@@ -93,8 +93,3 @@ debug = false
 big_endian_bytes = "deny"
 dbg_macro = "deny"
 host_endian_bytes = "deny"
-
-[[example]]
-name = "omdb_lanes"
-test = true
-required-features = ["std", "experimental-api-5"]

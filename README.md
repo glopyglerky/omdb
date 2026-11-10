@@ -1,14 +1,6 @@
 # omdb
 
-A fork of [redb](https://github.com/cberner/redb) developing native resource-backed
-database execution. The compatible embedded engine is present; universal device
-control, bare-metal integration and global resource pooling remain development
-targets. The Cargo package remains `redb`.
-
-Read the [omdb direction, executable lane proof and qualification record](docs/omdb/README.md).
-The upstream engine documentation follows.
-
-## redb engine
+A fork of [redb](https://github.com/cberner/redb). The Cargo package remains `redb`.
 
 ![Upstream CI](https://github.com/cberner/redb/actions/workflows/ci.yml/badge.svg)
 [![Crates.io](https://img.shields.io/crates/v/redb.svg)](https://crates.io/crates/redb)

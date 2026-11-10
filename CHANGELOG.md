@@ -1,12 +1,5 @@
 # redb - Changelog
 
-## omdb fork - unreleased
-
-* Add an experimental hosted execution-lane example with independent databases,
-  atomic command receipts and effect intents, revocation checks and restart tests.
-* Record the native hardware, storage and execution direction with explicit
-  implementation and qualification gates. No engine format change is made.
-
 ## 5.0.0 - 2026-XX-XX
 ### Breaking changes
 * Turning off the `std` feature now builds redb without the standard library (see below). If you
