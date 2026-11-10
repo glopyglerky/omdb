@@ -2,6 +2,17 @@
 
 This file tells coding agents how to work productively in this repository.
 
+## omdb fork direction
+
+Read [the omdb direction and evidence](docs/omdb/README.md) for the native
+resource/execution target, current implementation and acceptance gates. Preserve
+upstream engine organization and file compatibility while adding qualified
+slices. Use real ownership and recovery tests before claiming hardware control,
+global pooling or application migration. A source survey is not implementation.
+Do not copy private consumer or policy code into this public repository without
+the owner's publication authorization. Preserve donor licenses and source pins.
+The existing test and commit requirements below continue to apply.
+
 ## Setup
 
 `just` is required.
