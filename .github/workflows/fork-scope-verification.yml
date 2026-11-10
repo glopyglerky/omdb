@@ -1,0 +1,36 @@
+name: Fork scope verification
+
+on:
+  push:
+    branches:
+      - omdb/verify-minimal-fork-scope
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: b2ff031398b1f0a793a352db7a699575b5d4d3d4
+      - name: Verify the exact candidate source
+        run: test "$(git rev-parse HEAD)" = "b2ff031398b1f0a793a352db7a699575b5d4d3d4"
+      - name: Install the pinned toolchain
+        run: rustup toolchain install "$(cat rust-toolchain)" --profile minimal --component rustfmt,clippy
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes podman
+          cargo install --locked --version 1.36.0 just
+          cargo install --locked --version 0.20.2 cargo-deny
+      - name: Run the repository-required test gate
+        run: just test
+      - name: Check the existing freestanding engine profile
+        run: just build_no_std
