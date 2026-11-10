@@ -641,8 +641,10 @@ Transaction ids are mapped to the bytes in this range using the formula `TXN_BAS
 
 To begin a read transaction, the reader acquires a shared "header lock", reads the latest committed
 transaction id, and then while still holding the header lock, acquires
-a shared lock on the active transaction byte as determined by the id. When the transaction ends, the
-active transaction byte lock is released.
+a shared lock on the active transaction byte as determined by the id. The reader must wait for that
+lock rather than fail without it: an exclusive-writer open that is about to be refused briefly holds
+the whole active transaction range. When the transaction ends, the active transaction byte lock is
+released.
 
 Write transactions similarly take a shared lock on the transaction they are reading.
 

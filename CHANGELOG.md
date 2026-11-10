@@ -72,6 +72,8 @@
   database as an empty one instead of returning `StorageError::Corrupted`.
 * `commit()` returns `CommitError::TransactionPoisoned` when a table opened in the transaction was
   leaked, for example with `mem::forget()`, instead of committing a corrupted database.
+* Fix `begin_read()` on a `SingleWriter` or `MultiWriter` database failing with
+  `StorageError::Corrupted` while an `ExclusiveWriter` open of the same file was being refused.
 
 ## redb-derive 0.2.1 - 2026-XX-XX
 * The derived implementations no longer name `std`, so `#[derive(Key)]` and `#[derive(Value)]`
