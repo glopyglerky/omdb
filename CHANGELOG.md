@@ -1,5 +1,12 @@
 # redb - Changelog
 
+## omdb fork - Unreleased
+
+* Include the complete RuVector source snapshot at `39a104e50388d41837f86e4001096a01927e1728`
+  under `upstream/ruvector`, with its original notices and pinned external submodules.
+  Keep it outside the redb workspace and published package. This is a source import,
+  not a change to the redb engine or an integrated vector/graph API.
+
 ## 5.0.0 - 2026-XX-XX
 ### Breaking changes
 * Turning off the `std` feature now builds redb without the standard library (see below). If you

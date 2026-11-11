@@ -1,0 +1,60 @@
+{
+  "name": "ruvector-mragent",
+  "version": "0.1.1",
+  "private": false,
+  "type": "module",
+  "description": "RAG: MRAgent — Cue-Tag-Content graph memory over RuVector, with a Meta-Harness Darwin loop that evolves the reconstruction harness (freeze the model, evolve the harness).",
+  "homepage": "https://ruv.io",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git",
+    "directory": "examples/mragent"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "files": [
+    "agent/",
+    "harness/",
+    "data/",
+    "tools/",
+    "test/",
+    "*.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "probe": "node probeDarwin.mjs",
+    "optimize": "node optimize.mjs",
+    "benchmark": "node benchmark.mjs",
+    "test": "node --test \"test/*.test.mjs\"",
+    "gen-corpus": "node tools/genCorpus.mjs"
+  },
+  "keywords": [
+    "rag",
+    "hnsw",
+    "graph",
+    "agent-memory",
+    "agent-harness",
+    "ruvector",
+    "ruvnet",
+    "mragent",
+    "metaharness"
+  ],
+  "license": "MIT",
+  "optionalDependencies": {
+    "@metaharness/darwin": "^0.3.1",
+    "ruvector": "^2.1.0"
+  },
+  "peerDependencies": {
+    "@metaharness/darwin": "^0.3.1"
+  },
+  "peerDependenciesMeta": {
+    "@metaharness/darwin": {
+      "optional": true
+    }
+  }
+}

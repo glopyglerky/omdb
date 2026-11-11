@@ -15,6 +15,10 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha }}
+          sparse-checkout: |
+            /*
+            !/upstream/ruvector/
+          sparse-checkout-cone-mode: false
       - name: Ban AI-authored commits
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -60,6 +64,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          sparse-checkout: |
+            /*
+            !/upstream/ruvector/
+          sparse-checkout-cone-mode: false
 
       - name: Install Rust
         run: |
@@ -105,12 +114,13 @@ jobs:
                 fuzz/target/
             # No restore-keys fallback: restoring an older cache would carry its stale artifacts
             # forward into every cache saved after it
-            key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/Cargo.toml', 'Cargo.lock', 'fuzz/Cargo.lock', '.github/workflows/*.yml', 'rust-toolchain') }}
+            key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'fuzz/Cargo.toml', 'Cargo.lock', 'fuzz/Cargo.lock', '.github/workflows/*.yml', 'rust-toolchain') }}
 
       - name: Non ASCII characters
         if: startsWith(matrix.os, 'ubuntu')
         run: |
-            if grep -P -n "[^\x00-\x7F]" -r --include="*.rs" --include="*.toml" .; then
+            # Preserve the imported source bytes, including upstream's Unicode text.
+            if git grep -P -n "[^\x00-\x7F]" -- '*.rs' '*.toml' ':!upstream/ruvector/**'; then
             echo "Non-ASCII characters detected"
             exit 1
             fi

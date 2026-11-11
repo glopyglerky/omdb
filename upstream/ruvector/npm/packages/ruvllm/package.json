@@ -1,0 +1,153 @@
+{
+  "name": "@ruvector/ruvllm",
+  "version": "4.2.2",
+  "description": "Local LLM runtime for Node.js: GGUF inference, KV-cache compression, SONA self-learning with LoRA, speculative decoding and an HTTP serve command.",
+  "main": "dist/cjs/index.js",
+  "module": "dist/esm/index.js",
+  "types": "dist/cjs/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./simd": {
+      "import": {
+        "types": "./dist/esm/simd.d.ts",
+        "default": "./dist/esm/simd.js"
+      },
+      "require": {
+        "types": "./dist/cjs/simd.d.ts",
+        "default": "./dist/cjs/simd.js"
+      }
+    },
+    "./engine": {
+      "import": "./gpu/engine.mjs",
+      "require": "./gpu/engine.cjs"
+    },
+    "./gpu-loop": {
+      "import": "./gpu/gpu-loop.mjs",
+      "require": "./gpu/gpu-loop.cjs"
+    },
+    "./adapters": {
+      "import": "./gpu/adapters.mjs",
+      "require": "./gpu/adapters.cjs"
+    },
+    "./gpu-host": {
+      "import": "./gpu/gpu-host.mjs",
+      "require": "./gpu/gpu-host.cjs"
+    },
+    "./gpu-spool-adapter": {
+      "import": "./gpu/gpu-spool-adapter.mjs",
+      "require": "./gpu/gpu-spool-adapter.cjs"
+    },
+    "./vast-host-adapter": {
+      "import": "./gpu/vast-host-adapter.mjs",
+      "require": "./gpu/vast-host-adapter.cjs"
+    },
+    "./fixture": {
+      "import": "./gpu/fixture.mjs",
+      "require": "./gpu/fixture.cjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "ruvllm": "./bin/cli.js",
+    "ruvllm-gpu-loop": "./bin/ruvllm-gpu-loop.js",
+    "ruvllm-adapters": "./bin/ruvllm-adapters.js"
+  },
+  "napi": {
+    "name": "ruvllm",
+    "binaryName": "ruvllm",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "npm run build:cjs && npm run build:esm",
+    "build:cjs": "tsc",
+    "build:esm": "tsc -p tsconfig.esm.json && node scripts/fix-esm-extensions.mjs",
+    "verify:esm": "node scripts/fix-esm-extensions.mjs --verify",
+    "build:native": "napi build --platform --release --cargo-cwd ../../../examples/ruvLLM --features napi,candle --cargo-flags=--lib",
+    "build:debug": "napi build --platform --cargo-cwd ../../../examples/ruvLLM --features napi,candle --cargo-flags=--lib",
+    "prepublishOnly": "npm run build",
+    "test": "node --test test/*.test.js",
+    "test:esm-smoke": "node scripts/smoke-esm.mjs",
+    "universal": "napi universal",
+    "version": "napi version",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "@types/node": "^20.10.5",
+    "typescript": "^5.3.3"
+  },
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "commander": "^12.0.0",
+    "ora": "^5.4.1"
+  },
+  "optionalDependencies": {
+    "@ruvector/ruvllm-linux-x64-gnu": "2.1.0",
+    "@ruvector/ruvllm-linux-arm64-gnu": "2.1.0",
+    "@ruvector/ruvllm-darwin-x64": "2.1.0",
+    "@ruvector/ruvllm-darwin-arm64": "2.1.0",
+    "@ruvector/ruvllm-win32-x64-msvc": "2.1.0",
+    "@ruvector/ruvllm-gpu-loop": "^1.1.1"
+  },
+  "keywords": [
+    "local-llm",
+    "llm",
+    "self-learning",
+    "lora",
+    "inference",
+    "llm-routing",
+    "ruvector",
+    "ruvllm",
+    "ruvnet",
+    "sona",
+    "hnsw",
+    "vector-database",
+    "simd",
+    "federated-learning",
+    "machine-learning",
+    "ai"
+  ],
+  "author": "rUv Team <team@ruv.io>",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "directory": "npm/packages/ruvllm",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "gpu",
+    "scripts",
+    "*.node",
+    "README.md"
+  ]
+}

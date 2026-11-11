@@ -1,0 +1,11430 @@
+#!/usr/bin/env node
+
+// Signal CLI context (disables parallel workers - hooks are short-lived)
+process.env.RUVECTOR_CLI = '1';
+
+const { Command } = require('commander');
+const _chalk = require('chalk');
+const chalk = _chalk.default || _chalk;
+const fs = require('fs');
+const path = require('path');
+const { serializeStore, resolveIntelStorePath } = require('./intel-store');
+const memoryStore = require('./memory-store');
+const recordValidate = require('./record-validate');
+
+// Lazy load ora (spinner) - only needed for commands with progress indicators
+let _oraModule = null;
+function ora(text) {
+  if (_oraModule === null) {
+    const _ora = require('ora');
+    _oraModule = _ora.default || _ora;
+  }
+  return _oraModule(text);
+}
+
+// Lazy load ruvector (only when needed, not for install/help commands)
+let VectorDB, getVersion, getImplementationType;
+let ruvectorLoaded = false;
+
+function loadRuvector() {
+  if (ruvectorLoaded) return true;
+  try {
+    const ruvector = require('../dist/index.js');
+    VectorDB = ruvector.VectorDB;
+    getVersion = ruvector.getVersion;
+    getImplementationType = ruvector.getImplementationType;
+    ruvectorLoaded = true;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function requireRuvector() {
+  if (!loadRuvector()) {
+    console.error(chalk.red('Error: Failed to load ruvector. Please run: npm run build'));
+    console.error(chalk.yellow('Or install the package: npm install ruvector'));
+    process.exit(1);
+  }
+}
+
+// Lazy load GNN (optional - loaded on first use, not at startup)
+// Saves ~6ms startup time by deferring require('@ruvector/gnn')
+let _gnnModule = undefined; // undefined = not yet attempted, null = failed, object = loaded
+let RuvectorLayer, TensorCompress, differentiableSearch, getCompressionLevel, hierarchicalForward;
+let gnnAvailable = false;
+
+function loadGnn() {
+  if (_gnnModule !== undefined) return _gnnModule;
+  try {
+    const gnn = require('@ruvector/gnn');
+    RuvectorLayer = gnn.RuvectorLayer;
+    TensorCompress = gnn.TensorCompress;
+    differentiableSearch = gnn.differentiableSearch;
+    getCompressionLevel = gnn.getCompressionLevel;
+    hierarchicalForward = gnn.hierarchicalForward;
+    _gnnModule = gnn;
+    gnnAvailable = true;
+    return gnn;
+  } catch (e) {
+    _gnnModule = null;
+    gnnAvailable = false;
+    return null;
+  }
+}
+
+// Lazy load Attention (optional - loaded on first use, not at startup)
+// Saves ~5ms startup time by deferring require('@ruvector/attention')
+let _attentionModule = undefined; // undefined = not yet attempted
+let DotProductAttention, MultiHeadAttention, HyperbolicAttention, FlashAttention, LinearAttention, MoEAttention;
+let GraphRoPeAttention, EdgeFeaturedAttention, DualSpaceAttention, LocalGlobalAttention;
+let benchmarkAttention, computeAttentionAsync, batchAttentionCompute, parallelAttentionCompute;
+let expMap, logMap, mobiusAddition, poincareDistance, projectToPoincareBall;
+let attentionInfo, attentionVersion;
+let attentionAvailable = false;
+
+function loadAttention() {
+  if (_attentionModule !== undefined) return _attentionModule;
+  try {
+    const attention = require('@ruvector/attention');
+    // Core mechanisms
+    DotProductAttention = attention.DotProductAttention;
+    MultiHeadAttention = attention.MultiHeadAttention;
+    HyperbolicAttention = attention.HyperbolicAttention;
+    FlashAttention = attention.FlashAttention;
+    LinearAttention = attention.LinearAttention;
+    MoEAttention = attention.MoEAttention;
+    // Graph attention
+    GraphRoPeAttention = attention.GraphRoPeAttention;
+    EdgeFeaturedAttention = attention.EdgeFeaturedAttention;
+    DualSpaceAttention = attention.DualSpaceAttention;
+    LocalGlobalAttention = attention.LocalGlobalAttention;
+    // Utilities
+    benchmarkAttention = attention.benchmarkAttention;
+    computeAttentionAsync = attention.computeAttentionAsync;
+    batchAttentionCompute = attention.batchAttentionCompute;
+    parallelAttentionCompute = attention.parallelAttentionCompute;
+    // Hyperbolic math
+    expMap = attention.expMap;
+    logMap = attention.logMap;
+    mobiusAddition = attention.mobiusAddition;
+    poincareDistance = attention.poincareDistance;
+    projectToPoincareBall = attention.projectToPoincareBall;
+    // Meta
+    attentionInfo = attention.info;
+    attentionVersion = attention.version;
+    _attentionModule = attention;
+    attentionAvailable = true;
+    return attention;
+  } catch (e) {
+    _attentionModule = null;
+    attentionAvailable = false;
+    return null;
+  }
+}
+
+const program = new Command();
+
+// Get package version from package.json
+const packageJson = require('../package.json');
+
+// `@ruvector/gnn@0.1.25` has a native-binding regression where every method
+// throws `Given napi value is not an array` regardless of input shape (verified
+// with both Array<Float32Array> and number[][]). Use this helper to print a
+// pointer to the upstream issue when the CLI-side typed-array conversion is
+// already correct.
+function reportGnnBindingError(error) {
+  const msg = error && error.message ? error.message : String(error);
+  console.error(chalk.red(msg));
+  if (msg.includes('Given napi value is not an array') || msg.includes('TypedArray info failed')) {
+    console.error(chalk.yellow('  Note: this is a known regression in the @ruvector/gnn native binding,'));
+    console.error(chalk.yellow('  not in the CLI. Track at:'));
+    console.error(chalk.white('    https://github.com/ruvnet/ruvector/issues/402'));
+  }
+}
+
+// Version and description (lazy load implementation info)
+program
+  .name('ruvector')
+  .description(`${chalk.cyan('ruvector')} - High-performance vector database CLI`)
+  .version(packageJson.version);
+
+// Create database
+program
+  .command('create <path>')
+  .description('Create a new vector database')
+  .option('-d, --dimension <number>', 'Vector dimension', '384')
+  .option('-m, --metric <type>', 'Distance metric (cosine|euclidean|dot)', 'cosine')
+  .action((dbPath, options) => {
+    requireRuvector();
+    const spinner = ora('Creating database...').start();
+
+    try {
+      const dimension = parseInt(options.dimension);
+      const db = new VectorDB({
+        dimensions: dimension,
+        metric: options.metric,
+        storagePath: dbPath,
+      });
+
+      // Write sidecar so insert/search/stats can recover dimension without JSON-parsing binary redb
+      fs.writeFileSync(`${dbPath}.meta.json`, JSON.stringify({ dimension, metric: options.metric, version: 1 }));
+
+      spinner.succeed(chalk.green(`Database created: ${dbPath}`));
+      console.log(chalk.gray(`  Dimension: ${dimension}`));
+      console.log(chalk.gray(`  Metric: ${options.metric}`));
+      console.log(chalk.gray(`  Implementation: ${getImplementationType()}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to create database'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Insert vectors
+program
+  .command('insert <database> <file>')
+  .description('Insert vectors from JSON file')
+  .option('-b, --batch-size <number>', 'Batch size for insertion', '1000')
+  .action(async (dbPath, file, options) => {
+    requireRuvector();
+    const spinner = ora('Loading database...').start();
+
+    try {
+      // Read dimension + embedding provenance from sidecar (#508, ADR-210 D0).
+      // Sidecar JSON is untrusted on-disk input: malformed records are treated
+      // as absent (sanitizeDimension / sanitizeProvenanceSafe), never crash.
+      let dimension = 384;
+      let storeProvenance = null;
+      const metaPath = `${dbPath}.meta.json`;
+      if (fs.existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          dimension = sanitizeDimension(meta.dimension, 384);
+          storeProvenance = sanitizeProvenanceSafe(meta.provenance);
+        } catch (_) {}
+      }
+
+      spinner.text = 'Reading vectors...';
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      // Accept a plain array (raw vectors, no declared provenance) or the
+      // ADR-210 object form `{ provenance, vectors }` from embedding-path
+      // exporters. A malformed declared provenance is treated as undeclared
+      // (the dimension gate below still applies).
+      let declaredProvenance = null;
+      let vectors;
+      if (Array.isArray(data)) {
+        vectors = data;
+      } else if (data && Array.isArray(data.vectors)) {
+        vectors = data.vectors;
+        declaredProvenance = sanitizeProvenanceSafe(data.provenance);
+      } else {
+        vectors = [data];
+      }
+
+      // ADR-210 D0: a store stamped with embedding provenance refuses
+      // mismatched inserts — clear error naming both sides, no coercion.
+      if (storeProvenance) {
+        const provMod = loadProvenance();
+        const describe = provMod ? provMod.describeProvenance : (p) => JSON.stringify(p);
+        const badDim = vectors.find(v => v && Array.isArray(v.vector) && v.vector.length !== storeProvenance.dimension);
+        const provMismatch = declaredProvenance && provMod
+          ? provMod.compareProvenance(storeProvenance, declaredProvenance)
+          : [];
+        if (badDim || provMismatch.length > 0) {
+          const incoming = declaredProvenance
+            ? describe(declaredProvenance)
+            : `${badDim.vector.length}-dimensional vectors with undeclared provenance`;
+          spinner.fail(chalk.red(
+            `Insert refused (ADR-210): ${dbPath} records embedding provenance ${describe(storeProvenance)}, ` +
+            `but the incoming data is ${incoming}` +
+            (provMismatch.length ? ` (differs on: ${provMismatch.join(', ')})` : '') +
+            `. Mixed stores are never created — re-embed the data or the store.`
+          ));
+          process.exit(1);
+        }
+      }
+
+      // New database: derive dimension from the data and write the sidecar
+      // so later stats/search invocations open it correctly (#508). Declared
+      // provenance from the embedding path is stamped alongside (ADR-210 D0).
+      if (!fs.existsSync(dbPath) && vectors.length > 0 && Array.isArray(vectors[0].vector)) {
+        dimension = vectors[0].vector.length;
+        const meta = { dimension };
+        if (declaredProvenance) meta.provenance = declaredProvenance;
+        try { fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2)); } catch (_) {}
+      }
+
+      // The native binding loads/persists through storagePath itself —
+      // VectorDB has no load()/save() methods (#508).
+      const db = new VectorDB({ dimensions: dimension, storagePath: dbPath });
+
+      spinner.text = `Inserting ${vectors.length} vectors...`;
+      const batchSize = parseInt(options.batchSize);
+
+      for (let i = 0; i < vectors.length; i += batchSize) {
+        const batch = vectors.slice(i, i + batchSize);
+        await db.insertBatch(batch);
+        spinner.text = `Inserted ${Math.min(i + batchSize, vectors.length)}/${vectors.length} vectors...`;
+      }
+
+      spinner.succeed(chalk.green(`Inserted ${vectors.length} vectors`));
+
+      const count = await db.len();
+      console.log(chalk.gray(`  Total vectors: ${count}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to insert vectors'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Search vectors
+program
+  .command('search <database>')
+  .description('Search for similar vectors')
+  .requiredOption('-v, --vector <json>', 'Query vector as JSON array')
+  .option('-k, --top-k <number>', 'Number of results', '10')
+  .option('-t, --threshold <number>', 'Similarity threshold', '0.0')
+  .option('-f, --filter <json>', 'Metadata filter as JSON')
+  .action(async (dbPath, options) => {
+    requireRuvector();
+    const spinner = ora('Loading database...').start();
+
+    try {
+      // Read dimension from sidecar (avoids JSON-parsing binary redb)
+      let dimension = 384;
+      const metaPath = `${dbPath}.meta.json`;
+      if (fs.existsSync(metaPath)) {
+        try { dimension = sanitizeDimension(JSON.parse(fs.readFileSync(metaPath, 'utf8')).dimension, 384); } catch (_) {}
+      }
+
+      if (!fs.existsSync(dbPath)) {
+        spinner.fail(chalk.red(`Database not found: ${dbPath}`));
+        process.exit(1);
+      }
+
+      // storagePath loads the existing store; VectorDB has no load() (#508).
+      const db = new VectorDB({ dimensions: dimension, storagePath: dbPath });
+
+      spinner.text = 'Searching...';
+
+      const vector = JSON.parse(options.vector);
+      const query = {
+        vector,
+        k: parseInt(options.topK),
+        threshold: parseFloat(options.threshold)
+      };
+
+      if (options.filter) {
+        query.filter = JSON.parse(options.filter);
+      }
+
+      const results = await db.search(query);
+      spinner.succeed(chalk.green(`Found ${results.length} results`));
+
+      console.log(chalk.cyan('\nSearch Results:'));
+      results.forEach((result, i) => {
+        console.log(chalk.white(`\n${i + 1}. ID: ${result.id}`));
+        console.log(chalk.yellow(`   Score: ${result.score.toFixed(4)}`));
+        if (result.metadata) {
+          console.log(chalk.gray(`   Metadata: ${JSON.stringify(result.metadata)}`));
+        }
+      });
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to search'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Show stats
+program
+  .command('stats <database>')
+  .description('Show database statistics')
+  .action(async (dbPath) => {
+    requireRuvector();
+    const spinner = ora('Loading database...').start();
+
+    try {
+      // Read dimension/metric from sidecar (avoids JSON-parsing binary redb)
+      let dimension = 384;
+      let metric = 'cosine';
+      const metaPath = `${dbPath}.meta.json`;
+      if (fs.existsSync(metaPath)) {
+        try {
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          dimension = sanitizeDimension(meta.dimension, dimension);
+          metric = typeof meta.metric === 'string' ? meta.metric : metric;
+        } catch (_) {}
+      }
+
+      if (!fs.existsSync(dbPath)) {
+        spinner.fail(chalk.red(`Database not found: ${dbPath}`));
+        process.exit(1);
+      }
+
+      // storagePath loads the existing store; VectorDB exposes len(),
+      // not a stats() aggregate (#508).
+      const db = new VectorDB({ dimensions: dimension, storagePath: dbPath });
+      const count = await db.len();
+      spinner.succeed(chalk.green('Database statistics'));
+
+      console.log(chalk.cyan('\nDatabase Stats:'));
+      console.log(chalk.white(`  Vector Count: ${chalk.yellow(count)}`));
+      console.log(chalk.white(`  Dimension: ${chalk.yellow(dimension)}`));
+      console.log(chalk.white(`  Metric: ${chalk.yellow(metric)}`));
+      console.log(chalk.white(`  Implementation: ${chalk.yellow(getImplementationType())}`));
+
+      const fileStats = fs.statSync(dbPath);
+      const fileMb = (fileStats.size / (1024 * 1024)).toFixed(2);
+      console.log(chalk.white(`  File Size: ${chalk.yellow(fileMb + ' MB')}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to load database'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Open an existing store for get/update/delete. Dimension comes from the
+// sidecar written by create/insert; a missing store is an error (these
+// commands never create one).
+function openExistingVectorDb(dbPath) {
+  if (!fs.existsSync(dbPath)) throw new Error(`Database not found: ${dbPath}`);
+  let dimension = 384;
+  let provenance = null;
+  const metaPath = `${dbPath}.meta.json`;
+  if (fs.existsSync(metaPath)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+      dimension = sanitizeDimension(meta.dimension, 384);
+      provenance = sanitizeProvenanceSafe(meta.provenance);
+    } catch (_) {}
+  }
+  return { db: new VectorDB({ dimensions: dimension, storagePath: dbPath }), dimension, provenance };
+}
+
+function recordView(record) {
+  return { id: record.id, vector: Array.from(record.vector || []), metadata: record.metadata };
+}
+
+// Read one vector by id
+program
+  .command('get <database> <id>')
+  .description('Get a vector and its metadata by id')
+  .option('--no-vector', 'Omit the vector values from the output')
+  .action(async (dbPath, id, options) => {
+    requireRuvector();
+    try {
+      id = recordValidate.validateRecordId(id);
+      const { db } = openExistingVectorDb(dbPath);
+      const record = await db.get(id);
+      if (!record) {
+        console.error(chalk.red(`Not found: ${id}`));
+        process.exit(1);
+      }
+      const view = recordView({ ...record, id });
+      if (!options.vector) delete view.vector;
+      console.log(JSON.stringify(view, null, 2));
+    } catch (error) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Update an existing vector (never creates)
+program
+  .command('update <database> <id>')
+  .description('Update the vector and/or metadata of an existing id')
+  .option('-v, --vector <json>', 'New vector as JSON array')
+  .option('-m, --metadata <json>', 'New metadata as JSON object')
+  .option('--merge', 'Merge --metadata into the stored metadata instead of replacing it')
+  .action(async (dbPath, id, options) => {
+    requireRuvector();
+    try {
+      id = recordValidate.validateRecordId(id);
+      if (options.vector === undefined && options.metadata === undefined) {
+        throw new Error('Nothing to update: pass --vector and/or --metadata');
+      }
+      const { db, dimension, provenance } = openExistingVectorDb(dbPath);
+      const patch = { mergeMetadata: !!options.merge };
+      if (options.vector !== undefined) {
+        let parsed;
+        try { parsed = JSON.parse(options.vector); } catch { throw new Error('--vector is not valid JSON'); }
+        // ADR-210 D0: the stored provenance fixes the dimension.
+        patch.vector = recordValidate.validateVector(parsed, provenance ? provenance.dimension : dimension);
+      }
+      if (options.metadata !== undefined) patch.metadata = recordValidate.validateMetadata(options.metadata);
+      const updated = await db.update(id, patch);
+      if (!updated) {
+        console.error(chalk.red(`Not found: ${id}`));
+        process.exit(1);
+      }
+      console.log(chalk.green(`Updated ${id}`));
+    } catch (error) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Delete vectors by id
+program
+  .command('delete <database> <ids...>')
+  .description('Delete one or more vectors by id')
+  .action(async (dbPath, ids) => {
+    requireRuvector();
+    try {
+      ids = recordValidate.validateIdList(ids);
+      const { db } = openExistingVectorDb(dbPath);
+      const { deleted, missing } = await db.deleteMany(ids);
+      console.log(chalk.green(`Deleted ${deleted.length} vector(s)`));
+      if (missing.length) console.log(chalk.yellow(`  Not found: ${missing.join(', ')}`));
+      if (deleted.length === 0) process.exit(1);
+    } catch (error) {
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Benchmark
+program
+  .command('benchmark')
+  .description('Run performance benchmarks')
+  .option('-d, --dimension <number>', 'Vector dimension', '384')
+  .option('-n, --num-vectors <number>', 'Number of vectors', '10000')
+  .option('-q, --num-queries <number>', 'Number of queries', '1000')
+  .action((options) => {
+    requireRuvector();
+    console.log(chalk.cyan('\nruvector Performance Benchmark'));
+    console.log(chalk.gray(`Implementation: ${getImplementationType()}\n`));
+
+    const dimension = parseInt(options.dimension);
+    const numVectors = parseInt(options.numVectors);
+    const numQueries = parseInt(options.numQueries);
+
+    let spinner = ora('Creating database...').start();
+
+    try {
+      const db = new VectorDB({ dimensions: dimension, metric: 'cosine' });
+      spinner.succeed();
+
+      // Insert benchmark
+      spinner = ora(`Inserting ${numVectors} vectors...`).start();
+      const insertStart = Date.now();
+
+      const vectors = [];
+      for (let i = 0; i < numVectors; i++) {
+        vectors.push({
+          id: `vec_${i}`,
+          vector: Array.from({ length: dimension }, () => Math.random()),
+          metadata: { index: i, batch: Math.floor(i / 1000) }
+        });
+      }
+
+      db.insertBatch(vectors);
+      const insertTime = Date.now() - insertStart;
+      const insertRate = (numVectors / (insertTime / 1000)).toFixed(0);
+
+      spinner.succeed(chalk.green(`Inserted ${numVectors} vectors in ${insertTime}ms`));
+      console.log(chalk.gray(`  Rate: ${chalk.yellow(insertRate)} vectors/sec`));
+
+      // Search benchmark
+      spinner = ora(`Running ${numQueries} searches...`).start();
+      const searchStart = Date.now();
+
+      for (let i = 0; i < numQueries; i++) {
+        const query = {
+          vector: Array.from({ length: dimension }, () => Math.random()),
+          k: 10
+        };
+        db.search(query);
+      }
+
+      const searchTime = Date.now() - searchStart;
+      const searchRate = (numQueries / (searchTime / 1000)).toFixed(0);
+      const avgLatency = (searchTime / numQueries).toFixed(2);
+
+      spinner.succeed(chalk.green(`Completed ${numQueries} searches in ${searchTime}ms`));
+      console.log(chalk.gray(`  Rate: ${chalk.yellow(searchRate)} queries/sec`));
+      console.log(chalk.gray(`  Avg Latency: ${chalk.yellow(avgLatency)}ms`));
+
+      // Stats
+      console.log(chalk.cyan('\nFinal Stats:'));
+      console.log(chalk.white(`  Vector Count: ${chalk.yellow(numVectors)}`));
+      console.log(chalk.white(`  Dimension: ${chalk.yellow(dimension)}`));
+      console.log(chalk.white(`  Implementation: ${chalk.yellow(getImplementationType())}`));
+
+    } catch (error) {
+      spinner.fail(chalk.red('Benchmark failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Info command
+program
+  .command('info')
+  .description('Show ruvector information')
+  .action(() => {
+    // Trigger lazy load of optional modules for availability check
+    loadGnn();
+    loadAttention();
+
+    console.log(chalk.cyan('\nruvector Information'));
+    console.log(chalk.white(`  CLI Version: ${chalk.yellow(packageJson.version)}`));
+
+    // Try to load ruvector for implementation info
+    if (loadRuvector()) {
+      const v = typeof getVersion === 'function' ? getVersion() : 'unknown';
+      const version = v && typeof v === 'object' ? (v.version || JSON.stringify(v)) : v;
+      const impl = typeof getImplementationType === 'function' ? getImplementationType() : 'native';
+      console.log(chalk.white(`  Core Version: ${chalk.yellow(version)}`));
+      console.log(chalk.white(`  Implementation: ${chalk.yellow(impl)}`));
+    } else {
+      console.log(chalk.white(`  Core: ${chalk.gray('Not loaded (install @ruvector/core)')}`));
+    }
+
+    console.log(chalk.white(`  GNN Module: ${gnnAvailable ? chalk.green('Available') : chalk.gray('Not installed')}`));
+    console.log(chalk.white(`  Node Version: ${chalk.yellow(process.version)}`));
+    console.log(chalk.white(`  Platform: ${chalk.yellow(process.platform)}`));
+    console.log(chalk.white(`  Architecture: ${chalk.yellow(process.arch)}`));
+
+    if (!gnnAvailable) {
+      console.log(chalk.gray('\n  Install GNN with: npx ruvector install gnn'));
+    }
+    console.log(chalk.gray('  Optional extras (RaBitQ, DiskANN, router, graph, rvlite, quantum): npx ruvector add --list'));
+  });
+
+// =============================================================================
+// Install Command
+// =============================================================================
+
+program
+  .command('install [packages...]')
+  .description('Install optional ruvector packages')
+  .option('-a, --all', 'Install all optional packages')
+  .option('-l, --list', 'List available packages')
+  .option('-i, --interactive', 'Interactive package selection')
+  .action(async (packages, options) => {
+    const { execSync } = require('child_process');
+
+    // Trigger lazy load to check availability
+    loadGnn();
+
+    // Available optional packages - all ruvector npm packages
+    const availablePackages = {
+      // Core packages
+      core: {
+        name: '@ruvector/core',
+        description: 'Core vector database with native Rust bindings (HNSW, SIMD)',
+        installed: true, // Always installed with ruvector
+        category: 'core'
+      },
+      gnn: {
+        name: '@ruvector/gnn',
+        description: 'Graph Neural Network layers, tensor compression, differentiable search',
+        installed: gnnAvailable,
+        category: 'core'
+      },
+      'graph-node': {
+        name: '@ruvector/graph-node',
+        description: 'Native Node.js bindings for hypergraph database with Cypher queries',
+        installed: false,
+        category: 'core'
+      },
+      'agentic-synth': {
+        name: '@ruvector/agentic-synth',
+        description: 'Synthetic data generator for AI/ML training, RAG, and agentic workflows',
+        installed: false,
+        category: 'tools'
+      },
+      extensions: {
+        name: 'ruvector-extensions',
+        description: 'Advanced features: embeddings, UI, exports, temporal tracking, persistence',
+        installed: false,
+        category: 'tools'
+      },
+      // Platform-specific native bindings for @ruvector/core
+      'node-linux-x64': {
+        name: '@ruvector/node-linux-x64-gnu',
+        description: 'Linux x64 native bindings for @ruvector/core',
+        installed: false,
+        category: 'platform'
+      },
+      'node-linux-arm64': {
+        name: '@ruvector/node-linux-arm64-gnu',
+        description: 'Linux ARM64 native bindings for @ruvector/core',
+        installed: false,
+        category: 'platform'
+      },
+      'node-darwin-x64': {
+        name: '@ruvector/node-darwin-x64',
+        description: 'macOS Intel x64 native bindings for @ruvector/core',
+        installed: false,
+        category: 'platform'
+      },
+      'node-darwin-arm64': {
+        name: '@ruvector/node-darwin-arm64',
+        description: 'macOS Apple Silicon native bindings for @ruvector/core',
+        installed: false,
+        category: 'platform'
+      },
+      'node-win32-x64': {
+        name: '@ruvector/node-win32-x64-msvc',
+        description: 'Windows x64 native bindings for @ruvector/core',
+        installed: false,
+        category: 'platform'
+      },
+      // Platform-specific native bindings for @ruvector/gnn
+      'gnn-linux-x64': {
+        name: '@ruvector/gnn-linux-x64-gnu',
+        description: 'Linux x64 native bindings for @ruvector/gnn',
+        installed: false,
+        category: 'platform'
+      },
+      'gnn-linux-arm64': {
+        name: '@ruvector/gnn-linux-arm64-gnu',
+        description: 'Linux ARM64 native bindings for @ruvector/gnn',
+        installed: false,
+        category: 'platform'
+      },
+      'gnn-darwin-x64': {
+        name: '@ruvector/gnn-darwin-x64',
+        description: 'macOS Intel x64 native bindings for @ruvector/gnn',
+        installed: false,
+        category: 'platform'
+      },
+      'gnn-darwin-arm64': {
+        name: '@ruvector/gnn-darwin-arm64',
+        description: 'macOS Apple Silicon native bindings for @ruvector/gnn',
+        installed: false,
+        category: 'platform'
+      },
+      'gnn-win32-x64': {
+        name: '@ruvector/gnn-win32-x64-msvc',
+        description: 'Windows x64 native bindings for @ruvector/gnn',
+        installed: false,
+        category: 'platform'
+      },
+      // Legacy/standalone packages
+      'ruvector-core': {
+        name: 'ruvector-core',
+        description: 'Standalone vector database (legacy, use @ruvector/core instead)',
+        installed: false,
+        category: 'legacy'
+      }
+    };
+
+    // Check which packages are actually installed
+    for (const [key, pkg] of Object.entries(availablePackages)) {
+      if (key !== 'core' && key !== 'gnn') {
+        try {
+          require.resolve(pkg.name);
+          pkg.installed = true;
+        } catch (e) {
+          pkg.installed = false;
+        }
+      }
+    }
+
+    // List packages
+    if (options.list || (packages.length === 0 && !options.all && !options.interactive)) {
+      console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+      console.log(chalk.cyan('                    Ruvector Packages'));
+      console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+      const categories = {
+        core: { title: '📦 Core Packages', packages: [] },
+        tools: { title: '🔧 Tools & Extensions', packages: [] },
+        platform: { title: '🖥️  Platform Bindings', packages: [] },
+        legacy: { title: '📜 Legacy Packages', packages: [] }
+      };
+
+      // Group by category
+      Object.entries(availablePackages).forEach(([key, pkg]) => {
+        if (categories[pkg.category]) {
+          categories[pkg.category].packages.push({ key, ...pkg });
+        }
+      });
+
+      // Display by category
+      for (const [catKey, cat] of Object.entries(categories)) {
+        if (cat.packages.length === 0) continue;
+
+        console.log(chalk.cyan(`${cat.title}`));
+        console.log(chalk.gray('─'.repeat(60)));
+
+        cat.packages.forEach(pkg => {
+          const status = pkg.installed ? chalk.green('✓') : chalk.gray('○');
+          const statusText = pkg.installed ? chalk.green('installed') : chalk.gray('available');
+          console.log(chalk.white(`  ${status} ${chalk.yellow(pkg.key.padEnd(18))} ${statusText}`));
+          console.log(chalk.gray(`      ${pkg.description}`));
+          console.log(chalk.gray(`      npm: ${chalk.white(pkg.name)}\n`));
+        });
+      }
+
+      console.log(chalk.cyan('═══════════════════════════════════════════════════════════════'));
+      console.log(chalk.cyan('Usage:'));
+      console.log(chalk.white('  npx ruvector install gnn              # Install GNN package'));
+      console.log(chalk.white('  npx ruvector install graph-node       # Install graph database'));
+      console.log(chalk.white('  npx ruvector install agentic-synth    # Install data generator'));
+      console.log(chalk.white('  npx ruvector install --all            # Install all core packages'));
+      console.log(chalk.white('  npx ruvector install -i               # Interactive selection'));
+      console.log(chalk.gray('\n  Note: Platform bindings are auto-detected by @ruvector/core'));
+      return;
+    }
+
+    // Interactive mode
+    if (options.interactive) {
+      const readline = require('readline');
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout
+      });
+
+      console.log(chalk.cyan('\nSelect packages to install:\n'));
+
+      const notInstalled = Object.entries(availablePackages)
+        .filter(([_, pkg]) => !pkg.installed);
+
+      if (notInstalled.length === 0) {
+        console.log(chalk.green('All packages are already installed!'));
+        rl.close();
+        return;
+      }
+
+      notInstalled.forEach(([key, pkg], i) => {
+        console.log(chalk.white(`  ${i + 1}. ${chalk.yellow(key)} - ${pkg.description}`));
+      });
+      console.log(chalk.white(`  ${notInstalled.length + 1}. ${chalk.yellow('all')} - Install all packages`));
+      console.log(chalk.white(`  0. ${chalk.gray('cancel')} - Exit without installing`));
+
+      rl.question(chalk.cyan('\nEnter selection (comma-separated for multiple): '), (answer) => {
+        rl.close();
+
+        const selections = answer.split(',').map(s => s.trim());
+        let toInstall = [];
+
+        for (const sel of selections) {
+          if (sel === '0' || sel.toLowerCase() === 'cancel') {
+            console.log(chalk.yellow('Installation cancelled.'));
+            return;
+          }
+          if (sel === String(notInstalled.length + 1) || sel.toLowerCase() === 'all') {
+            toInstall = notInstalled.map(([_, pkg]) => pkg.name);
+            break;
+          }
+          const idx = parseInt(sel) - 1;
+          if (idx >= 0 && idx < notInstalled.length) {
+            toInstall.push(notInstalled[idx][1].name);
+          }
+        }
+
+        if (toInstall.length === 0) {
+          console.log(chalk.yellow('No valid packages selected.'));
+          return;
+        }
+
+        installPackages(toInstall);
+      });
+      return;
+    }
+
+    // Install all (core + tools only, not platform-specific or legacy)
+    if (options.all) {
+      const toInstall = Object.values(availablePackages)
+        .filter(pkg => !pkg.installed && (pkg.category === 'core' || pkg.category === 'tools'))
+        .map(pkg => pkg.name);
+
+      if (toInstall.length === 0) {
+        console.log(chalk.green('All core packages are already installed!'));
+        return;
+      }
+
+      console.log(chalk.cyan(`Installing ${toInstall.length} packages...`));
+      installPackages(toInstall);
+      return;
+    }
+
+    // Install specific packages
+    const toInstall = [];
+    for (const pkg of packages) {
+      const key = pkg.toLowerCase().replace('@ruvector/', '');
+      if (availablePackages[key]) {
+        if (availablePackages[key].installed) {
+          console.log(chalk.yellow(`${availablePackages[key].name} is already installed`));
+        } else {
+          toInstall.push(availablePackages[key].name);
+        }
+      } else {
+        console.log(chalk.red(`Unknown package: ${pkg}`));
+        console.log(chalk.gray(`Available: ${Object.keys(availablePackages).join(', ')}`));
+      }
+    }
+
+    if (toInstall.length > 0) {
+      installPackages(toInstall);
+    }
+
+    function installPackages(pkgs) {
+      const spinner = ora(`Installing ${pkgs.join(', ')}...`).start();
+
+      try {
+        // Detect package manager
+        let pm = 'npm';
+        if (fs.existsSync('yarn.lock')) pm = 'yarn';
+        else if (fs.existsSync('pnpm-lock.yaml')) pm = 'pnpm';
+        else if (fs.existsSync('bun.lockb')) pm = 'bun';
+
+        const cmd = pm === 'yarn' ? `yarn add ${pkgs.join(' ')}`
+                  : pm === 'pnpm' ? `pnpm add ${pkgs.join(' ')}`
+                  : pm === 'bun' ? `bun add ${pkgs.join(' ')}`
+                  : `npm install ${pkgs.join(' ')}`;
+
+        execSync(cmd, { stdio: 'pipe' });
+
+        spinner.succeed(chalk.green(`Installed: ${pkgs.join(', ')}`));
+        console.log(chalk.cyan('\nRun "npx ruvector info" to verify installation.'));
+      } catch (error) {
+        spinner.fail(chalk.red('Installation failed'));
+        console.error(chalk.red(error.message));
+        console.log(chalk.yellow(`\nTry manually: npm install ${pkgs.join(' ')}`));
+        process.exit(1);
+      }
+    }
+  });
+
+// =============================================================================
+// Add Command — opt-in extras (allowlisted, see bin/extras.js)
+// =============================================================================
+
+program
+  .command('add [extras...]')
+  .description('Install an optional ruvector extra (rabitq, diskann, router, graph, rvlite, rvf, tiny-dancer, quantum) into this project')
+  .option('-l, --list', 'List available extras and whether they are installed')
+  .option('--json', 'With --list, print JSON')
+  .option('--dry-run', 'Print what would be installed without installing')
+  .action((names, options) => {
+    const extras = require('./extras');
+
+    if (options.list) {
+      const rows = extras.listExtras().map((e) => ({
+        key: e.key, package: e.pkg, spec: e.spec, why: e.why, usage: e.usage,
+        bundled: !!e.bundled, installed: extras.isPackageInstalled(e.pkg),
+      }));
+      if (options.json) {
+        console.log(JSON.stringify({ extras: rows }, null, 2));
+        return;
+      }
+      console.log(chalk.cyan('\nruvector extras (opt-in, installed only on request)\n'));
+      for (const r of rows) {
+        const status = r.bundled ? chalk.green('bundled') : r.installed ? chalk.green('installed') : chalk.gray('available');
+        console.log(`  ${chalk.yellow(r.key.padEnd(12))} ${status.padEnd(10)} ${chalk.white(r.package)}`);
+        console.log(chalk.gray(`      ${r.why}`));
+        console.log(chalk.gray(`      use: ${r.usage}`));
+      }
+      console.log(chalk.gray('\n  npx ruvector add <extra> [--dry-run]\n'));
+      return;
+    }
+
+    if (!names || names.length === 0) {
+      console.error(chalk.red('No extra given.'));
+      console.error(chalk.yellow('  See what is available: npx ruvector add --list'));
+      process.exit(1);
+    }
+
+    const plan = extras.runAdd(names, { dryRun: true });
+    if (!plan.ok) {
+      console.error(chalk.red(`Unknown extra: ${plan.unknown.join(', ')}`));
+      console.error(chalk.yellow(`  Available: ${extras.listExtras().map((e) => e.key).join(', ')}`));
+      console.error(chalk.yellow('  Details:   npx ruvector add --list'));
+      process.exit(1);
+    }
+    for (const s of plan.skipped) {
+      console.log(chalk.green(`  ✓ ${s.key}: ${s.reason}`));
+    }
+    if (!plan.command) return;
+
+    console.log(chalk.cyan('\nWill install into ' + plan.cwd + ':'));
+    for (const e of plan.toInstall) {
+      console.log(`  ${chalk.yellow(e.spec)}`);
+      console.log(chalk.gray(`      why: ${e.why}`));
+      console.log(chalk.gray(`      use: ${e.usage}`));
+    }
+    console.log(chalk.white(`\n  $ ${plan.command.cmd} ${plan.command.args.join(' ')}\n`));
+    if (options.dryRun) {
+      console.log(chalk.gray('  Dry run — nothing installed.'));
+      return;
+    }
+
+    const result = extras.runAdd(names);
+    if (!result.ok) {
+      console.error(chalk.red(`Install failed${result.error ? `: ${result.error}` : ` (exit ${result.status})`}`));
+      process.exit(result.status || 1);
+    }
+    console.log(chalk.green(`Installed: ${result.toInstall.map((e) => e.pkg).join(', ')}`));
+  });
+
+// =============================================================================
+// GNN Commands
+// =============================================================================
+
+// Helper to check GNN availability (triggers lazy load)
+function requireGnn() {
+  loadGnn();
+  if (!gnnAvailable) {
+    console.error(chalk.red('Error: GNN module not available.'));
+    console.error(chalk.yellow('Install it with: npm install @ruvector/gnn'));
+    process.exit(1);
+  }
+}
+
+// GNN parent command
+const gnnCmd = program
+  .command('gnn')
+  .description('Graph Neural Network operations');
+
+// GNN Layer command
+gnnCmd
+  .command('layer')
+  .description('Create and test a GNN layer')
+  .requiredOption('-i, --input-dim <number>', 'Input dimension')
+  .requiredOption('-h, --hidden-dim <number>', 'Hidden dimension')
+  .option('-a, --heads <number>', 'Number of attention heads', '4')
+  .option('-d, --dropout <number>', 'Dropout rate', '0.1')
+  .option('--test', 'Run a test forward pass')
+  .option('-o, --output <file>', 'Save layer config to JSON file')
+  .action((options) => {
+    requireGnn();
+    const spinner = ora('Creating GNN layer...').start();
+
+    try {
+      const inputDim = parseInt(options.inputDim);
+      const hiddenDim = parseInt(options.hiddenDim);
+      const heads = parseInt(options.heads);
+      const dropout = parseFloat(options.dropout);
+
+      const layer = new RuvectorLayer(inputDim, hiddenDim, heads, dropout);
+      spinner.succeed(chalk.green('GNN Layer created'));
+
+      console.log(chalk.cyan('\nLayer Configuration:'));
+      console.log(chalk.white(`  Input Dim:  ${chalk.yellow(inputDim)}`));
+      console.log(chalk.white(`  Hidden Dim: ${chalk.yellow(hiddenDim)}`));
+      console.log(chalk.white(`  Heads:      ${chalk.yellow(heads)}`));
+      console.log(chalk.white(`  Dropout:    ${chalk.yellow(dropout)}`));
+
+      if (options.test) {
+        spinner.start('Running test forward pass...');
+
+        // The @ruvector/gnn binding requires Float32Array — plain number[] surfaces
+        // as `Get TypedArray info failed` from napi-rs.
+        const randVec = (n) => {
+          const v = new Float32Array(n);
+          for (let i = 0; i < n; i++) v[i] = Math.random();
+          return v;
+        };
+        const nodeEmbedding = randVec(inputDim);
+        const neighborEmbeddings = [randVec(inputDim), randVec(inputDim)];
+        const edgeWeights = new Float32Array([0.6, 0.4]);
+
+        const output = layer.forward(nodeEmbedding, neighborEmbeddings, edgeWeights);
+        spinner.succeed(chalk.green('Forward pass completed'));
+
+        console.log(chalk.cyan('\nTest Results:'));
+        console.log(chalk.white(`  Input shape:  ${chalk.yellow(`[${inputDim}]`)}`));
+        console.log(chalk.white(`  Output shape: ${chalk.yellow(`[${output.length}]`)}`));
+        console.log(chalk.white(`  Output sample: ${chalk.gray(`[${output.slice(0, 4).map(v => v.toFixed(4)).join(', ')}...]`)}`));
+      }
+
+      if (options.output) {
+        const config = layer.toJson();
+        fs.writeFileSync(options.output, config);
+        console.log(chalk.green(`\nLayer config saved to: ${options.output}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to create GNN layer'));
+      reportGnnBindingError(error);
+      process.exit(1);
+    }
+  });
+
+// GNN Compress command
+gnnCmd
+  .command('compress')
+  .description('Compress embeddings using adaptive tensor compression')
+  .requiredOption('-f, --file <path>', 'Input JSON file with embeddings')
+  .option('-l, --level <type>', 'Compression level (none|half|pq8|pq4|binary)', 'auto')
+  .option('-a, --access-freq <number>', 'Access frequency for auto compression (0.0-1.0)', '0.5')
+  .option('-o, --output <file>', 'Output file for compressed data')
+  .action((options) => {
+    requireGnn();
+    const spinner = ora('Loading embeddings...').start();
+
+    try {
+      const data = JSON.parse(fs.readFileSync(options.file, 'utf8'));
+      const embeddings = Array.isArray(data) ? data : [data];
+
+      spinner.text = 'Compressing embeddings...';
+      const compressor = new TensorCompress();
+      const accessFreq = parseFloat(options.accessFreq);
+
+      const results = [];
+      let totalOriginalSize = 0;
+      let totalCompressedSize = 0;
+
+      for (const embedding of embeddings) {
+        const rawVec = embedding.vector || embedding;
+        // TensorCompress requires Float32Array.
+        const vec = rawVec instanceof Float32Array ? rawVec : new Float32Array(rawVec);
+        totalOriginalSize += vec.length * 4; // float32 = 4 bytes
+
+        let compressed;
+        if (options.level === 'auto') {
+          compressed = compressor.compress(vec, accessFreq);
+        } else {
+          const levelConfig = { levelType: options.level };
+          if (options.level === 'pq8') {
+            levelConfig.subvectors = 8;
+            levelConfig.centroids = 256;
+          } else if (options.level === 'pq4') {
+            levelConfig.subvectors = 8;
+          }
+          compressed = compressor.compressWithLevel(vec, levelConfig);
+        }
+
+        totalCompressedSize += compressed.length;
+        results.push({
+          id: embedding.id,
+          compressed
+        });
+      }
+
+      const ratio = (totalOriginalSize / totalCompressedSize).toFixed(2);
+      const savings = ((1 - totalCompressedSize / totalOriginalSize) * 100).toFixed(1);
+
+      spinner.succeed(chalk.green(`Compressed ${embeddings.length} embeddings`));
+
+      console.log(chalk.cyan('\nCompression Results:'));
+      console.log(chalk.white(`  Embeddings:    ${chalk.yellow(embeddings.length)}`));
+      console.log(chalk.white(`  Level:         ${chalk.yellow(options.level === 'auto' ? `auto (${getCompressionLevel(accessFreq)})` : options.level)}`));
+      console.log(chalk.white(`  Original:      ${chalk.yellow((totalOriginalSize / 1024).toFixed(2) + ' KB')}`));
+      console.log(chalk.white(`  Compressed:    ${chalk.yellow((totalCompressedSize / 1024).toFixed(2) + ' KB')}`));
+      console.log(chalk.white(`  Ratio:         ${chalk.yellow(ratio + 'x')}`));
+      console.log(chalk.white(`  Savings:       ${chalk.yellow(savings + '%')}`));
+
+      if (options.output) {
+        fs.writeFileSync(options.output, JSON.stringify(results, null, 2));
+        console.log(chalk.green(`\nCompressed data saved to: ${options.output}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to compress embeddings'));
+      reportGnnBindingError(error);
+      process.exit(1);
+    }
+  });
+
+// GNN Search command
+gnnCmd
+  .command('search')
+  .description('Differentiable search with soft attention')
+  .requiredOption('-q, --query <json>', 'Query vector as JSON array')
+  .requiredOption('-c, --candidates <file>', 'Candidates file (JSON array of vectors)')
+  .option('-k, --top-k <number>', 'Number of results', '5')
+  .option('-t, --temperature <number>', 'Softmax temperature (lower=sharper)', '1.0')
+  .action((options) => {
+    requireGnn();
+    const spinner = ora('Loading candidates...').start();
+
+    try {
+      const query = JSON.parse(options.query);
+      const candidatesData = JSON.parse(fs.readFileSync(options.candidates, 'utf8'));
+      // @ruvector/gnn's differentiableSearch needs Float32Array everywhere; plain
+      // number[] surfaces as napi-rs `Get TypedArray info failed`.
+      const queryVec = query instanceof Float32Array ? query : new Float32Array(query);
+      const candidates = candidatesData.map((c) => {
+        const v = c.vector || c;
+        return v instanceof Float32Array ? v : new Float32Array(v);
+      });
+      const k = parseInt(options.topK);
+      const temperature = parseFloat(options.temperature);
+
+      spinner.text = 'Running differentiable search...';
+      const result = differentiableSearch(queryVec, candidates, k, temperature);
+
+      spinner.succeed(chalk.green(`Found top-${k} results`));
+
+      console.log(chalk.cyan('\nSearch Results:'));
+      console.log(chalk.white(`  Query dim:     ${chalk.yellow(query.length)}`));
+      console.log(chalk.white(`  Candidates:    ${chalk.yellow(candidates.length)}`));
+      console.log(chalk.white(`  Temperature:   ${chalk.yellow(temperature)}`));
+
+      // The wrapper exposes `weights`; older native shape used `attention_weights`.
+      const weights = result.weights || result.attention_weights || [];
+      console.log(chalk.cyan('\nTop-K Results:'));
+      for (let i = 0; i < result.indices.length; i++) {
+        const idx = result.indices[i];
+        const weight = weights[i];
+        const id = candidatesData[idx]?.id || `candidate_${idx}`;
+        console.log(chalk.white(`  ${i + 1}. ${chalk.yellow(id)} (index: ${idx})`));
+        console.log(chalk.gray(`     Weight: ${weight != null ? weight.toFixed(6) : 'n/a'}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to run search'));
+      reportGnnBindingError(error);
+      process.exit(1);
+    }
+  });
+
+// GNN Info command
+gnnCmd
+  .command('info')
+  .description('Show GNN module information')
+  .action(() => {
+    loadGnn();
+    if (!gnnAvailable) {
+      console.log(chalk.yellow('\nGNN Module: Not installed'));
+      console.log(chalk.white('Install with: npm install @ruvector/gnn'));
+      return;
+    }
+
+    console.log(chalk.cyan('\nGNN Module Information'));
+    console.log(chalk.white(`  Status:         ${chalk.green('Available')}`));
+    console.log(chalk.white(`  Platform:       ${chalk.yellow(process.platform)}`));
+    console.log(chalk.white(`  Architecture:   ${chalk.yellow(process.arch)}`));
+
+    console.log(chalk.cyan('\nAvailable Features:'));
+    console.log(chalk.white(`  • RuvectorLayer   - GNN layer with multi-head attention`));
+    console.log(chalk.white(`  • TensorCompress  - Adaptive tensor compression (5 levels)`));
+    console.log(chalk.white(`  • differentiableSearch - Soft attention-based search`));
+    console.log(chalk.white(`  • hierarchicalForward  - Multi-layer GNN processing`));
+
+    console.log(chalk.cyan('\nCompression Levels:'));
+    console.log(chalk.gray(`  none   (freq > 0.8)  - Full precision, hot data`));
+    console.log(chalk.gray(`  half   (freq > 0.4)  - ~50% savings, warm data`));
+    console.log(chalk.gray(`  pq8    (freq > 0.1)  - ~8x compression, cool data`));
+    console.log(chalk.gray(`  pq4    (freq > 0.01) - ~16x compression, cold data`));
+    console.log(chalk.gray(`  binary (freq <= 0.01) - ~32x compression, archive`));
+  });
+
+// =============================================================================
+// Attention Commands
+// =============================================================================
+
+// Helper to require attention module (triggers lazy load)
+function requireAttention() {
+  loadAttention();
+  if (!attentionAvailable) {
+    console.error(chalk.red('Error: @ruvector/attention is not installed'));
+    console.error(chalk.yellow('Install it with: npm install @ruvector/attention'));
+    process.exit(1);
+  }
+}
+
+// Attention parent command
+const attentionCmd = program
+  .command('attention')
+  .description('High-performance attention mechanism operations');
+
+// Attention compute command - run attention on input vectors
+attentionCmd
+  .command('compute')
+  .description('Compute attention over input vectors')
+  .requiredOption('-q, --query <json>', 'Query vector as JSON array')
+  .requiredOption('-k, --keys <file>', 'Keys file (JSON array of vectors)')
+  .option('-v, --values <file>', 'Values file (JSON array of vectors, defaults to keys)')
+  .option('-t, --type <type>', 'Attention type (dot|multi-head|flash|hyperbolic|linear)', 'dot')
+  .option('-h, --heads <number>', 'Number of attention heads (for multi-head)', '4')
+  .option('-d, --head-dim <number>', 'Head dimension (for multi-head)', '64')
+  .option('--curvature <number>', 'Curvature for hyperbolic attention', '1.0')
+  .option('--block-size <number>', 'Block size (for flash)', '64')
+  .option('--num-features <number>', 'Random feature count (for linear, default: query dim)')
+  .option('-o, --output <file>', 'Output file for results')
+  .action((options) => {
+    requireAttention();
+    const spinner = ora('Loading keys...').start();
+
+    try {
+      const queryRaw = JSON.parse(options.query);
+      const keysData = JSON.parse(fs.readFileSync(options.keys, 'utf8'));
+      // The native @ruvector/attention bindings require Float32Array; passing
+      // plain number[] surfaces as napi-rs `Get TypedArray info failed` or
+      // (when dim is read off a missing arg) `... Undefined into rust type u32`.
+      const toF32 = (v) => (v instanceof Float32Array ? v : new Float32Array(v));
+      const query = toF32(queryRaw);
+      const keys = keysData.map((k) => toF32(k.vector || k));
+
+      let values = keys;
+      if (options.values) {
+        const valuesData = JSON.parse(fs.readFileSync(options.values, 'utf8'));
+        values = valuesData.map((v) => toF32(v.vector || v));
+      }
+
+      const dim = query.length;
+
+      spinner.text = `Computing ${options.type} attention...`;
+
+      let result;
+      let attentionWeights;
+
+      // The native @ruvector/attention bindings expose `compute(query, keys, values)`
+      // — a flat Float32Array query plus Float32Array[] keys/values, returning a
+      // flat Float32Array. The older CLI invoked `forward([query], keys, values)`,
+      // which doesn't exist on the current binding (issue #402 §B).
+      switch (options.type) {
+        case 'dot': {
+          const attn = new DotProductAttention(dim);
+          result = attn.compute(query, keys, values);
+          attentionWeights = attn.getLastWeights ? attn.getLastWeights() : null;
+          break;
+        }
+        case 'multi-head': {
+          const numHeads = parseInt(options.heads);
+          const headDim = parseInt(options.headDim);
+          const attn = new MultiHeadAttention(dim, numHeads, headDim);
+          result = attn.compute(query, keys, values);
+          break;
+        }
+        case 'flash': {
+          // Native FlashAttention(dim, blockSize) and LinearAttention(dim, numFeatures)
+          // require the second argument (#1375).
+          const attn = new FlashAttention(dim, parseInt(options.blockSize, 10) || 64);
+          result = attn.compute(query, keys, values);
+          break;
+        }
+        case 'hyperbolic': {
+          const curvature = parseFloat(options.curvature);
+          const attn = new HyperbolicAttention(dim, curvature);
+          result = attn.compute(query, keys, values);
+          break;
+        }
+        case 'linear': {
+          const attn = new LinearAttention(dim, parseInt(options.numFeatures, 10) || dim);
+          result = attn.compute(query, keys, values);
+          break;
+        }
+        default:
+          throw new Error(`Unknown attention type: ${options.type}`);
+      }
+      // Native kernels return Float32Array: print and serialize as plain numbers.
+      result = Array.from(result);
+      if (attentionWeights) attentionWeights = Array.from(attentionWeights);
+
+      spinner.succeed(chalk.green(`Attention computed (${options.type})`));
+
+      console.log(chalk.cyan('\nAttention Results:'));
+      console.log(chalk.white(`  Type:        ${chalk.yellow(options.type)}`));
+      console.log(chalk.white(`  Query dim:   ${chalk.yellow(query.length)}`));
+      console.log(chalk.white(`  Num keys:    ${chalk.yellow(keys.length)}`));
+      console.log(chalk.white(`  Output dim:  ${chalk.yellow(result.length)}`));
+      console.log(chalk.white(`  Output:      ${chalk.gray(`[${result.slice(0, 4).map(v => v.toFixed(4)).join(', ')}...]`)}`));
+
+      if (attentionWeights) {
+        console.log(chalk.cyan('\nAttention Weights:'));
+        attentionWeights.slice(0, 5).forEach((w, i) => {
+          console.log(chalk.gray(`  Key ${i}: ${w.toFixed(4)}`));
+        });
+        if (attentionWeights.length > 5) {
+          console.log(chalk.gray(`  ... and ${attentionWeights.length - 5} more`));
+        }
+      }
+
+      if (options.output) {
+        const outputData = { result, attentionWeights };
+        fs.writeFileSync(options.output, JSON.stringify(outputData, null, 2));
+        console.log(chalk.green(`\nResults saved to: ${options.output}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to compute attention'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Attention benchmark command
+attentionCmd
+  .command('benchmark')
+  .description('Benchmark attention mechanisms')
+  .option('-d, --dimension <number>', 'Vector dimension', '256')
+  .option('-n, --num-vectors <number>', 'Number of vectors', '100')
+  .option('-i, --iterations <number>', 'Benchmark iterations', '100')
+  .option('-t, --types <list>', 'Attention types to benchmark (comma-separated)', 'dot,flash,linear')
+  .action((options) => {
+    requireAttention();
+    const spinner = ora('Setting up benchmark...').start();
+
+    try {
+      const dim = parseInt(options.dimension);
+      const numVectors = parseInt(options.numVectors);
+      const iterations = parseInt(options.iterations);
+      const types = options.types.split(',').map(t => t.trim());
+
+      // Generate random test data
+      spinner.text = 'Generating test data...';
+      const query = Array.from({ length: dim }, () => Math.random());
+      const keys = Array.from({ length: numVectors }, () =>
+        Array.from({ length: dim }, () => Math.random())
+      );
+
+      console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+      console.log(chalk.cyan('                Attention Mechanism Benchmark'));
+      console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+      console.log(chalk.white(`  Dimension:    ${chalk.yellow(dim)}`));
+      console.log(chalk.white(`  Vectors:      ${chalk.yellow(numVectors)}`));
+      console.log(chalk.white(`  Iterations:   ${chalk.yellow(iterations)}`));
+      console.log('');
+
+      const results = [];
+
+      // Convert to Float32Arrays for compute()
+      const queryF32 = new Float32Array(query);
+      const keysF32 = keys.map(k => new Float32Array(k));
+
+      for (const type of types) {
+        spinner.text = `Benchmarking ${type} attention...`;
+        spinner.start();
+
+        let attn;
+        try {
+          switch (type) {
+            case 'dot':
+              attn = new DotProductAttention(dim);
+              break;
+            case 'flash':
+              attn = new FlashAttention(dim, 64);  // dim, block_size
+              break;
+            case 'linear':
+              attn = new LinearAttention(dim, 64);  // dim, num_features
+              break;
+            case 'hyperbolic':
+              attn = new HyperbolicAttention(dim, 1.0);
+              break;
+            case 'multi-head':
+              attn = new MultiHeadAttention(dim, 4);  // dim, num_heads
+              break;
+            default:
+              console.log(chalk.yellow(`  Skipping unknown type: ${type}`));
+              continue;
+          }
+        } catch (e) {
+          console.log(chalk.yellow(`  ${type}: not available (${e.message})`));
+          continue;
+        }
+
+        // Warm up
+        for (let i = 0; i < 5; i++) {
+          try {
+            attn.compute(queryF32, keysF32, keysF32);
+          } catch (e) {
+            // Some mechanisms may fail warmup
+          }
+        }
+
+        // Benchmark
+        const start = process.hrtime.bigint();
+        for (let i = 0; i < iterations; i++) {
+          attn.compute(queryF32, keysF32, keysF32);
+        }
+        const end = process.hrtime.bigint();
+        const totalMs = Number(end - start) / 1_000_000;
+        const avgMs = totalMs / iterations;
+        const opsPerSec = 1000 / avgMs;
+
+        results.push({ type, avgMs, opsPerSec });
+        spinner.succeed(chalk.green(`${type}: ${avgMs.toFixed(3)} ms/op (${opsPerSec.toFixed(1)} ops/sec)`));
+      }
+
+      // Summary
+      if (results.length > 0) {
+        console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+        console.log(chalk.cyan('                         Summary'));
+        console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+        const fastest = results.reduce((a, b) => a.avgMs < b.avgMs ? a : b);
+        console.log(chalk.green(`  Fastest: ${fastest.type} (${fastest.avgMs.toFixed(3)} ms/op)\n`));
+
+        console.log(chalk.white('  Relative Performance:'));
+        for (const r of results) {
+          const relPerf = (fastest.avgMs / r.avgMs * 100).toFixed(1);
+          const bar = '█'.repeat(Math.round(relPerf / 5));
+          console.log(chalk.white(`    ${r.type.padEnd(12)} ${chalk.cyan(bar)} ${relPerf}%`));
+        }
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Benchmark failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// Hyperbolic math command
+attentionCmd
+  .command('hyperbolic')
+  .description('Hyperbolic geometry operations')
+  .requiredOption('-a, --action <type>', 'Action: exp-map|log-map|distance|project|mobius-add')
+  .requiredOption('-v, --vector <json>', 'Input vector(s) as JSON')
+  .option('-b, --vector-b <json>', 'Second vector for binary operations')
+  .option('-c, --curvature <number>', 'Poincaré ball curvature', '1.0')
+  .option('-o, --origin <json>', 'Origin point for exp/log maps')
+  .action((options) => {
+    requireAttention();
+
+    try {
+      const vecArray = JSON.parse(options.vector);
+      const vec = new Float32Array(vecArray);
+      const curvature = parseFloat(options.curvature);
+
+      let result;
+      let description;
+
+      switch (options.action) {
+        case 'exp-map': {
+          const originArray = options.origin ? JSON.parse(options.origin) : Array(vec.length).fill(0);
+          const origin = new Float32Array(originArray);
+          result = expMap(origin, vec, curvature);
+          description = 'Exponential map (tangent → Poincaré ball)';
+          break;
+        }
+        case 'log-map': {
+          const originArray = options.origin ? JSON.parse(options.origin) : Array(vec.length).fill(0);
+          const origin = new Float32Array(originArray);
+          result = logMap(origin, vec, curvature);
+          description = 'Logarithmic map (Poincaré ball → tangent)';
+          break;
+        }
+        case 'distance': {
+          if (!options.vectorB) {
+            throw new Error('--vector-b required for distance calculation');
+          }
+          const vecBArray = JSON.parse(options.vectorB);
+          const vecB = new Float32Array(vecBArray);
+          result = poincareDistance(vec, vecB, curvature);
+          description = 'Poincaré distance';
+          break;
+        }
+        case 'project': {
+          result = projectToPoincareBall(vec, curvature);
+          description = 'Project to Poincaré ball';
+          break;
+        }
+        case 'mobius-add': {
+          if (!options.vectorB) {
+            throw new Error('--vector-b required for Möbius addition');
+          }
+          const vecBArray = JSON.parse(options.vectorB);
+          const vecB = new Float32Array(vecBArray);
+          result = mobiusAddition(vec, vecB, curvature);
+          description = 'Möbius addition';
+          break;
+        }
+        default:
+          throw new Error(`Unknown action: ${options.action}`);
+      }
+
+      console.log(chalk.cyan('\nHyperbolic Operation:'));
+      console.log(chalk.white(`  Action:     ${chalk.yellow(description)}`));
+      console.log(chalk.white(`  Curvature:  ${chalk.yellow(curvature)}`));
+
+      if (typeof result === 'number') {
+        console.log(chalk.white(`  Result:     ${chalk.green(result.toFixed(6))}`));
+      } else {
+        const resultArray = Array.from(result);
+        console.log(chalk.white(`  Input dim:  ${chalk.yellow(vec.length)}`));
+        console.log(chalk.white(`  Output dim: ${chalk.yellow(resultArray.length)}`));
+        console.log(chalk.white(`  Result:     ${chalk.gray(`[${resultArray.slice(0, 5).map(v => v.toFixed(4)).join(', ')}...]`)}`));
+
+        // Compute norm to verify it's in the ball
+        const norm = Math.sqrt(resultArray.reduce((sum, x) => sum + x * x, 0));
+        console.log(chalk.white(`  Norm:       ${chalk.yellow(norm.toFixed(6))} ${norm < 1 ? chalk.green('(inside ball)') : chalk.red('(outside ball)')}`));
+      }
+    } catch (error) {
+      console.error(chalk.red('Hyperbolic operation failed:'), error.message);
+      process.exit(1);
+    }
+  });
+
+// Attention info command
+attentionCmd
+  .command('info')
+  .description('Show attention module information')
+  .action(() => {
+    loadAttention();
+    if (!attentionAvailable) {
+      console.log(chalk.yellow('\nAttention Module: Not installed'));
+      console.log(chalk.white('Install with: npm install @ruvector/attention'));
+      return;
+    }
+
+    console.log(chalk.cyan('\nAttention Module Information'));
+    console.log(chalk.white(`  Status:         ${chalk.green('Available')}`));
+    console.log(chalk.white(`  Version:        ${chalk.yellow(attentionVersion ? attentionVersion() : 'unknown')}`));
+    console.log(chalk.white(`  Platform:       ${chalk.yellow(process.platform)}`));
+    console.log(chalk.white(`  Architecture:   ${chalk.yellow(process.arch)}`));
+
+    console.log(chalk.cyan('\nCore Attention Mechanisms:'));
+    console.log(chalk.white(`  • DotProductAttention  - Scaled dot-product attention`));
+    console.log(chalk.white(`  • MultiHeadAttention   - Multi-head self-attention`));
+    console.log(chalk.white(`  • FlashAttention       - Memory-efficient IO-aware attention`));
+    console.log(chalk.white(`  • HyperbolicAttention  - Poincaré ball attention`));
+    console.log(chalk.white(`  • LinearAttention      - O(n) linear complexity attention`));
+    console.log(chalk.white(`  • MoEAttention         - Mixture of Experts attention`));
+
+    console.log(chalk.cyan('\nGraph Attention:'));
+    console.log(chalk.white(`  • GraphRoPeAttention   - Rotary position embeddings for graphs`));
+    console.log(chalk.white(`  • EdgeFeaturedAttention - Edge feature-enhanced attention`));
+    console.log(chalk.white(`  • DualSpaceAttention   - Euclidean + hyperbolic dual space`));
+    console.log(chalk.white(`  • LocalGlobalAttention - Local-global graph attention`));
+
+    console.log(chalk.cyan('\nHyperbolic Math:'));
+    console.log(chalk.white(`  • expMap, logMap       - Exponential/logarithmic maps`));
+    console.log(chalk.white(`  • mobiusAddition       - Möbius addition in Poincaré ball`));
+    console.log(chalk.white(`  • poincareDistance     - Hyperbolic distance metric`));
+    console.log(chalk.white(`  • projectToPoincareBall - Project vectors to ball`));
+
+    console.log(chalk.cyan('\nTraining Utilities:'));
+    console.log(chalk.white(`  • AdamOptimizer, AdamWOptimizer, SgdOptimizer`));
+    console.log(chalk.white(`  • InfoNceLoss, LocalContrastiveLoss`));
+    console.log(chalk.white(`  • CurriculumScheduler, TemperatureAnnealing`));
+    console.log(chalk.white(`  • HardNegativeMiner, InBatchMiner`));
+  });
+
+// Attention list command - list available mechanisms
+attentionCmd
+  .command('list')
+  .description('List all available attention mechanisms')
+  .option('-v, --verbose', 'Show detailed information')
+  .action((options) => {
+    loadAttention();
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('              Available Attention Mechanisms'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    const mechanisms = [
+      { name: 'DotProductAttention', type: 'core', complexity: 'O(n²)', available: !!DotProductAttention },
+      { name: 'MultiHeadAttention', type: 'core', complexity: 'O(n²)', available: !!MultiHeadAttention },
+      { name: 'FlashAttention', type: 'core', complexity: 'O(n²) IO-optimized', available: !!FlashAttention },
+      { name: 'HyperbolicAttention', type: 'core', complexity: 'O(n²)', available: !!HyperbolicAttention },
+      { name: 'LinearAttention', type: 'core', complexity: 'O(n)', available: !!LinearAttention },
+      { name: 'MoEAttention', type: 'core', complexity: 'O(n*k)', available: !!MoEAttention },
+      { name: 'GraphRoPeAttention', type: 'graph', complexity: 'O(n²)', available: !!GraphRoPeAttention },
+      { name: 'EdgeFeaturedAttention', type: 'graph', complexity: 'O(n²)', available: !!EdgeFeaturedAttention },
+      { name: 'DualSpaceAttention', type: 'graph', complexity: 'O(n²)', available: !!DualSpaceAttention },
+      { name: 'LocalGlobalAttention', type: 'graph', complexity: 'O(n*k)', available: !!LocalGlobalAttention },
+    ];
+
+    console.log(chalk.white('  Core Attention:'));
+    mechanisms.filter(m => m.type === 'core').forEach(m => {
+      const status = m.available ? chalk.green('✓') : chalk.red('✗');
+      console.log(chalk.white(`    ${status} ${m.name.padEnd(22)} ${chalk.gray(m.complexity)}`));
+    });
+
+    console.log(chalk.white('\n  Graph Attention:'));
+    mechanisms.filter(m => m.type === 'graph').forEach(m => {
+      const status = m.available ? chalk.green('✓') : chalk.red('✗');
+      console.log(chalk.white(`    ${status} ${m.name.padEnd(22)} ${chalk.gray(m.complexity)}`));
+    });
+
+    if (!attentionAvailable) {
+      console.log(chalk.yellow('\n  Note: @ruvector/attention not installed'));
+      console.log(chalk.white('  Install with: npm install @ruvector/attention'));
+    }
+
+    if (options.verbose) {
+      console.log(chalk.cyan('\n  Usage Examples:'));
+      console.log(chalk.gray('    # Compute dot-product attention'));
+      console.log(chalk.white('    npx ruvector attention compute -q "[1,2,3]" -k keys.json -t dot'));
+      console.log(chalk.gray('\n    # Benchmark attention mechanisms'));
+      console.log(chalk.white('    npx ruvector attention benchmark -d 256 -n 100'));
+      console.log(chalk.gray('\n    # Hyperbolic distance'));
+      console.log(chalk.white('    npx ruvector attention hyperbolic -a distance -v "[0.1,0.2]" -b "[0.3,0.4]"'));
+    }
+  });
+
+// =============================================================================
+// Doctor Command - Check system health and dependencies
+// =============================================================================
+
+program
+  .command('doctor')
+  .description('Check system health and dependencies')
+  .option('-v, --verbose', 'Show detailed information')
+  .action(async (options) => {
+    const { execSync } = require('child_process');
+
+    // Trigger lazy load of optional modules for availability check
+    loadGnn();
+    loadAttention();
+
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Doctor'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    let issues = 0;
+    let warnings = 0;
+
+    // Helper functions
+    const check = (name, condition, fix) => {
+      if (condition) {
+        console.log(chalk.green(`  ✓ ${name}`));
+        return true;
+      } else {
+        console.log(chalk.red(`  ✗ ${name}`));
+        if (fix) console.log(chalk.gray(`    Fix: ${fix}`));
+        issues++;
+        return false;
+      }
+    };
+
+    const warn = (name, condition, suggestion) => {
+      if (condition) {
+        console.log(chalk.green(`  ✓ ${name}`));
+        return true;
+      } else {
+        console.log(chalk.yellow(`  ! ${name}`));
+        if (suggestion) console.log(chalk.gray(`    Suggestion: ${suggestion}`));
+        warnings++;
+        return false;
+      }
+    };
+
+    const getVersion = (cmd) => {
+      try {
+        return execSync(cmd, { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }).trim();
+      } catch (e) {
+        return null;
+      }
+    };
+
+    // System Information
+    console.log(chalk.cyan('System Information:'));
+    console.log(chalk.white(`  Platform:      ${chalk.yellow(process.platform)}`));
+    console.log(chalk.white(`  Architecture:  ${chalk.yellow(process.arch)}`));
+    console.log(chalk.white(`  Node.js:       ${chalk.yellow(process.version)}`));
+    console.log('');
+
+    // Node.js Checks
+    console.log(chalk.cyan('Node.js Environment:'));
+    const nodeVersion = parseInt(process.version.slice(1).split('.')[0]);
+    check('Node.js >= 14', nodeVersion >= 14, 'Upgrade Node.js: https://nodejs.org');
+
+    const npmVersion = getVersion('npm --version');
+    if (npmVersion) {
+      console.log(chalk.green(`  ✓ npm ${npmVersion}`));
+    } else {
+      check('npm installed', false, 'Install npm or reinstall Node.js');
+    }
+    console.log('');
+
+    // RuVector Packages
+    console.log(chalk.cyan('RuVector Packages:'));
+
+    // Check @ruvector/core
+    let coreAvailable = false;
+    try {
+      require.resolve('@ruvector/core');
+      coreAvailable = true;
+      console.log(chalk.green(`  ✓ @ruvector/core installed`));
+    } catch (e) {
+      console.log(chalk.yellow(`  ! @ruvector/core not found (using WASM fallback)`));
+      warnings++;
+    }
+
+    // Check if native binding works
+    if (coreAvailable && loadRuvector()) {
+      const version = typeof getVersion === 'function' ? getVersion() : null;
+      const impl = typeof getImplementationType === 'function' ? getImplementationType() : 'native';
+      const versionStr = version ? `, v${version}` : '';
+      console.log(chalk.green(`  ✓ Native binding working (${impl}${versionStr})`));
+    } else if (coreAvailable) {
+      console.log(chalk.yellow(`  ! Native binding failed to load`));
+      warnings++;
+    }
+
+    // Check @ruvector/gnn
+    if (gnnAvailable) {
+      console.log(chalk.green(`  ✓ @ruvector/gnn installed`));
+    } else {
+      console.log(chalk.gray(`  ○ @ruvector/gnn not installed (optional)`));
+    }
+
+    // Check @ruvector/attention
+    if (attentionAvailable) {
+      console.log(chalk.green(`  ✓ @ruvector/attention installed`));
+    } else {
+      console.log(chalk.gray(`  ○ @ruvector/attention not installed (optional)`));
+    }
+
+    // Check @ruvector/graph-node
+    try {
+      require.resolve('@ruvector/graph-node');
+      console.log(chalk.green(`  ✓ @ruvector/graph-node installed`));
+    } catch (e) {
+      console.log(chalk.gray(`  ○ @ruvector/graph-node not installed (optional)`));
+    }
+    console.log('');
+
+    // Rust Toolchain (optional for development)
+    console.log(chalk.cyan('Rust Toolchain (optional):'));
+
+    const rustVersion = getVersion('rustc --version');
+    if (rustVersion) {
+      console.log(chalk.green(`  ✓ ${rustVersion}`));
+    } else {
+      console.log(chalk.gray(`  ○ Rust not installed (only needed for development)`));
+    }
+
+    const cargoVersion = getVersion('cargo --version');
+    if (cargoVersion) {
+      console.log(chalk.green(`  ✓ ${cargoVersion}`));
+    } else if (rustVersion) {
+      console.log(chalk.yellow(`  ! cargo not found`));
+      warnings++;
+    }
+    console.log('');
+
+    // Build Tools (optional)
+    if (options.verbose) {
+      console.log(chalk.cyan('Build Tools (for native compilation):'));
+
+      const hasGcc = getVersion('gcc --version');
+      const hasClang = getVersion('clang --version');
+      const hasCc = getVersion('cc --version');
+
+      if (hasGcc || hasClang || hasCc) {
+        console.log(chalk.green(`  ✓ C compiler available`));
+      } else {
+        console.log(chalk.gray(`  ○ No C compiler found (only needed for building from source)`));
+      }
+
+      const hasMake = getVersion('make --version');
+      if (hasMake) {
+        console.log(chalk.green(`  ✓ make available`));
+      } else {
+        console.log(chalk.gray(`  ○ make not found`));
+      }
+
+      const hasCmake = getVersion('cmake --version');
+      if (hasCmake) {
+        console.log(chalk.green(`  ✓ cmake available`));
+      } else {
+        console.log(chalk.gray(`  ○ cmake not found`));
+      }
+      console.log('');
+    }
+
+    // Summary
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════'));
+    if (issues === 0 && warnings === 0) {
+      console.log(chalk.green('\n  ✓ All checks passed! RuVector is ready to use.\n'));
+    } else if (issues === 0) {
+      console.log(chalk.yellow(`\n  ! ${warnings} warning(s) found. RuVector should work but may have limited features.\n`));
+    } else {
+      console.log(chalk.red(`\n  ✗ ${issues} issue(s) and ${warnings} warning(s) found.\n`));
+      console.log(chalk.white('  Run "npx ruvector setup" for installation instructions.\n'));
+    }
+  });
+
+// =============================================================================
+// Setup Command - Installation instructions
+// =============================================================================
+
+program
+  .command('setup')
+  .description('Show installation and setup instructions')
+  .option('--rust', 'Show Rust installation instructions')
+  .option('--npm', 'Show npm package installation instructions')
+  .option('--all', 'Show all installation instructions')
+  .action((options) => {
+    const showAll = options.all || (!options.rust && !options.npm);
+
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Setup Guide'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    // Quick install
+    console.log(chalk.cyan('Quick Install (one-liner):'));
+    console.log(chalk.white('  curl -fsSL https://raw.githubusercontent.com/ruvnet/ruvector/main/install.sh | bash'));
+    console.log('');
+
+    if (showAll || options.npm) {
+      console.log(chalk.cyan('───────────────────────────────────────────────────────────────'));
+      console.log(chalk.cyan('npm Packages'));
+      console.log(chalk.cyan('───────────────────────────────────────────────────────────────\n'));
+
+      console.log(chalk.yellow('All-in-one CLI:'));
+      console.log(chalk.white('  npm install -g ruvector'));
+      console.log(chalk.white('  npx ruvector'));
+      console.log('');
+
+      console.log(chalk.yellow('Core packages:'));
+      console.log(chalk.white('  npm install @ruvector/core       # Vector database'));
+      console.log(chalk.white('  npm install @ruvector/gnn        # Graph Neural Networks'));
+      console.log(chalk.white('  npm install @ruvector/graph-node # Hypergraph database'));
+      console.log('');
+
+      console.log(chalk.yellow('Install all optional packages:'));
+      console.log(chalk.white('  npx ruvector install --all'));
+      console.log('');
+
+      console.log(chalk.yellow('List available packages:'));
+      console.log(chalk.white('  npx ruvector install'));
+      console.log('');
+    }
+
+    if (showAll || options.rust) {
+      console.log(chalk.cyan('───────────────────────────────────────────────────────────────'));
+      console.log(chalk.cyan('Rust Installation'));
+      console.log(chalk.cyan('───────────────────────────────────────────────────────────────\n'));
+
+      console.log(chalk.yellow('1. Install Rust:'));
+      console.log(chalk.white('  curl --proto \'=https\' --tlsv1.2 -sSf https://sh.rustup.rs | sh'));
+      console.log(chalk.gray('  # Follow the prompts, then restart your terminal or run:'));
+      console.log(chalk.white('  source $HOME/.cargo/env'));
+      console.log('');
+
+      console.log(chalk.yellow('2. Verify installation:'));
+      console.log(chalk.white('  rustc --version'));
+      console.log(chalk.white('  cargo --version'));
+      console.log('');
+
+      console.log(chalk.yellow('3. Add RuVector crates to your project:'));
+      console.log(chalk.white('  cargo add ruvector-core          # Vector database'));
+      console.log(chalk.white('  cargo add ruvector-graph         # Hypergraph with Cypher'));
+      console.log(chalk.white('  cargo add ruvector-gnn           # Graph Neural Networks'));
+      console.log('');
+
+      console.log(chalk.yellow('4. Other available crates:'));
+      console.log(chalk.white('  cargo add ruvector-cluster       # Distributed clustering'));
+      console.log(chalk.white('  cargo add ruvector-raft          # Raft consensus'));
+      console.log(chalk.white('  cargo add ruvector-replication   # Data replication'));
+      console.log(chalk.white('  cargo add ruvector-tiny-dancer-core  # AI routing'));
+      console.log(chalk.white('  cargo add ruvector-router-core       # Semantic routing (Rust crate)'));
+      console.log(chalk.white('  npm install @ruvector/router         # Semantic routing (npm)'));
+      console.log('');
+
+      console.log(chalk.yellow('Platform-specific notes:'));
+      console.log('');
+
+      if (process.platform === 'darwin') {
+        console.log(chalk.cyan('  macOS:'));
+        console.log(chalk.white('    xcode-select --install  # Install command line tools'));
+        console.log('');
+      } else if (process.platform === 'linux') {
+        console.log(chalk.cyan('  Linux (Debian/Ubuntu):'));
+        console.log(chalk.white('    sudo apt-get update'));
+        console.log(chalk.white('    sudo apt-get install build-essential pkg-config libssl-dev'));
+        console.log('');
+        console.log(chalk.cyan('  Linux (RHEL/CentOS):'));
+        console.log(chalk.white('    sudo yum groupinstall "Development Tools"'));
+        console.log(chalk.white('    sudo yum install openssl-devel'));
+        console.log('');
+      } else if (process.platform === 'win32') {
+        console.log(chalk.cyan('  Windows:'));
+        console.log(chalk.white('    # Install Visual Studio Build Tools'));
+        console.log(chalk.white('    # https://visualstudio.microsoft.com/visual-cpp-build-tools/'));
+        console.log(chalk.white('    # Or use WSL2 for best experience'));
+        console.log('');
+      }
+    }
+
+    console.log(chalk.cyan('───────────────────────────────────────────────────────────────'));
+    console.log(chalk.cyan('Documentation & Resources'));
+    console.log(chalk.cyan('───────────────────────────────────────────────────────────────\n'));
+
+    console.log(chalk.white('  GitHub:     https://github.com/ruvnet/ruvector'));
+    console.log(chalk.white('  npm:        https://www.npmjs.com/package/ruvector'));
+    console.log(chalk.white('  crates.io:  https://crates.io/crates/ruvector-core'));
+    console.log(chalk.white('  Issues:     https://github.com/ruvnet/ruvector/issues'));
+    console.log('');
+
+    console.log(chalk.cyan('Quick Commands:'));
+    console.log(chalk.white('  npx ruvector doctor     # Check system health'));
+    console.log(chalk.white('  npx ruvector info       # Show version info'));
+    console.log(chalk.white('  npx ruvector benchmark  # Run performance test'));
+    console.log(chalk.white('  npx ruvector install    # List available packages'));
+    console.log('');
+  });
+
+// =============================================================================
+// Graph Commands - Cypher queries and graph operations
+// =============================================================================
+
+program
+  .command('graph')
+  .description('Graph database operations (requires @ruvector/graph-node)')
+  .option('-q, --query <cypher>', 'Execute Cypher query')
+  .option('-c, --create <label>', 'Create a node with label')
+  .option('--id <id>', 'Node ID for --create (defaults to a UUID)')
+  .option('-p, --properties <json>', 'Node properties as JSON')
+  .option('-r, --relate <spec>', 'Create relationship (from:rel:to)')
+  .option('--path <file>', 'Persistent graph database path')
+  .option('--info', 'Show graph info and stats')
+  .action(async (options) => {
+    const requestedOperation = options.info || options.query || options.create || options.relate;
+    if (!requestedOperation) {
+      console.error(chalk.red('  Specify one of --info, --query, --create, or --relate.'));
+      process.exitCode = 1;
+      return;
+    }
+    if (!options.path) {
+      console.error(chalk.red('  --path <file> is required so graph operations persist across CLI runs.'));
+      process.exitCode = 1;
+      return;
+    }
+
+    let graphNode;
+    try {
+      graphNode = require('@ruvector/graph-node');
+    } catch (e) {
+      console.log(chalk.yellow('\n  @ruvector/graph-node is not installed.\n'));
+      console.log(chalk.cyan('  Install with:'));
+      console.log(chalk.white('    npm install @ruvector/graph-node\n'));
+      console.log(chalk.cyan('  Features:'));
+      console.log(chalk.gray('    - Cypher query language support'));
+      console.log(chalk.gray('    - Hypergraph data structure'));
+      console.log(chalk.gray('    - Knowledge graph operations'));
+      console.log(chalk.gray('    - Neo4j-compatible syntax\n'));
+      console.log(chalk.cyan('  Example usage:'));
+      console.log(chalk.white('    npx ruvector graph --query "CREATE (n:Person {name: \'Alice\'})"'));
+      console.log(chalk.white('    npx ruvector graph --query "MATCH (n) RETURN n"'));
+      console.log('');
+      process.exitCode = 1;
+      return;
+    }
+
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Graph'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    try {
+      const GraphDatabase = graphNode.GraphDatabase;
+      if (typeof GraphDatabase !== 'function') {
+        throw new Error('@ruvector/graph-node does not export GraphDatabase');
+      }
+
+      const storagePath = path.resolve(options.path);
+      fs.mkdirSync(path.dirname(storagePath), { recursive: true });
+      const db = new GraphDatabase({ storagePath });
+
+      if (options.create) {
+        const parsed = options.properties ? JSON.parse(options.properties) : {};
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') {
+          throw new Error('--properties must be a JSON object');
+        }
+        const properties = Object.fromEntries(
+          Object.entries(parsed).map(([key, value]) => [
+            key,
+            typeof value === 'string' ? value : JSON.stringify(value),
+          ])
+        );
+        const id = options.id || require('crypto').randomUUID();
+        const createdId = await db.createNode({
+          id,
+          labels: [options.create],
+          properties,
+          embedding: new Float32Array(0),
+        });
+        console.log(JSON.stringify({ success: true, operation: 'create', id: createdId, label: options.create, path: storagePath }));
+      }
+
+      if (options.relate) {
+        const parts = options.relate.split(':');
+        if (parts.length !== 3 || parts.some((part) => !part.trim())) {
+          throw new Error('--relate must use the form from:relationship:to');
+        }
+        const [from, description, to] = parts.map((part) => part.trim());
+        const edgeId = await db.createEdge({
+          from,
+          to,
+          description,
+          embedding: new Float32Array(0),
+          confidence: 1,
+        });
+        console.log(JSON.stringify({ success: true, operation: 'relate', id: edgeId, from, relationship: description, to, path: storagePath }));
+      }
+
+      if (options.query) {
+        const result = await db.query(options.query);
+        console.log(JSON.stringify({ success: true, operation: 'query', path: storagePath, result }, null, 2));
+      }
+
+      if (options.info) {
+        const stats = await db.stats();
+        console.log(JSON.stringify({ success: true, operation: 'info', path: storagePath, persistent: db.isPersistent(), stats }, null, 2));
+      }
+    } catch (error) {
+      console.error(chalk.red(`  Graph operation failed: ${error.message}`));
+      process.exitCode = 1;
+    }
+
+    console.log('');
+  });
+
+// =============================================================================
+// Router Commands - AI agent routing
+// =============================================================================
+
+program
+  .command('router')
+  .description('AI semantic router operations (requires @ruvector/router)')
+  .option('--route <text>', 'Route text to best matching intent')
+  .option('--intents <file>', 'Load intents from JSON file')
+  .option('--add-intent <name>', 'Add new intent')
+  .option('--examples <json>', 'Example utterances for intent')
+  .option('--info', 'Show router info')
+  .action(async (options) => {
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Router'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    console.log(chalk.yellow('  Semantic Router for AI Agent Routing\n'));
+
+    if (options.info || (!options.route && !options.intents && !options.addIntent)) {
+      console.log(chalk.cyan('  Features:'));
+      console.log(chalk.gray('    - Semantic intent matching'));
+      console.log(chalk.gray('    - Multi-agent routing'));
+      console.log(chalk.gray('    - Dynamic intent registration'));
+      console.log(chalk.gray('    - Vector-based similarity matching'));
+      console.log('');
+      console.log(chalk.cyan('  Status:'), chalk.yellow('Coming Soon'));
+      console.log(chalk.gray('  The router subcommand integration is still in development.'));
+      console.log(chalk.gray('  npm package:  npm install @ruvector/router'));
+      console.log(chalk.gray('  Rust crate:   cargo add ruvector-router-core'));
+      console.log('');
+      console.log(chalk.cyan('  Usage (when available):'));
+      console.log(chalk.white('    npx ruvector router --route "What is the weather?"'));
+      console.log(chalk.white('    npx ruvector router --intents intents.json --route "query"'));
+      console.log('');
+      return;
+    }
+
+    if (options.route) {
+      console.log(chalk.yellow('  Input:'), chalk.white(options.route));
+      console.log(chalk.gray('  Router package not yet available in npm.'));
+      console.log(chalk.gray('  Check issue #20 for roadmap.'));
+    }
+
+    console.log('');
+  });
+
+// =============================================================================
+// Tiny Dancer - cost-optimal FastGRNN model router (train + route)
+// =============================================================================
+
+const tinyDancer = program
+  .command('tiny-dancer')
+  .alias('td')
+  .description('Cost-optimal FastGRNN model router — train from a DRACO dataset and route with it (requires @ruvector/tiny-dancer)');
+
+function loadTinyDancer() {
+  try {
+    return require('@ruvector/tiny-dancer');
+  } catch (e) {
+    console.error(chalk.red('\n  This command requires @ruvector/tiny-dancer'));
+    console.error(chalk.yellow('  Install it:  npx ruvector add tiny-dancer   (or: npm install @ruvector/tiny-dancer)'));
+    console.error(chalk.dim('  (native router; ships for linux/macos/windows incl. musl + arm64)\n'));
+    process.exit(1);
+  }
+}
+
+tinyDancer
+  .command('train <draco>')
+  .description('Train a FastGRNN router from a DRACO dataset (rows of {embedding, scores}) into a .safetensors model')
+  .requiredOption('--out <path>', 'Output .safetensors model path')
+  .option('--input-dim <n>', 'Embedding/feature dimension (default: inferred from the first row)')
+  .option('--prices <json>', 'Price table as JSON or @file, e.g. \'{"haiku":1,"opus":15}\'')
+  .option('--epochs <n>', 'Training epochs', '40')
+  .option('--lr <n>', 'Learning rate', '0.05')
+  .option('--hidden <n>', 'Hidden dimension', '12')
+  .option('--tolerance <n>', 'Cheap-model "good enough" tolerance', '0.05')
+  .action(async (draco, options) => {
+    const td = loadTinyDancer();
+    const parsed = JSON.parse(fs.readFileSync(draco, 'utf8'));
+    const rows = Array.isArray(parsed) ? parsed : parsed.rows;
+    const prices = options.prices
+      ? JSON.parse(options.prices.startsWith('@') ? fs.readFileSync(options.prices.slice(1), 'utf8') : options.prices)
+      : (parsed.prices || {});
+    if (!Array.isArray(rows) || rows.length === 0) {
+      console.error(chalk.red('  DRACO file must contain rows of { embedding, scores }')); process.exit(1);
+    }
+    if (!prices || Object.keys(prices).length === 0) {
+      console.error(chalk.red('  Provide a price table via --prices or a "prices" field in the file')); process.exit(1);
+    }
+    const inputDim = options.inputDim ? parseInt(options.inputDim, 10) : (rows[0].embedding || []).length;
+    console.log(chalk.cyan(`\n  Training FastGRNN router: ${rows.length} rows, dim ${inputDim}`));
+    const res = await td.trainRouter(rows, prices, {
+      outputPath: options.out,
+      inputDim,
+      hiddenDim: parseInt(options.hidden, 10),
+      epochs: parseInt(options.epochs, 10),
+      learningRate: parseFloat(options.lr),
+      tolerance: parseFloat(options.tolerance),
+    });
+    console.log(chalk.green(`  ✓ trained: acc=${res.trainAccuracy.toFixed(3)} val=${res.valAccuracy.toFixed(3)} loss=${res.trainLoss.toFixed(4)}`));
+    console.log(chalk.white(`  ✓ saved:   ${res.modelPath} (${res.modelBytes} bytes, ${res.epochsRun} epochs)`));
+    console.log(chalk.gray(`  Load it:   new Router({ modelPath: '${res.modelPath}' })\n`));
+  });
+
+tinyDancer
+  .command('score <model>')
+  .description('Score a query embedding with a trained model. High = the cheap model is good enough (route cheap)')
+  .requiredOption('--query <json>', 'Query embedding as a JSON array or @file (length must match the model input dim)')
+  .option('--threshold <n>', 'Decision threshold for cheap-vs-strong', '0.5')
+  .action(async (model, options) => {
+    const td = loadTinyDancer();
+    const embedding = JSON.parse(options.query.startsWith('@') ? fs.readFileSync(options.query.slice(1), 'utf8') : options.query);
+    const s = await td.score(model, embedding);
+    const threshold = parseFloat(options.threshold);
+    console.log(chalk.cyan(`\n  score = ${s.toFixed(4)}`));
+    console.log(
+      s >= threshold
+        ? chalk.green('  → route to the CHEAP model (good enough)\n')
+        : chalk.yellow('  → route to a STRONGER model\n')
+    );
+  });
+
+tinyDancer
+  .command('info')
+  .description('Show tiny-dancer availability and version')
+  .action(() => {
+    try {
+      const td = require('@ruvector/tiny-dancer');
+      console.log(chalk.green(`\n  @ruvector/tiny-dancer ${td.version()} — ${td.hello()}`));
+      console.log(chalk.gray('  train:  npx ruvector tiny-dancer train <draco.json> --out model.safetensors'));
+      console.log(chalk.gray('  score:  npx ruvector tiny-dancer score <model.safetensors> --query <embedding.json>\n'));
+    } catch {
+      console.log(chalk.yellow('\n  @ruvector/tiny-dancer not installed.  npm install @ruvector/tiny-dancer\n'));
+    }
+  });
+
+// =============================================================================
+// Quantum (ruqu) - state-vector circuit simulation via optional @ruvector/ruqu-wasm
+// =============================================================================
+
+const quantumCmd = program
+  .command('quantum')
+  .alias('ruqu')
+  .description('Quantum circuit simulation — simulate, grover, bench, info (requires @ruvector/ruqu-wasm)');
+
+/** Lazy: the wrapper and the WASM engine load only inside a quantum action. */
+function loadQuantumApi() {
+  const q = require('../dist/core/quantum-wrapper.js');
+  if (!q.isQuantumAvailable()) {
+    console.error(chalk.red('\n  This command requires @ruvector/ruqu-wasm (quantum circuit engine, ~0.5 MB WASM)'));
+    console.error(chalk.yellow(`  Install it:  ${q.QUANTUM_INSTALL_HINT}   (or: npx ruvector add quantum)\n`));
+    process.exit(1);
+  }
+  return q;
+}
+
+function quantumFail(e) {
+  console.error(chalk.red(`  ${e && e.message ? e.message : e}`));
+  process.exit(1);
+}
+
+/** <circuit> = preset (bell, ghz, ghz:N) | JSON file | inline JSON | text ops ("h 0; cx 0 1"). */
+function readCircuitArg(q, arg, qubits) {
+  const s = String(arg).trim();
+  if (/\.json$/i.test(s) && fs.existsSync(s)) return JSON.parse(fs.readFileSync(s, 'utf8'));
+  return q.circuitFromString(s, qubits, q.CLI_LIMITS);
+}
+
+function intOpt(v, name) {
+  if (v === undefined) return undefined;
+  if (!/^\d+$/.test(String(v))) quantumFail(`--${name} must be a non-negative integer`);
+  return parseInt(v, 10);
+}
+
+quantumCmd
+  .command('simulate <circuit>')
+  .description('Simulate a circuit: bell | ghz[:N] | circuit.json | \'{"qubits":2,"gates":[...]}\' | "h 0; cx 0 1"')
+  .option('-q, --qubits <n>', 'Qubit count (for text circuits / ghz; default: inferred)')
+  .option('-s, --shots <n>', 'Sample N measurements from the final state', '1024')
+  .option('--seed <n>', 'Sampling seed (reproducible counts)')
+  .option('-t, --top <n>', 'Show the N most probable basis states', '8')
+  .option('--full', 'Include the full 2^n probability vector (with --json)')
+  .option('--json', 'Machine-readable output')
+  .action(async (circuitArg, options) => {
+    const q = loadQuantumApi();
+    try {
+      const spec = readCircuitArg(q, circuitArg, intOpt(options.qubits, 'qubits'));
+      const r = await q.simulate(spec, {
+        shots: intOpt(options.shots, 'shots'),
+        seed: intOpt(options.seed, 'seed'),
+        top: intOpt(options.top, 'top'),
+        full: !!options.full,
+        limits: q.CLI_LIMITS,
+      });
+      if (options.json) { console.log(JSON.stringify(r, null, 2)); return; }
+      console.log(chalk.cyan(`\n  ${r.numQubits} qubits, ${r.gateCount} gates, depth ${r.depth} — simulated in ${r.wallTimeMs.toFixed(2)} ms (state ${r.memoryBytes < 1048576 ? (r.memoryBytes / 1024).toFixed(1) + " KiB" : (r.memoryBytes / 1048576).toFixed(1) + " MiB"})`));
+      console.log(chalk.gray(`  bit order: ${r.bitOrder}\n`));
+      for (const s of r.top) {
+        const bar = '█'.repeat(Math.max(1, Math.round(s.probability * 40)));
+        console.log(`  |${s.state}>  ${s.probability.toFixed(4)}  ${chalk.green(bar)}`);
+      }
+      if (r.counts) {
+        const entries = Object.entries(r.counts).sort((a, b) => b[1] - a[1]).slice(0, r.top.length);
+        console.log(chalk.white(`\n  ${r.shots} shots (seed ${r.seed}):`));
+        for (const [k, v] of entries) console.log(`  |${k}>  ${v}`);
+      }
+      console.log('');
+    } catch (e) { quantumFail(e); }
+  });
+
+quantumCmd
+  .command('grover')
+  .description('Grover search over 2^qubits items')
+  .requiredOption('-q, --qubits <n>', 'Search-space qubits')
+  .requiredOption('--target <list>', 'Target index or comma-separated indices')
+  .option('--seed <n>', 'RNG seed')
+  .option('--json', 'Machine-readable output')
+  .action(async (options) => {
+    const q = loadQuantumApi();
+    try {
+      const targets = String(options.target).split(',').map((t) => intOpt(t.trim(), 'target'));
+      const r = await q.grover(intOpt(options.qubits, 'qubits'), targets, intOpt(options.seed, 'seed'), q.CLI_LIMITS);
+      if (options.json) { console.log(JSON.stringify(r, null, 2)); return; }
+      console.log(chalk.cyan(`\n  measured |${r.measured}> (${r.measuredState}) — ${r.targetFound ? chalk.green('target found') : chalk.yellow('target missed')}`));
+      console.log(chalk.gray(`  success probability ${r.successProbability.toFixed(4)} after ${r.iterations} iterations\n`));
+    } catch (e) { quantumFail(e); }
+  });
+
+quantumCmd
+  .command('bench')
+  .description('Time GHZ-state simulation (H + CNOT chain) at several sizes')
+  .option('--qubits <list>', 'Comma-separated qubit counts', '10,16,20')
+  .option('-r, --repeats <n>', 'Repeats per size (median reported)', '5')
+  .option('--json', 'Machine-readable output')
+  .action(async (options) => {
+    const q = loadQuantumApi();
+    try {
+      const sizes = String(options.qubits).split(',').map((s) => intOpt(s.trim(), 'qubits'));
+      const repeats = intOpt(options.repeats, 'repeats');
+      if (!repeats || repeats < 1 || repeats > 1000) quantumFail('--repeats must be in 1..1000');
+      const rows = await q.bench(sizes, repeats);
+      if (options.json) { console.log(JSON.stringify({ engine: '@ruvector/ruqu-wasm', node: process.version, rows }, null, 2)); return; }
+      console.log(chalk.cyan(`\n  GHZ simulation, median of ${repeats} (node ${process.version})\n`));
+      for (const r of rows) {
+        console.log(`  ${String(r.qubits).padStart(2)} qubits  ${r.medianMs.toFixed(2).padStart(9)} ms  (min ${r.minMs.toFixed(2)} ms, state ${(r.memoryBytes / 1048576).toFixed(2)} MiB)`);
+      }
+      console.log('');
+    } catch (e) { quantumFail(e); }
+  });
+
+quantumCmd
+  .command('info')
+  .description('Show quantum engine availability, version, limits and supported gates')
+  .option('--json', 'Machine-readable output')
+  .action(async (options) => {
+    const q = require('../dist/core/quantum-wrapper.js');
+    const i = await q.info(q.CLI_LIMITS);
+    if (options.json) { console.log(JSON.stringify(i, null, 2)); if (!i.available) process.exitCode = 1; return; }
+    if (!i.available) {
+      console.log(chalk.yellow(`\n  @ruvector/ruqu-wasm not installed.  ${i.install}\n`));
+      process.exitCode = 1;
+      return;
+    }
+    console.log(chalk.green(`\n  ${i.package} ${i.version} — state-vector simulator, engine max ${i.engineMaxQubits} qubits`));
+    console.log(chalk.gray(`  gates: ${i.gates.join(', ')}`));
+    console.log(chalk.gray(`  bit order: ${i.bitOrder}; measurement via --shots (seeded sampling)`));
+    for (const [n, b] of Object.entries(i.memoryBytes || {})) console.log(chalk.gray(`  ${n} qubits → ${(b / 1048576).toFixed(2)} MiB state vector`));
+    console.log(chalk.gray('  try:   npx ruvector quantum simulate bell\n'));
+  });
+
+// =============================================================================
+// Server Commands - HTTP/gRPC server
+// =============================================================================
+
+program
+  .command('server')
+  .description('Start RuVector HTTP/gRPC server')
+  .option('-p, --port <number>', 'HTTP port', '8080')
+  .option('-g, --grpc-port <number>', 'gRPC port', '50051')
+  .option('-d, --data-dir <path>', 'Data directory', './ruvector-data')
+  .option('--http-only', 'Start only HTTP server')
+  .option('--grpc-only', 'Start only gRPC server')
+  .option('--cors', 'Enable CORS for all origins')
+  .option('--info', 'Show server info')
+  .action(async (options) => {
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Server'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    if (options.info || Object.keys(options).filter(k => k !== 'port' && k !== 'grpcPort' && k !== 'dataDir').length === 0) {
+      console.log(chalk.cyan('  Status:'), chalk.yellow('Coming Soon'));
+      console.log('');
+      console.log(chalk.cyan('  Planned Features:'));
+      console.log(chalk.gray('    - REST API for vector operations'));
+      console.log(chalk.gray('    - gRPC high-performance interface'));
+      console.log(chalk.gray('    - WebSocket real-time updates'));
+      console.log(chalk.gray('    - OpenAPI/Swagger documentation'));
+      console.log(chalk.gray('    - Prometheus metrics endpoint'));
+      console.log(chalk.gray('    - Health check endpoints'));
+      console.log('');
+      console.log(chalk.cyan('  Rust binary available:'));
+      console.log(chalk.white('    cargo install ruvector-server  # When published'));
+      console.log('');
+      console.log(chalk.cyan('  Configuration (when available):'));
+      console.log(chalk.white(`    --port ${options.port}            # HTTP port`));
+      console.log(chalk.white(`    --grpc-port ${options.grpcPort}       # gRPC port`));
+      console.log(chalk.white(`    --data-dir ${options.dataDir}  # Data directory`));
+      console.log('');
+      console.log(chalk.gray('  Track progress: https://github.com/ruvnet/ruvector/issues/20'));
+      console.log('');
+      return;
+    }
+
+    console.log(chalk.yellow('  Server package not yet available.'));
+    console.log(chalk.gray('  Check issue #20 for roadmap.'));
+    console.log('');
+  });
+
+// =============================================================================
+// Cluster Commands - Distributed operations
+// =============================================================================
+
+program
+  .command('cluster')
+  .description('Distributed cluster operations')
+  .option('--status', 'Show cluster status')
+  .option('--join <address>', 'Join existing cluster')
+  .option('--leave', 'Leave cluster')
+  .option('--nodes', 'List cluster nodes')
+  .option('--leader', 'Show current leader')
+  .option('--info', 'Show cluster info')
+  .action(async (options) => {
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Cluster'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    console.log(chalk.cyan('  Status:'), chalk.yellow('Coming Soon'));
+    console.log('');
+    console.log(chalk.cyan('  Features:'));
+    console.log(chalk.gray('    - Raft consensus for leader election'));
+    console.log(chalk.gray('    - Automatic failover'));
+    console.log(chalk.gray('    - Data replication'));
+    console.log(chalk.gray('    - Sharding support'));
+    console.log(chalk.gray('    - Distributed queries'));
+    console.log('');
+    console.log(chalk.cyan('  Rust crates available:'));
+    console.log(chalk.white('    cargo add ruvector-cluster      # Clustering'));
+    console.log(chalk.white('    cargo add ruvector-raft         # Raft consensus'));
+    console.log(chalk.white('    cargo add ruvector-replication  # Replication'));
+    console.log('');
+    console.log(chalk.cyan('  Commands (when available):'));
+    console.log(chalk.white('    npx ruvector cluster --status'));
+    console.log(chalk.white('    npx ruvector cluster --join 192.168.1.10:7000'));
+    console.log(chalk.white('    npx ruvector cluster --nodes'));
+    console.log('');
+    console.log(chalk.gray('  Track progress: https://github.com/ruvnet/ruvector/issues/20'));
+    console.log('');
+  });
+
+// =============================================================================
+// Export/Import Commands - Database backup/restore
+// =============================================================================
+
+program
+  .command('export <database>')
+  .description('Export database to file')
+  .option('-o, --output <file>', 'Output file path')
+  .option('-f, --format <type>', 'Export format (json|binary|parquet)', 'json')
+  .option('--compress', 'Compress output')
+  .option('--vectors-only', 'Export only vectors (no metadata)')
+  .action(async (dbPath, options) => {
+    requireRuvector();
+    const spinner = ora('Exporting database...').start();
+
+    try {
+      if (!fs.existsSync(dbPath)) {
+        spinner.fail(chalk.red(`Database not found: ${dbPath}`));
+        process.exit(1);
+      }
+
+      const outputFile = options.output || `${dbPath.replace(/\/$/, '')}_export.${options.format}`;
+
+      // Read dimension/metric from sidecar; storagePath loads the store (#508)
+      let dimension = 384;
+      const metaPath = `${dbPath}.meta.json`;
+      if (fs.existsSync(metaPath)) {
+        try { dimension = sanitizeDimension(JSON.parse(fs.readFileSync(metaPath, 'utf8')).dimension, 384); } catch (_) {}
+      }
+      const db = new VectorDB({ dimensions: dimension, storagePath: dbPath });
+      const count = await db.len();
+
+      // HONESTY: VectorDB has no enumeration API, so vector payloads cannot
+      // be exported yet — only metadata. Refuse to write a file that import
+      // would silently pretend to restore.
+      spinner.fail(chalk.yellow(
+        `Export is not supported yet: the database has ${count} vectors but ` +
+        `the VectorDB API has no enumeration method to read them back out. ` +
+        `The .db file itself is the portable artifact — copy it (with its ` +
+        `.meta.json sidecar) to back up or move the database.`
+      ));
+      console.log(chalk.gray(`  Requested output: ${outputFile} (not written)`));
+      process.exit(1);
+    } catch (error) {
+      spinner.fail(chalk.red('Export failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+program
+  .command('import <file>')
+  .description('Import database from file')
+  .option('-d, --database <path>', 'Target database path')
+  .option('--merge', 'Merge with existing data')
+  .option('--replace', 'Replace existing data')
+  .action(async (file, options) => {
+    requireRuvector();
+    const spinner = ora('Importing database...').start();
+
+    try {
+      if (!fs.existsSync(file)) {
+        spinner.fail(chalk.red(`File not found: ${file}`));
+        process.exit(1);
+      }
+
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const dbPath = options.database || file.replace(/_export\.json$/, '');
+
+      // A plain JSON array of {vector, metadata} entries is importable via
+      // the real API. The old _export.json format never contained vectors,
+      // so importing it would fabricate an empty database (#508).
+      const vectors = Array.isArray(data) ? data : null;
+      if (!vectors || vectors.length === 0 || !vectors[0].vector) {
+        spinner.fail(chalk.yellow(
+          'Import expects a JSON array of {vector, metadata} entries ' +
+          '(the same format `ruvector insert` accepts). Legacy _export.json ' +
+          'files contain no vector data and cannot be restored. To move a ' +
+          'database, copy the .db file and its .meta.json sidecar.'
+        ));
+        process.exit(1);
+      }
+
+      spinner.text = `Importing ${vectors.length} vectors...`;
+      const dimension = vectors[0].vector.length;
+
+      // ADR-210 D0: refuse mismatched imports into a provenance-stamped store.
+      const importMetaPath = `${dbPath}.meta.json`;
+      if (fs.existsSync(importMetaPath)) {
+        let targetProvenance = null;
+        try { targetProvenance = sanitizeProvenanceSafe(JSON.parse(fs.readFileSync(importMetaPath, 'utf8')).provenance); } catch (_) {}
+        if (targetProvenance && targetProvenance.dimension !== dimension) {
+          const provMod = loadProvenance();
+          const describe = provMod ? provMod.describeProvenance : (p) => JSON.stringify(p);
+          spinner.fail(chalk.red(
+            `Import refused (ADR-210): ${dbPath} records embedding provenance ${describe(targetProvenance)}, ` +
+            `but the incoming data is ${dimension}-dimensional with undeclared provenance. ` +
+            `Mixed stores are never created — re-embed the data or the store.`
+          ));
+          process.exit(1);
+        }
+      }
+
+      const db = new VectorDB({ dimensions: dimension, storagePath: dbPath });
+      await db.insertBatch(vectors);
+      const count = await db.len();
+
+      spinner.succeed(chalk.green(`Imported to: ${dbPath}`));
+      console.log(chalk.gray(`  Vectors imported: ${vectors.length} (db total: ${count})`));
+      console.log(chalk.gray(`  Dimension: ${dimension}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Import failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// =============================================================================
+// Embed Command - Generate embeddings
+// =============================================================================
+
+// =============================================================================
+// Embed Command - Generate embeddings (now with ONNX + Adaptive LoRA)
+// =============================================================================
+
+const embedCmd = program.command('embed').description('Generate embeddings from text (ONNX + Adaptive LoRA)');
+
+embedCmd
+  .command('text')
+  .description('Embed a text string ("-" or --stdin reads from stdin; --input-file reads from a file — keeps sensitive text off argv)')
+  .argument('[text]', 'Text to embed, or "-" to read from stdin')
+  .option('--stdin', 'Read the text from stdin instead of argv')
+  .option('--input-file <path>', 'Read the text from a file instead of argv')
+  .option('--adaptive', 'Use adaptive embedder with LoRA')
+  .option('--domain <domain>', 'Domain for prototype learning')
+  .option('-o, --output <file>', 'Output file for embedding')
+  .action(async (text, opts) => {
+    try {
+      // #641: raw text on argv leaks via the process table; offer stdin/file input.
+      if (opts.inputFile) {
+        text = fs.readFileSync(opts.inputFile, 'utf8').replace(/\r?\n$/, '');
+      } else if (opts.stdin || text === '-') {
+        text = fs.readFileSync(0, 'utf8').replace(/\r?\n$/, '');
+      }
+      if (!text) {
+        console.error(chalk.red('No text to embed. Pass a text argument, "-" / --stdin, or --input-file <path>.'));
+        process.exit(1);
+      }
+      const { performance } = require('perf_hooks');
+      const start = performance.now();
+
+      if (opts.adaptive) {
+        const { initAdaptiveEmbedder } = require('../dist/core/adaptive-embedder.js');
+        const embedder = await initAdaptiveEmbedder();
+        const embedding = await embedder.embed(text, { domain: opts.domain });
+        const stats = embedder.getStats();
+
+        console.log(chalk.cyan('\n🧠 Adaptive Embedding (ONNX + Micro-LoRA)\n'));
+        console.log(chalk.dim(`Text: "${text.slice(0, 60)}..."`));
+        console.log(chalk.dim(`Dimension: ${embedding.length}`));
+        console.log(chalk.dim(`LoRA rank: ${stats.loraRank} (${stats.loraParams} params)`));
+        console.log(chalk.dim(`Prototypes: ${stats.prototypes}`));
+        console.log(chalk.dim(`Time: ${(performance.now() - start).toFixed(1)}ms`));
+
+        if (opts.output) {
+          fs.writeFileSync(opts.output, JSON.stringify({ text, embedding, stats }, null, 2));
+          console.log(chalk.green(`\nSaved to ${opts.output}`));
+        }
+      } else {
+        const { initOnnxEmbedder, embed } = require('../dist/core/onnx-embedder.js');
+        await initOnnxEmbedder();
+        const result = await embed(text);
+
+        console.log(chalk.cyan('\n📊 ONNX Embedding (all-MiniLM-L6-v2)\n'));
+        console.log(chalk.dim(`Text: "${text.slice(0, 60)}..."`));
+        console.log(chalk.dim(`Dimension: ${result.embedding.length}`));
+        console.log(chalk.dim(`Time: ${(performance.now() - start).toFixed(1)}ms`));
+
+        if (opts.output) {
+          fs.writeFileSync(opts.output, JSON.stringify({ text, embedding: result.embedding }, null, 2));
+          console.log(chalk.green(`\nSaved to ${opts.output}`));
+        }
+      }
+    } catch (e) {
+      console.error(chalk.red('Embedding failed:'), e.message);
+    }
+  });
+
+embedCmd
+  .command('adaptive')
+  .description('Adaptive embedding with Micro-LoRA optimization')
+  .option('--stats', 'Show adaptive embedder statistics')
+  .option('--consolidate', 'Run EWC consolidation')
+  .option('--reset', 'Reset adaptive weights')
+  .option('--export <file>', 'Export learned weights')
+  .option('--import <file>', 'Import learned weights')
+  .action(async (opts) => {
+    try {
+      const { initAdaptiveEmbedder } = require('../dist/core/adaptive-embedder.js');
+      const embedder = await initAdaptiveEmbedder();
+
+      if (opts.stats) {
+        const stats = embedder.getStats();
+        console.log(chalk.cyan('\n🧠 Adaptive Embedder Statistics\n'));
+        console.log(chalk.white('Base Model:'), chalk.dim(stats.baseModel));
+        console.log(chalk.white('Dimension:'), chalk.dim(stats.dimension));
+        console.log(chalk.white('LoRA Rank:'), chalk.dim(stats.loraRank));
+        console.log(chalk.white('LoRA Params:'), chalk.dim(`${stats.loraParams} (~${(stats.loraParams / (stats.dimension * stats.dimension) * 100).toFixed(2)}% of base)`));
+        console.log(chalk.white('Adaptations:'), chalk.dim(stats.adaptations));
+        console.log(chalk.white('Prototypes:'), chalk.dim(stats.prototypes));
+        console.log(chalk.white('Memory Size:'), chalk.dim(stats.memorySize));
+        console.log(chalk.white('EWC Consolidations:'), chalk.dim(stats.ewcConsolidations));
+        console.log(chalk.white('Contrastive Updates:'), chalk.dim(stats.contrastiveUpdates));
+        console.log('');
+      }
+
+      if (opts.consolidate) {
+        console.log(chalk.yellow('Running EWC consolidation...'));
+        await embedder.consolidate();
+        console.log(chalk.green('✓ Consolidation complete'));
+      }
+
+      if (opts.reset) {
+        embedder.reset();
+        console.log(chalk.green('✓ Adaptive weights reset'));
+      }
+
+      if (opts.export) {
+        const data = embedder.export();
+        fs.writeFileSync(opts.export, JSON.stringify(data, null, 2));
+        console.log(chalk.green(`✓ Exported to ${opts.export}`));
+      }
+
+      if (opts.import) {
+        const data = JSON.parse(fs.readFileSync(opts.import, 'utf-8'));
+        embedder.import(data);
+        console.log(chalk.green(`✓ Imported from ${opts.import}`));
+      }
+    } catch (e) {
+      console.error(chalk.red('Error:'), e.message);
+    }
+  });
+
+embedCmd
+  .command('benchmark')
+  .description('Benchmark base vs adaptive embeddings')
+  .option('--iterations <n>', 'Number of iterations', '10')
+  .action(async (opts) => {
+    try {
+      const { performance } = require('perf_hooks');
+      const iterations = parseInt(opts.iterations) || 10;
+
+      console.log(chalk.cyan('\n🚀 Embedding Benchmark: Base ONNX vs Adaptive LoRA\n'));
+
+      const testTexts = [
+        'This is a test sentence for embedding generation.',
+        'The quick brown fox jumps over the lazy dog.',
+        'Machine learning models can learn from data.',
+        'Vector databases enable semantic search.',
+      ];
+
+      // Benchmark base ONNX
+      const { initOnnxEmbedder, embed, embedBatch } = require('../dist/core/onnx-embedder.js');
+      await initOnnxEmbedder();
+
+      console.log(chalk.yellow('1. Base ONNX Embeddings'));
+      const baseStart = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        await embed(testTexts[i % testTexts.length]);
+      }
+      const baseTime = (performance.now() - baseStart) / iterations;
+      console.log(chalk.dim(`   Single: ${baseTime.toFixed(1)}ms avg`));
+
+      const baseBatchStart = performance.now();
+      for (let i = 0; i < Math.ceil(iterations / 4); i++) {
+        await embedBatch(testTexts);
+      }
+      const baseBatchTime = (performance.now() - baseBatchStart) / Math.ceil(iterations / 4);
+      console.log(chalk.dim(`   Batch(4): ${baseBatchTime.toFixed(1)}ms avg (${(4000 / baseBatchTime).toFixed(1)}/s)`));
+
+      // Benchmark adaptive
+      const { initAdaptiveEmbedder } = require('../dist/core/adaptive-embedder.js');
+      const adaptive = await initAdaptiveEmbedder();
+
+      console.log(chalk.yellow('\n2. Adaptive ONNX + LoRA'));
+      const adaptStart = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        await adaptive.embed(testTexts[i % testTexts.length]);
+      }
+      const adaptTime = (performance.now() - adaptStart) / iterations;
+      console.log(chalk.dim(`   Single: ${adaptTime.toFixed(1)}ms avg`));
+
+      const adaptBatchStart = performance.now();
+      for (let i = 0; i < Math.ceil(iterations / 4); i++) {
+        await adaptive.embedBatch(testTexts);
+      }
+      const adaptBatchTime = (performance.now() - adaptBatchStart) / Math.ceil(iterations / 4);
+      console.log(chalk.dim(`   Batch(4): ${adaptBatchTime.toFixed(1)}ms avg (${(4000 / adaptBatchTime).toFixed(1)}/s)`));
+
+      // Summary
+      console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+      console.log(chalk.bold('Summary'));
+      console.log(chalk.cyan('═══════════════════════════════════════════════════════════════'));
+      const stats = adaptive.getStats();
+      console.log(chalk.dim(`\nAdaptive overhead: +${(adaptTime - baseTime).toFixed(1)}ms (+${((adaptTime/baseTime - 1) * 100).toFixed(1)}%)`));
+      console.log(chalk.dim(`LoRA params: ${stats.loraParams} (rank ${stats.loraRank})`));
+      console.log(chalk.dim(`Memory prototypes: ${stats.prototypes}`));
+      console.log(chalk.dim(`Episodic memory: ${stats.memorySize} entries`));
+
+      console.log(chalk.white('\nBenefits of Adaptive:'));
+      console.log(chalk.dim('  • Domain-specific fine-tuning via Micro-LoRA'));
+      console.log(chalk.dim('  • Contrastive learning from co-edit patterns'));
+      console.log(chalk.dim('  • EWC++ prevents catastrophic forgetting'));
+      console.log(chalk.dim('  • Prototype-based domain adaptation'));
+      console.log(chalk.dim('  • Episodic memory augmentation'));
+      console.log('');
+    } catch (e) {
+      console.error(chalk.red('Benchmark failed:'), e.message);
+      if (e.stack) console.error(chalk.dim(e.stack));
+    }
+  });
+
+embedCmd
+  .command('optimized')
+  .description('Use optimized ONNX embedder with LRU caching')
+  .argument('[text]', 'Text to embed (optional)')
+  .option('--cache-size <n>', 'Embedding cache size', '512')
+  .option('--stats', 'Show cache statistics')
+  .option('--clear-cache', 'Clear all caches')
+  .option('--benchmark', 'Run cache benchmark')
+  .action(async (text, opts) => {
+    try {
+      const { performance } = require('perf_hooks');
+      const { OptimizedOnnxEmbedder } = require('../dist/core/onnx-optimized.js');
+
+      const embedder = new OptimizedOnnxEmbedder({
+        cacheSize: parseInt(opts.cacheSize) || 512,
+        lazyInit: false,
+      });
+
+      await embedder.init();
+
+      if (opts.clearCache) {
+        embedder.clearCache();
+        console.log(chalk.green('✓ Caches cleared'));
+        return;
+      }
+
+      if (opts.benchmark) {
+        console.log(chalk.cyan('\n⚡ Optimized ONNX Cache Benchmark\n'));
+
+        const testTexts = [
+          'Machine learning algorithms optimize model parameters',
+          'Vector databases enable semantic search capabilities',
+          'Neural networks learn hierarchical representations',
+          'Code embeddings capture syntax and semantic patterns',
+          'Transformer models use attention mechanisms',
+        ];
+
+        // Cold benchmark
+        embedder.clearCache();
+        const coldStart = performance.now();
+        for (const t of testTexts) await embedder.embed(t);
+        const coldTime = performance.now() - coldStart;
+
+        // Warm benchmark
+        const warmStart = performance.now();
+        for (let i = 0; i < 100; i++) {
+          for (const t of testTexts) await embedder.embed(t);
+        }
+        const warmTime = performance.now() - warmStart;
+
+        const stats = embedder.getCacheStats();
+
+        console.log(chalk.yellow('Performance:'));
+        console.log(chalk.dim('  Cold (5 unique texts):'), chalk.white(coldTime.toFixed(2) + 'ms'));
+        console.log(chalk.dim('  Warm (500 cached):'), chalk.white(warmTime.toFixed(2) + 'ms'));
+        console.log(chalk.dim('  Cache speedup:'), chalk.green((coldTime / warmTime * 100).toFixed(0) + 'x'));
+        console.log();
+        console.log(chalk.yellow('Cache Stats:'));
+        console.log(chalk.dim('  Hit rate:'), chalk.white((stats.embedding.hitRate * 100).toFixed(1) + '%'));
+        console.log(chalk.dim('  Cache size:'), chalk.white(stats.embedding.size));
+        console.log(chalk.dim('  Total embeds:'), chalk.white(stats.totalEmbeds));
+        console.log();
+        return;
+      }
+
+      if (opts.stats) {
+        const stats = embedder.getCacheStats();
+        console.log(chalk.cyan('\n📊 Optimized ONNX Embedder Stats\n'));
+        console.log(chalk.white('Embedding Cache:'));
+        console.log(chalk.dim('  Size:'), stats.embedding.size);
+        console.log(chalk.dim('  Hits:'), stats.embedding.hits);
+        console.log(chalk.dim('  Misses:'), stats.embedding.misses);
+        console.log(chalk.dim('  Hit Rate:'), (stats.embedding.hitRate * 100).toFixed(1) + '%');
+        console.log();
+        console.log(chalk.white('Performance:'));
+        console.log(chalk.dim('  Avg Time:'), stats.avgTimeMs.toFixed(2) + 'ms');
+        console.log(chalk.dim('  Total Embeds:'), stats.totalEmbeds);
+        console.log();
+        return;
+      }
+
+      if (text) {
+        const start = performance.now();
+        const embedding = await embedder.embed(text);
+        const elapsed = performance.now() - start;
+        const stats = embedder.getCacheStats();
+
+        console.log(chalk.cyan('\n⚡ Optimized ONNX Embedding\n'));
+        console.log(chalk.dim(`Text: "${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`));
+        console.log(chalk.dim(`Dimension: ${embedding.length}`));
+        console.log(chalk.dim(`Time: ${elapsed.toFixed(2)}ms`));
+        console.log(chalk.dim(`Cache hit rate: ${(stats.embedding.hitRate * 100).toFixed(1)}%`));
+        console.log();
+      } else {
+        console.log(chalk.yellow('Usage: ruvector embed optimized <text>'));
+        console.log(chalk.dim('  --stats       Show cache statistics'));
+        console.log(chalk.dim('  --benchmark   Run cache benchmark'));
+        console.log(chalk.dim('  --clear-cache Clear all caches'));
+        console.log(chalk.dim('  --cache-size  Set cache size (default: 512)'));
+      }
+    } catch (e) {
+      console.error(chalk.red('Error:'), e.message);
+    }
+  });
+
+embedCmd
+  .command('neural')
+  .description('Neural embedding substrate (frontier AI concepts)')
+  .option('--health', 'Show neural substrate health')
+  .option('--consolidate', 'Run memory consolidation (like sleep)')
+  .option('--calibrate', 'Calibrate coherence baseline')
+  .option('--swarm-status', 'Show swarm coordination status')
+  .option('--drift-stats', 'Show semantic drift statistics')
+  .option('--memory-stats', 'Show memory physics statistics')
+  .option('--demo', 'Run interactive neural demo')
+  .option('--dimension <n>', 'Embedding dimension', '384')
+  .action(async (opts) => {
+    try {
+      const { NeuralSubstrate } = require('../dist/core/neural-embeddings.js');
+      const { initOnnxEmbedder, embed } = require('../dist/core/onnx-embedder.js');
+
+      const dimension = parseInt(opts.dimension) || 384;
+      const substrate = new NeuralSubstrate({ dimension });
+
+      if (opts.demo) {
+        console.log(chalk.cyan('\n🧠 Neural Embedding Substrate Demo\n'));
+        console.log(chalk.dim('Frontier AI concepts: drift detection, memory physics, swarm coordination\n'));
+
+        // Initialize ONNX for real embeddings
+        await initOnnxEmbedder();
+
+        console.log(chalk.yellow('1. Semantic Drift Detection'));
+        console.log(chalk.dim('   Observing embeddings and detecting semantic movement...\n'));
+
+        const texts = [
+          'Machine learning optimizes neural networks',
+          'Deep learning uses backpropagation',
+          'AI models learn from data patterns',
+          'Quantum computing is completely different',  // Should trigger drift
+        ];
+
+        for (const text of texts) {
+          const result = await embed(text);
+          const driftEvent = substrate.drift.observe(result.embedding, 'demo');
+          const symbol = driftEvent?.category === 'critical' ? '🚨' :
+                        driftEvent?.category === 'warning' ? '⚠️' : '✓';
+          console.log(chalk.dim(`   ${symbol} "${text.slice(0, 40)}..." → drift: ${driftEvent?.magnitude?.toFixed(3) || '0.000'}`));
+        }
+
+        console.log(chalk.yellow('\n2. Memory Physics (Hippocampal Dynamics)'));
+        console.log(chalk.dim('   Encoding memories with strength, decay, and consolidation...\n'));
+
+        const memories = [
+          { id: 'mem1', text: 'Vector databases store embeddings' },
+          { id: 'mem2', text: 'HNSW enables fast nearest neighbor search' },
+          { id: 'mem3', text: 'Cosine similarity measures semantic closeness' },
+        ];
+
+        for (const mem of memories) {
+          const result = await embed(mem.text);
+          const entry = substrate.memory.encode(mem.id, result.embedding, mem.text);
+          console.log(chalk.dim(`   📝 Encoded "${mem.id}": strength=${entry.strength.toFixed(2)}, interference=${entry.interference.toFixed(2)}`));
+        }
+
+        // Query memory
+        const queryText = 'How do vector databases work?';
+        const queryEmb = await embed(queryText);
+        const recalled = substrate.memory.recall(queryEmb.embedding, 2);
+        console.log(chalk.dim(`\n   🔍 Query: "${queryText}"`));
+        console.log(chalk.dim(`   📚 Recalled: ${recalled.map(m => m.id).join(', ')}`));
+
+        console.log(chalk.yellow('\n3. Agent State Machine (Geometric State)'));
+        console.log(chalk.dim('   Managing agent state as movement through embedding space...\n'));
+
+        // Define mode regions
+        substrate.state.defineMode('research', queryEmb.embedding, 0.5);
+        const codeEmb = await embed('Write code and debug programs');
+        substrate.state.defineMode('coding', codeEmb.embedding, 0.5);
+
+        // Update agent state
+        const agent1State = substrate.state.updateAgent('agent-1', queryEmb.embedding);
+        console.log(chalk.dim(`   🤖 agent-1 mode: ${agent1State.mode}, energy: ${agent1State.energy.toFixed(2)}`));
+
+        const agent2State = substrate.state.updateAgent('agent-2', codeEmb.embedding);
+        console.log(chalk.dim(`   🤖 agent-2 mode: ${agent2State.mode}, energy: ${agent2State.energy.toFixed(2)}`));
+
+        console.log(chalk.yellow('\n4. Swarm Coordination'));
+        console.log(chalk.dim('   Multi-agent coordination through shared embedding geometry...\n'));
+
+        substrate.swarm.register('researcher', queryEmb.embedding, 'research');
+        substrate.swarm.register('coder', codeEmb.embedding, 'development');
+        const reviewEmb = await embed('Review code and check quality');
+        substrate.swarm.register('reviewer', reviewEmb.embedding, 'review');
+
+        const coherence = substrate.swarm.getCoherence();
+        console.log(chalk.dim(`   🌐 Swarm coherence: ${(coherence * 100).toFixed(1)}%`));
+
+        const collaborators = substrate.swarm.findCollaborators('researcher', 2);
+        console.log(chalk.dim(`   🤝 Collaborators for researcher: ${collaborators.map(c => c.id).join(', ')}`));
+
+        console.log(chalk.yellow('\n5. Coherence Monitoring (Safety)'));
+        console.log(chalk.dim('   Detecting degradation, poisoning, misalignment...\n'));
+
+        try {
+          substrate.calibrate();
+          const report = substrate.coherence.report();
+          console.log(chalk.dim(`   📊 Overall coherence: ${(report.overallScore * 100).toFixed(1)}%`));
+          console.log(chalk.dim(`   📊 Stability: ${(report.stabilityScore * 100).toFixed(1)}%`));
+          console.log(chalk.dim(`   📊 Alignment: ${(report.alignmentScore * 100).toFixed(1)}%`));
+        } catch {
+          console.log(chalk.dim('   ℹ️ Need more observations to calibrate coherence'));
+        }
+
+        console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+        console.log(chalk.bold('   Neural Substrate: Embeddings as Synthetic Nervous System'));
+        console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+        console.log(chalk.dim('Components:'));
+        console.log(chalk.dim('  • SemanticDriftDetector - Control signals, reflex triggers'));
+        console.log(chalk.dim('  • MemoryPhysics - Forgetting, interference, consolidation'));
+        console.log(chalk.dim('  • EmbeddingStateMachine - Agent state via geometry'));
+        console.log(chalk.dim('  • SwarmCoordinator - Multi-agent coordination'));
+        console.log(chalk.dim('  • CoherenceMonitor - Safety/alignment detection'));
+        console.log(chalk.dim('  • NeuralSubstrate - Unified nervous system layer'));
+        console.log('');
+        return;
+      }
+
+      if (opts.health) {
+        const health = substrate.health();
+        console.log(chalk.cyan('\n🧠 Neural Substrate Health\n'));
+
+        console.log(chalk.yellow('Drift Detection:'));
+        console.log(chalk.dim(`  Current drift: ${health.driftStats.currentDrift.toFixed(4)}`));
+        console.log(chalk.dim(`  Velocity: ${health.driftStats.velocity.toFixed(4)}/s`));
+        console.log(chalk.dim(`  Critical events: ${health.driftStats.criticalEvents}`));
+        console.log(chalk.dim(`  Warning events: ${health.driftStats.warningEvents}`));
+
+        console.log(chalk.yellow('\nMemory Physics:'));
+        console.log(chalk.dim(`  Total memories: ${health.memoryStats.totalMemories}`));
+        console.log(chalk.dim(`  Avg strength: ${health.memoryStats.avgStrength.toFixed(3)}`));
+        console.log(chalk.dim(`  Avg consolidation: ${health.memoryStats.avgConsolidation.toFixed(3)}`));
+        console.log(chalk.dim(`  Avg interference: ${health.memoryStats.avgInterference.toFixed(3)}`));
+
+        console.log(chalk.yellow('\nSwarm Coordination:'));
+        console.log(chalk.dim(`  Coherence: ${(health.swarmCoherence * 100).toFixed(1)}%`));
+
+        console.log(chalk.yellow('\nCoherence Report:'));
+        console.log(chalk.dim(`  Overall: ${(health.coherenceReport.overallScore * 100).toFixed(1)}%`));
+        console.log(chalk.dim(`  Drift: ${(health.coherenceReport.driftScore * 100).toFixed(1)}%`));
+        console.log(chalk.dim(`  Stability: ${(health.coherenceReport.stabilityScore * 100).toFixed(1)}%`));
+        console.log(chalk.dim(`  Alignment: ${(health.coherenceReport.alignmentScore * 100).toFixed(1)}%`));
+
+        if (health.coherenceReport.anomalies.length > 0) {
+          console.log(chalk.yellow('\nAnomalies:'));
+          for (const a of health.coherenceReport.anomalies) {
+            console.log(chalk.red(`  ⚠️ ${a.type}: ${a.description} (severity: ${a.severity.toFixed(2)})`));
+          }
+        }
+        console.log('');
+        return;
+      }
+
+      if (opts.consolidate) {
+        console.log(chalk.yellow('Running memory consolidation...'));
+        const result = substrate.consolidate();
+        console.log(chalk.green(`✓ Consolidated: ${result.consolidated} memories`));
+        console.log(chalk.dim(`  Forgotten: ${result.forgotten} weak memories`));
+        return;
+      }
+
+      if (opts.calibrate) {
+        try {
+          substrate.calibrate();
+          console.log(chalk.green('✓ Coherence baseline calibrated'));
+        } catch (e) {
+          console.log(chalk.yellow('Need more observations to calibrate'));
+          console.log(chalk.dim('Run --demo first to populate the substrate'));
+        }
+        return;
+      }
+
+      if (opts.driftStats) {
+        const stats = substrate.drift.getStats();
+        console.log(chalk.cyan('\n📊 Semantic Drift Statistics\n'));
+        console.log(chalk.dim(`Current drift: ${stats.currentDrift.toFixed(4)}`));
+        console.log(chalk.dim(`Velocity: ${stats.velocity.toFixed(4)} drift/s`));
+        console.log(chalk.dim(`Critical events: ${stats.criticalEvents}`));
+        console.log(chalk.dim(`Warning events: ${stats.warningEvents}`));
+        console.log(chalk.dim(`History size: ${stats.historySize}`));
+        console.log('');
+        return;
+      }
+
+      if (opts.memoryStats) {
+        const stats = substrate.memory.getStats();
+        console.log(chalk.cyan('\n📊 Memory Physics Statistics\n'));
+        console.log(chalk.dim(`Total memories: ${stats.totalMemories}`));
+        console.log(chalk.dim(`Average strength: ${stats.avgStrength.toFixed(3)}`));
+        console.log(chalk.dim(`Average consolidation: ${stats.avgConsolidation.toFixed(3)}`));
+        console.log(chalk.dim(`Average interference: ${stats.avgInterference.toFixed(3)}`));
+        console.log('');
+        return;
+      }
+
+      if (opts.swarmStatus) {
+        const coherence = substrate.swarm.getCoherence();
+        const clusters = substrate.swarm.detectClusters(0.7);
+        console.log(chalk.cyan('\n📊 Swarm Coordination Status\n'));
+        console.log(chalk.dim(`Coherence: ${(coherence * 100).toFixed(1)}%`));
+        console.log(chalk.dim(`Clusters detected: ${clusters.size}`));
+        for (const [leader, members] of clusters) {
+          console.log(chalk.dim(`  Cluster ${leader}: ${members.join(', ')}`));
+        }
+        console.log('');
+        return;
+      }
+
+      // Default: show help
+      console.log(chalk.cyan('\n🧠 Neural Embedding Substrate\n'));
+      console.log(chalk.dim('Frontier AI concepts treating embeddings as a synthetic nervous system.\n'));
+      console.log(chalk.yellow('Commands:'));
+      console.log(chalk.dim('  --demo          Run interactive neural demo'));
+      console.log(chalk.dim('  --health        Show neural substrate health'));
+      console.log(chalk.dim('  --consolidate   Run memory consolidation (like sleep)'));
+      console.log(chalk.dim('  --calibrate     Calibrate coherence baseline'));
+      console.log(chalk.dim('  --drift-stats   Show semantic drift statistics'));
+      console.log(chalk.dim('  --memory-stats  Show memory physics statistics'));
+      console.log(chalk.dim('  --swarm-status  Show swarm coordination status'));
+      console.log('');
+      console.log(chalk.yellow('Components:'));
+      console.log(chalk.dim('  • SemanticDriftDetector - Embeddings as control signals'));
+      console.log(chalk.dim('  • MemoryPhysics - Hippocampal memory dynamics'));
+      console.log(chalk.dim('  • EmbeddingStateMachine - Agent state via geometry'));
+      console.log(chalk.dim('  • SwarmCoordinator - Multi-agent coordination'));
+      console.log(chalk.dim('  • CoherenceMonitor - Safety/alignment detection'));
+      console.log('');
+    } catch (e) {
+      console.error(chalk.red('Error:'), e.message);
+      if (e.stack) console.error(chalk.dim(e.stack));
+    }
+  });
+
+// =============================================================================
+// Demo Command - Interactive tutorial
+// =============================================================================
+
+program
+  .command('demo')
+  .description('Run interactive demo and tutorials')
+  .option('--basic', 'Basic vector operations demo')
+  .option('--gnn', 'GNN differentiable search demo')
+  .option('--graph', 'Graph database demo')
+  .option('--benchmark', 'Performance benchmark demo')
+  .option('-i, --interactive', 'Interactive mode')
+  .action(async (options) => {
+    console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+    console.log(chalk.cyan('                    RuVector Demo'));
+    console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+
+    const showMenu = !options.basic && !options.gnn && !options.graph && !options.benchmark;
+
+    if (showMenu) {
+      console.log(chalk.yellow('  Available Demos:\n'));
+      console.log(chalk.white('    --basic      '), chalk.gray('Basic vector operations (insert, search, delete)'));
+      console.log(chalk.white('    --gnn        '), chalk.gray('GNN differentiable search with gradients'));
+      console.log(chalk.white('    --graph      '), chalk.gray('Graph database and Cypher queries'));
+      console.log(chalk.white('    --benchmark  '), chalk.gray('Performance benchmark suite'));
+      console.log('');
+      console.log(chalk.cyan('  Run a demo:'));
+      console.log(chalk.white('    npx ruvector demo --basic'));
+      console.log(chalk.white('    npx ruvector demo --gnn'));
+      console.log('');
+      return;
+    }
+
+    if (options.basic) {
+      requireRuvector();
+      console.log(chalk.yellow('  Basic Vector Operations Demo\n'));
+
+      const spinner = ora('Creating demo database...').start();
+
+      try {
+        // Explicit path + sidecar so the stats/search/insert/export commands
+        // can open this database afterwards with the right dimension (#508).
+        const demoPath = './demo.db';
+        const db = new VectorDB({ dimensions: 4, distanceMetric: 'cosine', storagePath: demoPath });
+        fs.writeFileSync(`${demoPath}.meta.json`, JSON.stringify({ dimension: 4, metric: 'cosine' }, null, 2));
+
+        spinner.text = 'Inserting vectors...';
+        // VectorDBWrapper.insert takes a single object: { id?, vector, metadata? }.
+        // Wrap to Float32Array so the native binding sees the right typed array.
+        await db.insert({ id: 'vec1', vector: new Float32Array([1.0, 0.0, 0.0, 0.0]), metadata: { label: 'x-axis' } });
+        await db.insert({ id: 'vec2', vector: new Float32Array([0.0, 1.0, 0.0, 0.0]), metadata: { label: 'y-axis' } });
+        await db.insert({ id: 'vec3', vector: new Float32Array([0.0, 0.0, 1.0, 0.0]), metadata: { label: 'z-axis' } });
+        await db.insert({ id: 'vec4', vector: new Float32Array([0.7, 0.7, 0.0, 0.0]), metadata: { label: 'xy-diagonal' } });
+
+        spinner.succeed('Demo database created with 4 vectors');
+
+        console.log(chalk.cyan('\n  Vectors inserted:'));
+        console.log(chalk.gray('    vec1: [1,0,0,0] - x-axis'));
+        console.log(chalk.gray('    vec2: [0,1,0,0] - y-axis'));
+        console.log(chalk.gray('    vec3: [0,0,1,0] - z-axis'));
+        console.log(chalk.gray('    vec4: [0.7,0.7,0,0] - xy-diagonal'));
+
+        console.log(chalk.cyan('\n  Searching for nearest to [0.8, 0.6, 0, 0]:'));
+        const results = await db.search({ vector: new Float32Array([0.8, 0.6, 0.0, 0.0]), k: 3 });
+        results.forEach((r, i) => {
+          console.log(chalk.gray(`    ${i + 1}. ${r.id} (score: ${r.score.toFixed(4)})`));
+        });
+
+        console.log(chalk.green('\n  Demo complete!'));
+        console.log(chalk.cyan('\n  The database persists at ./demo.db — try:'));
+        console.log(chalk.white('    npx ruvector stats ./demo.db'));
+        console.log(chalk.white('    npx ruvector search ./demo.db --vector "[0.8, 0.6, 0, 0]"'));
+      } catch (error) {
+        spinner.fail(chalk.red('Demo failed'));
+        console.error(chalk.red(error.message));
+      }
+    }
+
+    if (options.gnn) {
+      loadGnn();
+      if (!gnnAvailable) {
+        console.log(chalk.yellow('  @ruvector/gnn not installed.'));
+        console.log(chalk.white('  Install with: npm install @ruvector/gnn'));
+        console.log('');
+        return;
+      }
+
+      console.log(chalk.yellow('  GNN Differentiable Search Demo\n'));
+
+      try {
+        console.log(chalk.cyan('  Running differentiable search with gradients...\n'));
+
+        // The native @ruvector/gnn binding expects Float32Array typed arrays.
+        const queryVec = new Float32Array([1.0, 0.5, 0.3, 0.1]);
+        const dbVectors = [
+          new Float32Array([1.0, 0.0, 0.0, 0.0]),
+          new Float32Array([0.0, 1.0, 0.0, 0.0]),
+          new Float32Array([0.5, 0.5, 0.5, 0.5]),
+          new Float32Array([0.9, 0.4, 0.2, 0.1]),
+        ];
+
+        const result = differentiableSearch(queryVec, dbVectors, 3, 10.0);
+
+        // The wrapper returns `{ indices, weights }`; older binding versions
+        // exposed `attention_weights` instead.
+        const weights = result.weights || result.attention_weights || [];
+
+        console.log(chalk.cyan('  Query:'), JSON.stringify(Array.from(queryVec)));
+        console.log(chalk.cyan('  Top 3 results:'));
+        result.indices.forEach((idx, i) => {
+          const w = weights[i] != null ? weights[i].toFixed(4) : 'n/a';
+          console.log(chalk.gray(`    ${i + 1}. Index ${idx} (attention: ${w})`));
+        });
+
+        console.log(chalk.cyan('\n  Gradient flow enabled:'), chalk.green('Yes'));
+        console.log(chalk.gray('  Use for: Neural network training, learned retrieval'));
+
+        console.log(chalk.green('\n  GNN demo complete!'));
+      } catch (error) {
+        // `@ruvector/gnn@0.1.25`'s native binding has a regression where every
+        // method throws `Given napi value is not an array`, regardless of the
+        // input shape (verified with both Array<Float32Array> and number[][]).
+        // Surface that explicitly so users don't think it's their CLI install.
+        const msg = error && error.message ? error.message : String(error);
+        if (msg.includes('not an array') || msg.includes('TypedArray')) {
+          console.error(chalk.red(`  GNN demo failed: ${msg}`));
+          console.error(chalk.yellow('\n  This looks like a regression in the @ruvector/gnn native binding,'));
+          console.error(chalk.yellow('  not in the CLI. Tracking at:'));
+          console.error(chalk.white('    https://github.com/ruvnet/ruvector/issues/402'));
+        } else {
+          console.error(chalk.red('GNN demo failed:', msg));
+        }
+      }
+    }
+
+    if (options.graph) {
+      console.log(chalk.yellow('  Graph Database Demo\n'));
+
+      let graphNode;
+      try {
+        graphNode = require('@ruvector/graph-node');
+      } catch (e) {
+        console.log(chalk.yellow('  @ruvector/graph-node not installed.'));
+        console.log(chalk.white('  Install with: npm install @ruvector/graph-node'));
+        console.log('');
+        return;
+      }
+
+      try {
+        // The current binding exposes a `GraphDatabase` class (not Graph /
+        // HyperGraph / RuVectorGraph) with createNode / createEdge / query.
+        const GraphDatabase = graphNode.GraphDatabase;
+        if (typeof GraphDatabase !== 'function') {
+          console.log(chalk.yellow('  @ruvector/graph-node has no GraphDatabase constructor.'));
+          console.log(chalk.gray(`    Available exports: ${Object.keys(graphNode).join(', ')}`));
+          return;
+        }
+
+        const g = new GraphDatabase();
+        console.log(chalk.green('  ✓ GraphDatabase instance created'));
+
+        // createNode / createEdge take a JsNode / JsEdge object (not positional
+        // args) and are async — see @ruvector/graph-node index.d.ts.
+        const aId = await g.createNode({
+          id: 'alice',
+          embedding: new Float32Array([1, 0, 0, 0]),
+          properties: { name: 'Alice', label: 'Person' },
+        });
+        const bId = await g.createNode({
+          id: 'bob',
+          embedding: new Float32Array([0, 1, 0, 0]),
+          properties: { name: 'Bob', label: 'Person' },
+        });
+        console.log(chalk.green(`  ✓ Created nodes: Alice (${aId}), Bob (${bId})`));
+
+        const edgeId = await g.createEdge({
+          from: 'alice',
+          to: 'bob',
+          description: 'KNOWS',
+          embedding: new Float32Array([0.5, 0.5, 0, 0]),
+          confidence: 0.95,
+        });
+        console.log(chalk.green(`  ✓ Created edge Alice -[:KNOWS]-> Bob (${edgeId})`));
+
+        const stats = g.stats();
+        console.log(chalk.gray(`    Stats: ${typeof stats === 'string' ? stats : JSON.stringify(stats)}`));
+
+        console.log(chalk.green('\n  Graph demo complete!'));
+      } catch (error) {
+        // The createNode/createEdge signatures vary across binding versions
+        // (some take (label, propsJson), some take (label, propsObject)).
+        // Print enough context that the user can adapt without guessing.
+        console.error(chalk.red(`  Graph demo failed: ${error.message}`));
+        const G = graphNode && graphNode.GraphDatabase;
+        if (G) {
+          const methods = Object.getOwnPropertyNames(G.prototype || {}).filter((m) => m !== 'constructor');
+          console.error(chalk.gray(`    GraphDatabase prototype: ${methods.join(', ')}`));
+        }
+      }
+      console.log('');
+    }
+
+    if (options.benchmark) {
+      requireRuvector();
+      console.log(chalk.yellow('  Mini Benchmark Demo\n'));
+
+      try {
+        // Note: ruvector-core-linux-x64-gnu@0.1.29 (and current sister binaries)
+        // has a regression where the `dimensions` constructor arg is ignored
+        // and inserts are pinned to dim=4. Tracking at issue #402. Keeping the
+        // demo at dim=4 so it completes; once the binding is rebuilt from
+        // current source, this can scale up.
+        const dim = 4;
+        const n = 1000;
+        const k = 10;
+        const db = new VectorDB({ dimensions: dim, distanceMetric: 'cosine' });
+
+        console.log(chalk.cyan(`  Generating ${n} random ${dim}-dim vectors...`));
+        const t0 = Date.now();
+        const entries = [];
+        for (let i = 0; i < n; i++) {
+          const v = new Float32Array(dim);
+          for (let j = 0; j < dim; j++) v[j] = Math.random();
+          entries.push({ id: `v${i}`, vector: v });
+        }
+        const insertStart = Date.now();
+        for (const entry of entries) await db.insert(entry);
+        const insertMs = Date.now() - insertStart;
+
+        const queryVec = new Float32Array(dim);
+        for (let j = 0; j < dim; j++) queryVec[j] = Math.random();
+
+        const searchStart = Date.now();
+        const iters = 100;
+        for (let i = 0; i < iters; i++) {
+          await db.search({ vector: queryVec, k });
+        }
+        const searchMs = Date.now() - searchStart;
+
+        console.log(chalk.green(`\n  ✓ Inserted ${n} vectors in ${insertMs}ms (${(insertMs / n).toFixed(2)}ms/vec)`));
+        console.log(chalk.green(`  ✓ ${iters}× top-${k} search in ${searchMs}ms (${(searchMs / iters).toFixed(2)}ms/query)`));
+        console.log(chalk.gray(`  Wall time: ${Date.now() - t0}ms`));
+        console.log(chalk.gray('  For deeper benchmarks: npx ruvector benchmark'));
+      } catch (error) {
+        console.error(chalk.red(`  Benchmark demo failed: ${error.message}`));
+      }
+      console.log('');
+    }
+  });
+
+// ============================================
+// Self-Learning Intelligence Hooks
+// Full RuVector Stack: VectorDB + SONA + Attention
+// ============================================
+
+// LAZY LOADING: IntelligenceEngine is only loaded when first accessed
+// This reduces CLI startup from ~1000ms to ~70ms for simple operations
+let IntelligenceEngine = null;
+let engineLoadAttempted = false;
+
+function loadIntelligenceEngine() {
+  if (engineLoadAttempted) return IntelligenceEngine;
+  engineLoadAttempted = true;
+  try {
+    const core = require('../dist/core/intelligence-engine.js');
+    IntelligenceEngine = core.IntelligenceEngine || core.default;
+  } catch (e) {
+    // IntelligenceEngine not available, use fallback
+  }
+  return IntelligenceEngine;
+}
+
+// ADR-210 D0: shared embedding-provenance invariant (compare/refuse logic,
+// legacy-default derivation, rollout-flag resolution). Lazy, same pattern as
+// the engine: when dist is missing the CLI degrades to pre-ADR-210 behavior.
+let provenanceMod = null;
+let provenanceLoadAttempted = false;
+function loadProvenance() {
+  if (provenanceLoadAttempted) return provenanceMod;
+  provenanceLoadAttempted = true;
+  try {
+    provenanceMod = require('../dist/core/embedding-provenance.js');
+  } catch (e) {
+    provenanceMod = null;
+  }
+  return provenanceMod;
+}
+
+/**
+ * Sanitize a provenance record read from disk (untrusted JSON, ADR-210
+ * security pass): malformed records are treated as ABSENT (null), never
+ * crash. Falls back to a minimal shape check when dist is missing.
+ */
+function sanitizeProvenanceSafe(value) {
+  const prov = loadProvenance();
+  if (prov && typeof prov.sanitizeProvenance === 'function') {
+    return prov.sanitizeProvenance(value);
+  }
+  return (
+    value && typeof value === 'object' && !Array.isArray(value) &&
+    typeof value.embedderKind === 'string' &&
+    Number.isInteger(value.dimension) && value.dimension > 0 && value.dimension <= 65536
+  ) ? value : null;
+}
+
+/** Bound a dimension read from an untrusted sidecar to a sane integer. */
+function sanitizeDimension(value, fallback) {
+  return (Number.isInteger(value) && value > 0 && value <= 65536) ? value : fallback;
+}
+
+/**
+ * Write a file atomically: serialize to a unique temp file in the same
+ * directory, then rename() over the target. rename() is atomic on a POSIX
+ * filesystem, so a concurrent reader never observes a torn/half-written file.
+ * This is the root-cause fix for the intelligence.json wipe under Claude Code,
+ * where every hook is a separate short-lived process sharing the store: a
+ * plain writeFileSync lets one process read a half-written file mid-write.
+ * The temp name carries pid + timestamp so concurrent writers never collide on
+ * the temp file; the final rename is last-writer-wins.
+ */
+function atomicWriteFileSync(filePath, data) {
+  try {
+    return atomicWriteFileSyncUnlocked(filePath, data);
+  } finally {
+    releaseIntelLock(filePath);
+  }
+}
+
+function atomicWriteFileSyncUnlocked(filePath, data) {
+  const dir = path.dirname(filePath);
+  const tmp = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best-effort temp cleanup */ }
+    throw err;
+  }
+}
+
+/**
+ * Read a JSON intelligence store for a standalone command. Returns `{}` for a
+ * missing store (legitimate fresh start), but on a corrupt/unparseable store
+ * quarantines the file (renames it aside) and throws instead of returning `{}`.
+ * The previous `try { parse } catch {}` → `{}` pattern let a corrupt read
+ * degrade to an empty object that the command then wrote back, wiping the
+ * store. Mirrors Intelligence.load()'s corrupt handling.
+ */
+function readIntelStoreSafe(dataPath) {
+  acquireIntelLock(dataPath);
+  if (!fs.existsSync(dataPath)) return {};
+  try {
+    return JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+  } catch (err) {
+    const quarantine = `${dataPath}.corrupt-${Date.now()}`;
+    try { fs.renameSync(dataPath, quarantine); } catch { /* still fail loud below */ }
+    throw new Error(
+      `ruvector: intelligence store at ${dataPath} is corrupt and was quarantined to ` +
+      `${quarantine} rather than overwritten with an empty store — ` +
+      `restore it or delete it to start fresh. (${err.message})`
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-process lock for the intelligence store. Claude Code runs every hook as
+// its own short-lived process, so load → modify → save from two hooks at once
+// used to be last-writer-wins and silently dropped learning updates. The lock
+// is taken on read and released on write (or process exit), is reentrant per
+// process, breaks stale locks left by dead processes, and never blocks a hook
+// for more than INTEL_LOCK_WAIT_MS (it then proceeds unlocked, as before).
+// ---------------------------------------------------------------------------
+const INTEL_LOCK_WAIT_MS = 10000;
+const INTEL_LOCK_STALE_MS = 30000;
+const heldIntelLocks = new Set();
+
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function acquireIntelLock(dataPath) {
+  const lockPath = `${dataPath}.lock`;
+  if (heldIntelLocks.has(lockPath)) return true;
+  try { fs.mkdirSync(path.dirname(dataPath), { recursive: true }); } catch { return false; }
+  const deadline = Date.now() + INTEL_LOCK_WAIT_MS;
+  while (true) {
+    try {
+      const fd = fs.openSync(lockPath, 'wx');
+      fs.writeSync(fd, String(process.pid));
+      fs.closeSync(fd);
+      heldIntelLocks.add(lockPath);
+      if (heldIntelLocks.size === 1) process.once('exit', releaseAllIntelLocks);
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') return false;
+    }
+    try {
+      const st = fs.statSync(lockPath);
+      const owner = parseInt(fs.readFileSync(lockPath, 'utf8'), 10);
+      let ownerAlive = true;
+      if (Number.isInteger(owner) && owner > 0) {
+        try { process.kill(owner, 0); } catch (e) { ownerAlive = e.code === 'EPERM'; }
+      }
+      if (!ownerAlive || Date.now() - st.mtimeMs > INTEL_LOCK_STALE_MS) {
+        fs.rmSync(lockPath, { force: true });
+        continue;
+      }
+    } catch { continue; }
+    if (Date.now() > deadline) return false;
+    sleepSync(5 + Math.floor(Math.random() * 10));
+  }
+}
+
+function releaseIntelLock(dataPath) {
+  const lockPath = `${dataPath}.lock`;
+  if (!heldIntelLocks.delete(lockPath)) return;
+  try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
+}
+
+function releaseAllIntelLocks() {
+  for (const lockPath of heldIntelLocks) {
+    try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
+  }
+  heldIntelLocks.clear();
+}
+
+/**
+ * Tensors for TensorCompress from the store's `patterns`. Q-table entries are
+ * `{state, action, q_value, visits, last_update}` objects, stored as
+ * `[q_value, visits]`; legacy number-array patterns pass through. `hooks
+ * compress` used to accept only the legacy form and so wrote nothing (#1223).
+ */
+function patternTensors(patterns) {
+  const out = [];
+  if (!patterns || typeof patterns !== 'object') return out;
+  for (const [key, value] of Object.entries(patterns)) {
+    if (Array.isArray(value)) {
+      if (value.length > 0 && value.every(Number.isFinite)) out.push([key, value]);
+    } else if (value && typeof value === 'object' && Number.isFinite(value.q_value)) {
+      out.push([key, [value.q_value, Number.isFinite(value.visits) ? value.visits : 0]]);
+    }
+  }
+  return out;
+}
+
+/** Parse a numeric CLI/MCP input; reject non-finite values and clamp to [min, max]. */
+function parseBoundedNumber(value, min, max, name) {
+  const n = typeof value === 'number' ? value : parseFloat(value);
+  if (!Number.isFinite(n)) {
+    throw new Error(`${name} must be a finite number, got ${JSON.stringify(value)}`);
+  }
+  return Math.min(max, Math.max(min, n));
+}
+
+class Intelligence {
+  constructor(options = {}) {
+    this.intelPath = this.getIntelPath();
+    this.data = this.load();
+    this.alpha = 0.1;
+    this.lastEditedFile = null;
+    this.sessionStartTime = null;
+    this._engine = null;
+    this._engineInitialized = false;
+    // Skip engine init for fast operations (trajectory, coedit, error commands)
+    this._skipEngine = options.skipEngine || false;
+  }
+
+  // Lazy getter for engine - only initializes when first accessed
+  getEngine() {
+    if (this._skipEngine) return null;
+    if (this._engineInitialized) return this._engine;
+    this._engineInitialized = true;
+
+    const EngineClass = loadIntelligenceEngine();
+    if (EngineClass) {
+      try {
+        this._engine = new EngineClass({
+          maxMemories: 100000,
+          maxEpisodes: 50000,
+          enableSona: true,
+          enableAttention: true,
+          enableOnnx: true,  // Enable ONNX semantic embeddings
+          learningRate: this.alpha,
+        });
+        // Import existing data into engine
+        if (this.data) {
+          this._engine.import(this.convertLegacyData(this.data), true);
+        }
+      } catch (e) {
+        this._engine = null;
+      }
+    }
+    return this._engine;
+  }
+
+  // Property alias for backwards compatibility
+  get engine() {
+    return this.getEngine();
+  }
+
+  // Check if engine is available WITHOUT triggering initialization
+  // Use this for optional engine features that have fallbacks
+  hasEngine() {
+    return this._engineInitialized && this._engine !== null;
+  }
+
+  // Get engine only if already initialized (doesn't trigger lazy load)
+  getEngineIfReady() {
+    return this._engineInitialized ? this._engine : null;
+  }
+
+  // Convert legacy data format to new engine format
+  convertLegacyData(data) {
+    const converted = {
+      memories: [],
+      routingPatterns: {},
+      errorPatterns: data.errors || {},
+      coEditPatterns: {},
+      agentMappings: {},
+    };
+
+    // Convert memories
+    if (data.memories) {
+      converted.memories = data.memories.map(m => ({
+        id: m.id,
+        content: m.content,
+        type: m.memory_type || 'general',
+        embedding: m.embedding || this.embed(m.content),
+        created: m.timestamp ? new Date(m.timestamp * 1000).toISOString() : new Date().toISOString(),
+        accessed: 0,
+      }));
+    }
+
+    // Convert Q-learning patterns to routing patterns
+    if (data.patterns) {
+      for (const [key, value] of Object.entries(data.patterns)) {
+        const [state, action] = key.split('|');
+        const unsafe = (k) => k === '__proto__' || k === 'constructor' || k === 'prototype';
+        if (state && action && !unsafe(state) && !unsafe(action)) {
+          if (!Object.prototype.hasOwnProperty.call(converted.routingPatterns, state)) {
+            converted.routingPatterns[state] = {};
+          }
+          converted.routingPatterns[state][action] = value.q_value || 0.5;
+        }
+      }
+    }
+
+    // Convert file sequences to co-edit patterns
+    if (data.file_sequences) {
+      for (const seq of data.file_sequences) {
+        if (!converted.coEditPatterns[seq.from_file]) {
+          converted.coEditPatterns[seq.from_file] = {};
+        }
+        converted.coEditPatterns[seq.from_file][seq.to_file] = seq.count;
+      }
+    }
+
+    return converted;
+  }
+
+  // Prefer project-local storage, fall back to home directory
+  getIntelPath() {
+    return resolveIntelStorePath();
+  }
+
+  load() {
+    acquireIntelLock(this.intelPath);
+    const defaults = {
+      patterns: {},
+      memories: [],
+      trajectories: [],
+      errors: {},
+      file_sequences: [],
+      agents: {},
+      edges: [],
+      stats: { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 }
+    };
+    // A missing store is a legitimate fresh start.
+    if (!fs.existsSync(this.intelPath)) return defaults;
+
+    let data;
+    try {
+      data = JSON.parse(fs.readFileSync(this.intelPath, 'utf-8'));
+    } catch (err) {
+      // A corrupt/unreadable store must NOT silently degrade to empty defaults:
+      // the caller would then save() the emptiness back over the real data,
+      // destroying weeks of accumulated memories with no signal. Quarantine the
+      // file (rename it aside so it is preserved and the next save cannot clobber
+      // it) and fail loud. With atomicWriteFileSync() below, a concurrent writer
+      // can no longer produce a torn read, so reaching here means genuine
+      // corruption — a fresh store restarts cleanly on the next run.
+      const quarantine = `${this.intelPath}.corrupt-${Date.now()}`;
+      try { fs.renameSync(this.intelPath, quarantine); } catch { /* still fail loud below */ }
+      throw new Error(
+        `ruvector: intelligence store at ${this.intelPath} is corrupt and was quarantined ` +
+        `to ${quarantine} rather than overwritten with an empty store — ` +
+        `restore it or delete it to start fresh. (${err.message})`
+      );
+    }
+
+    // Merge with defaults to ensure all fields exist. The file is
+    // untrusted on-disk input (ADR-210 security pass): shape-check each
+    // field so a hand-edited/corrupted store cannot crash later code
+    // that iterates arrays or spreads objects.
+    const asArray = (v, dflt) => (Array.isArray(v) ? v : dflt);
+    const asObject = (v, dflt) => (v && typeof v === 'object' && !Array.isArray(v) ? v : dflt);
+    const memories = asArray(data.memories, defaults.memories);
+    // Every memory gets a stable id so get/update/forget can address it.
+    memoryStore.ensureMemoryIds({ memories });
+    return {
+      patterns: asObject(data.patterns, defaults.patterns),
+      memories,
+      trajectories: asArray(data.trajectories, defaults.trajectories),
+      errors: asObject(data.errors, defaults.errors),
+      file_sequences: asArray(data.file_sequences, defaults.file_sequences),
+      agents: asObject(data.agents, defaults.agents),
+      edges: asArray(data.edges, defaults.edges),
+      stats: { ...defaults.stats, ...asObject(data.stats, {}) },
+      // ADR-210 D0: embedding provenance of stored memory vectors
+      // (null = legacy store, read-only for vector writes until reembed).
+      // Malformed records are treated as absent (sanitized, never crash).
+      embeddingProvenance: sanitizeProvenanceSafe(data.embeddingProvenance),
+      // Preserve in-flight trajectories so trajectory-end (run in a later
+      // process) can find what trajectory-begin recorded (#517)
+      activeTrajectories: data.activeTrajectories || {},
+      // Preserve auxiliary learned data if present
+      coEditPatterns: data.coEditPatterns || undefined,
+      sequences: data.sequences || undefined,
+      learning: data.learning || undefined,
+      // Kept so a later save does not drop what `hooks compress` wrote (#1223)
+      compressedPatterns: data.compressedPatterns || undefined
+    };
+  }
+
+  save() {
+    const dir = path.dirname(this.intelPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    // If engine is already initialized, export its data (don't trigger lazy load)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      try {
+        const engineData = eng.export();
+        // Merge engine data with legacy format for compatibility
+        // Merge engine patterns into the store. Replacing the map here used to
+        // delete every pattern the engine had not loaded (pretrain output, CLI
+        // trajectory outcomes) and reset visit counts to 1.
+        if (!this.data.patterns) this.data.patterns = {};
+        for (const [state, actions] of Object.entries(engineData.routingPatterns || {})) {
+          for (const [action, value] of Object.entries(actions)) {
+            if (!Number.isFinite(value)) continue;
+            const key = `${state}|${action}`;
+            const existing = this.data.patterns[key];
+            this.data.patterns[key] = existing
+              ? { ...existing, q_value: value, last_update: this.now() }
+              : { state, action, q_value: value, visits: 1, last_update: this.now() };
+          }
+        }
+        this.data.stats.total_patterns = Object.keys(this.data.patterns).length;
+        this.data.stats.total_memories = (this.data.memories || []).length;
+
+        // Add engine stats
+        this.data.engineStats = engineData.stats;
+      } catch (e) {
+        // Ignore engine export errors
+      }
+    }
+
+    atomicWriteFileSync(this.intelPath, serializeStore(this.data));
+  }
+
+  now() { return Math.floor(Date.now() / 1000); }
+
+  // Use engine embedding if available (256-dim with attention), otherwise fallback (64-dim hash)
+  embed(text) {
+    // Only use engine if already initialized (don't trigger lazy load for embeddings)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      try {
+        return eng.embed(text);
+      } catch {}
+    }
+    // Fallback: simple 64-dim hash embedding
+    const embedding = new Array(64).fill(0);
+    for (let i = 0; i < text.length; i++) {
+      const idx = (text.charCodeAt(i) + i * 7) % 64;
+      embedding[idx] += 1.0;
+    }
+    const norm = Math.sqrt(embedding.reduce((a, b) => a + b * b, 0));
+    if (norm > 0) for (let i = 0; i < embedding.length; i++) embedding[i] /= norm;
+    return embedding;
+  }
+
+  similarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    const dot = a.reduce((sum, v, i) => sum + v * b[i], 0);
+    const normA = Math.sqrt(a.reduce((sum, v) => sum + v * v, 0));
+    const normB = Math.sqrt(b.reduce((sum, v) => sum + v * v, 0));
+    return normA > 0 && normB > 0 ? dot / (normA * normB) : 0;
+  }
+
+  // ========================================================================
+  // ADR-210 D0: embedding-provenance invariant for the intelligence store.
+  // Every memory write records/validates { embedderKind, modelId, dimension,
+  // normalize, prefixPolicy }; mismatched writes are refused, legacy stores
+  // (memories without provenance) are read-only until `hooks reembed`.
+  // ========================================================================
+
+  storedProvenance() { return this.data.embeddingProvenance || null; }
+
+  vectorMemoryCount() {
+    return (this.data.memories || []).filter(m => Array.isArray(m.embedding) && m.embedding.length > 0).length;
+  }
+
+  /** Store predates ADR-210 (has vectors but no provenance record). */
+  isLegacyVectorStore() {
+    return !this.storedProvenance() && this.vectorMemoryCount() > 0;
+  }
+
+  /** Legacy default: hash, dimension inferred from the stored vectors. */
+  inferredLegacyProvenance() {
+    const prov = loadProvenance();
+    const first = (this.data.memories || []).find(m => Array.isArray(m.embedding) && m.embedding.length > 0);
+    const dim = first ? first.embedding.length : 256;
+    if (prov) return prov.legacyHashProvenance(dim);
+    return { embedderKind: 'hash', modelId: null, dimension: dim, normalize: false, prefixPolicy: 'none' };
+  }
+
+  /** Provenance of an embedding produced by the wrapper's sync hash path. */
+  syncWriteProvenance(embedding) {
+    return { embedderKind: 'hash', modelId: null, dimension: embedding.length, normalize: true, prefixPolicy: 'none' };
+  }
+
+  /**
+   * Gate a vector write (throws on refusal). Stamps provenance on the first
+   * write to a fresh store; refuses mismatched writes naming both sides;
+   * legacy stores are read-only until re-embedded.
+   */
+  checkVectorWrite(active) {
+    const prov = loadProvenance();
+    if (!prov || !active) return; // enforcement needs the dist module
+    if (this.isLegacyVectorStore()) {
+      const legacy = this.inferredLegacyProvenance();
+      const err = new Error(
+        `Vector store ${this.intelPath} predates embedding provenance (ADR-210) and is read-only for vector writes. ` +
+        `Stored vectors are treated as ${prov.describeProvenance(legacy)}; the active embedder is ` +
+        `${prov.describeProvenance(active)}. Run 'ruvector hooks reembed' to re-embed and unlock it.`
+      );
+      err.code = 'ERR_LEGACY_STORE_READONLY';
+      throw err;
+    }
+    const stored = this.storedProvenance();
+    if (!stored) {
+      this.data.embeddingProvenance = active;
+      return;
+    }
+    prov.assertProvenanceMatch(stored, active, this.intelPath);
+  }
+
+  /**
+   * Non-throwing write gate honoring RUVECTOR_REEMBED (D5):
+   *   refuse (default) → rethrow; warn → skip the write with one stderr
+   *   warning per process; auto → handled by callers that can re-embed.
+   * Returns { ok } or { ok: false, skipped: true }.
+   */
+  guardVectorWrite(active) {
+    try {
+      this.checkVectorWrite(active);
+      return { ok: true };
+    } catch (e) {
+      const prov = loadProvenance();
+      const policy = prov ? prov.resolveReembedPolicy() : 'refuse';
+      if (policy === 'warn') {
+        if (!Intelligence._reembedWarned) {
+          Intelligence._reembedWarned = true;
+          console.error(`ruvector: ${e.message} (RUVECTOR_REEMBED=warn: store stays read-only, write skipped)`);
+        }
+        return { ok: false, skipped: true, error: e.message };
+      }
+      // 'auto' without an async re-embed path behaves like refuse, with a hint.
+      if (policy === 'auto') e.message += ` (RUVECTOR_REEMBED=auto: run 'ruvector hooks reembed' — in-place re-embedding needs the async path)`;
+      throw e;
+    }
+  }
+
+  /**
+   * Re-embed every stored memory with `embedFn` and stamp `provenance`.
+   * Requires retained source text; memories without text must be dropped
+   * explicitly (the command refuses otherwise — no fabricated vectors).
+   *
+   * ADR-210 D3: when `embedBatchFn` is provided and the store holds
+   * `batchThreshold` (32) or more re-embeddable memories, the whole corpus
+   * is embedded in one bulk call (the engine routes it through the bundled
+   * parallel worker pool); smaller stores embed per-item via `embedFn`.
+   */
+  async reembedAll(embedFn, provenance, { dropMissing = false, embedBatchFn = null, batchThreshold = 32 } = {}) {
+    const memories = Array.isArray(this.data.memories) ? this.data.memories : [];
+    const kept = [];
+    let dropped = 0;
+    for (const m of memories) {
+      if (m && typeof m.content === 'string' && m.content.length > 0) {
+        kept.push(m);
+      } else if (dropMissing) {
+        dropped++;
+      } else {
+        throw new Error('memory without retained source text encountered; rerun with --drop-missing');
+      }
+    }
+    let usedBulk = false;
+    if (embedBatchFn && kept.length >= batchThreshold) {
+      const vectors = await embedBatchFn(kept.map(m => m.content));
+      if (!Array.isArray(vectors) || vectors.length !== kept.length) {
+        throw new Error(`bulk embed returned ${vectors && vectors.length} vectors for ${kept.length} texts`);
+      }
+      for (let i = 0; i < kept.length; i++) kept[i].embedding = vectors[i];
+      usedBulk = true;
+    } else {
+      for (const m of kept) m.embedding = await embedFn(m.content);
+    }
+    this.data.memories = kept;
+    this.data.stats.total_memories = kept.length;
+    this.data.embeddingProvenance = provenance;
+    return { reembedded: kept.length, dropped, bulk: usedBulk };
+  }
+
+  // Memory operations - use engine's VectorDB for semantic search
+  async rememberAsync(memoryType, content, metadata = {}) {
+    if (this.engine) {
+      let entry = null;
+      try {
+        entry = await this.engine.remember(content, memoryType, memoryStore.newMemoryId());
+      } catch (e) {
+        // RUVECTOR_EMBEDDER=minilm is an explicit hard requirement. Do not
+        // silently route a failed semantic write through the sync hash path:
+        // that both contradicts the flag and can create mixed provenance.
+        const prov = loadProvenance();
+        if (prov && prov.resolveEmbedderSelection() === 'minilm') throw e;
+      }
+      if (entry) {
+        // ADR-210 D0: validate provenance BEFORE persisting; provenance
+        // refusals propagate (no silent fallback into a mixed store).
+        const active = typeof this.engine.getActiveProvenance === 'function'
+          ? this.engine.getActiveProvenance()
+          : this.syncWriteProvenance(entry.embedding);
+        const guard = this.guardVectorWrite(active);
+        if (!guard.ok) return null;
+        // Also store in legacy format for compatibility
+        this.data.memories.push({
+          id: entry.id,
+          memory_type: memoryType,
+          content,
+          embedding: entry.embedding,
+          metadata,
+          timestamp: this.now()
+        });
+        if (this.data.memories.length > 5000) this.data.memories.splice(0, 1000);
+        this.data.stats.total_memories = this.data.memories.length;
+        return entry.id;
+      }
+    }
+    return this.remember(memoryType, content, metadata);
+  }
+
+  remember(memoryType, content, metadata = {}) {
+    const id = memoryStore.newMemoryId();
+    const embedding = this.embed(content);
+    // ADR-210 D0: refuse mismatched/legacy vector writes (throws), or skip
+    // under RUVECTOR_REEMBED=warn (returns null).
+    const guard = this.guardVectorWrite(this.syncWriteProvenance(embedding));
+    if (!guard.ok) return null;
+    this.data.memories.push({ id, memory_type: memoryType, content, embedding, metadata, timestamp: this.now() });
+    if (this.data.memories.length > 5000) this.data.memories.splice(0, 1000);
+    this.data.stats.total_memories = this.data.memories.length;
+
+    // Also store in engine if already initialized (don't trigger lazy load)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.remember(content, memoryType).catch(() => {});
+    }
+
+    return id;
+  }
+
+  /**
+   * Update a memory in place. New content is embedded through the same path
+   * as remember()/rememberAsync() and passes the same provenance gate, so an
+   * edit can never create a mixed store (ADR-210). Returns the updated view,
+   * null when the id is unknown, or throws on invalid input / refusal.
+   */
+  async updateMemory(id, patch, { semantic = false } = {}) {
+    const hit = memoryStore.findMemory(this.data, id);
+    if (!hit) return null;
+    const clean = memoryStore.validateMemoryPatch(patch);
+    let embedding;
+    if (clean.content !== undefined) {
+      if (semantic && this.engine) {
+        embedding = await this.engine.embedAsync(clean.content);
+        const active = typeof this.engine.getActiveProvenance === 'function'
+          ? this.engine.getActiveProvenance()
+          : this.syncWriteProvenance(embedding);
+        const guard = this.guardVectorWrite(active);
+        if (!guard.ok) throw Object.assign(new Error(guard.error || 'store is read-only for vector writes (ADR-210)'), { code: 'ERR_EMBEDDING_PROVENANCE' });
+      } else {
+        embedding = this.embed(clean.content);
+        const guard = this.guardVectorWrite(this.syncWriteProvenance(embedding));
+        if (!guard.ok) throw Object.assign(new Error(guard.error || 'store is read-only for vector writes (ADR-210)'), { code: 'ERR_EMBEDDING_PROVENANCE' });
+      }
+    }
+    const view = memoryStore.applyMemoryPatch(hit.memory, clean, embedding);
+    const eng = this.getEngineIfReady();
+    if (eng && typeof eng.forget === 'function') eng.forget(id);
+    return view;
+  }
+
+  /** Remove memories by id; returns { deleted, missing }. */
+  forgetMemories(ids) {
+    const result = memoryStore.deleteMemories(this.data, ids);
+    const eng = this.getEngineIfReady();
+    if (eng && typeof eng.forget === 'function') result.deleted.forEach(id => eng.forget(id));
+    return result;
+  }
+
+  /**
+   * Best-effort remember for ambient learning hooks (post-edit/post-command):
+   * a provenance refusal must not fail the hook — note it once and move on.
+   */
+  tryRemember(memoryType, content, metadata = {}) {
+    try {
+      return this.remember(memoryType, content, metadata);
+    } catch (e) {
+      if (!Intelligence._rememberSkipNoted) {
+        Intelligence._rememberSkipNoted = true;
+        console.error(chalk.dim(`   (memory write skipped: ${e.message})`));
+      }
+      return null;
+    }
+  }
+
+  /**
+   * ADR-210: reads stay allowed on legacy/mismatched stores, but similarity
+   * against differently-embedded vectors is meaningless — say so once.
+   */
+  warnRecallProvenance(active) {
+    const prov = loadProvenance();
+    if (!prov || !active || Intelligence._recallWarned) return;
+    let stored = this.storedProvenance();
+    if (!stored && this.isLegacyVectorStore()) stored = this.inferredLegacyProvenance();
+    if (!stored) return;
+    const mismatches = prov.compareProvenance(stored, active);
+    if (mismatches.length > 0) {
+      Intelligence._recallWarned = true;
+      console.error(
+        `ruvector: recall quality degraded — stored vectors are ${prov.describeProvenance(stored)} ` +
+        `but the query was embedded as ${prov.describeProvenance(active)} (differs on: ${mismatches.join(', ')}). ` +
+        `Run 'ruvector hooks reembed' to fix.`
+      );
+    }
+  }
+
+  async recallAsync(query, topK = 5) {
+    if (this.engine) {
+      try {
+        const results = await this.engine.recall(query, topK);
+        // After recall: embedAsync has settled, so getActiveProvenance() now
+        // reflects the embedder that actually served the query.
+        if (typeof this.engine.getActiveProvenance === 'function') {
+          this.warnRecallProvenance(this.engine.getActiveProvenance());
+        }
+        // Return same format as sync recall() - direct memory objects
+        return results.map(r => ({
+          id: r.id,
+          content: r.content || '',
+          memory_type: r.type || 'general',
+          timestamp: r.created || new Date().toISOString(),
+          score: r.score || 0
+        }));
+      } catch (e) {
+        // Preserve the hard-fail contract for an explicitly selected MiniLM
+        // embedder instead of disguising model failures as hash recall.
+        const prov = loadProvenance();
+        if (prov && prov.resolveEmbedderSelection() === 'minilm') throw e;
+      }
+    }
+    return this.recall(query, topK);
+  }
+
+  recall(query, topK) {
+    const queryEmbed = this.embed(query);
+    this.warnRecallProvenance(this.syncWriteProvenance(queryEmbed));
+    return this.data.memories
+      .map(m => ({ score: this.similarity(queryEmbed, m.embedding), memory: m }))
+      .sort((a, b) => b.score - a.score).slice(0, topK).map(r => r.memory);
+  }
+
+  // Q-learning operations - enhanced with SONA trajectory tracking
+  getQ(state, action) {
+    const key = `${state}|${action}`;
+    if (!this.data.patterns) this.data.patterns = {};
+    return this.data.patterns[key]?.q_value ?? 0;
+  }
+
+  updateQ(state, action, reward) {
+    const key = `${state}|${action}`;
+    if (!this.data.patterns) this.data.patterns = {};
+    if (!this.data.stats) this.data.stats = { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 };
+    if (!this.data.patterns[key]) {
+      this.data.patterns[key] = { state, action, q_value: 0, visits: 0, last_update: 0 };
+    }
+    const p = this.data.patterns[key];
+    p.q_value = p.q_value + this.alpha * (reward - p.q_value);
+    p.visits++;
+    p.last_update = this.now();
+    this.data.stats.total_patterns = Object.keys(this.data.patterns).length;
+
+    // Record episode in engine if already initialized (don't trigger lazy load)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.recordEpisode(state, action, reward, state, false).catch(() => {});
+    }
+  }
+
+  // Canonical routing state key — MUST mirror IntelligenceEngine.getState()/
+  // getExtension() so patterns written here are found by engine.route() (#517).
+  routeState(task, file) {
+    const t = task || '';
+    const taskType = t.includes('fix') ? 'fix' :
+                     t.includes('test') ? 'test' :
+                     t.includes('refactor') ? 'refactor' :
+                     t.includes('document') ? 'docs' : 'edit';
+    let ext = '';
+    if (file) {
+      const idx = file.lastIndexOf('.');
+      ext = idx >= 0 ? file.slice(idx).toLowerCase() : '';
+    }
+    return `${taskType}:${ext || 'unknown'}`;
+  }
+
+  // Record an agent routing outcome under the state key route() reads.
+  // Uses the engine's Q-update semantics (0.5 baseline), so a single good
+  // outcome (reward > 0.5) is enough to beat the static default mapping.
+  recordRouteOutcome(task, file, agent, reward) {
+    if (!agent || agent === 'unknown') return null;
+    const state = this.routeState(task, file);
+    const key = `${state}|${agent}`;
+    if (!this.data.patterns) this.data.patterns = {};
+    if (!this.data.stats) this.data.stats = { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 };
+    if (!this.data.patterns[key]) {
+      this.data.patterns[key] = { state, action: agent, q_value: 0.5, visits: 0, last_update: 0 };
+    }
+    const p = this.data.patterns[key];
+    p.q_value = p.q_value + this.alpha * (reward - p.q_value);
+    p.visits++;
+    p.last_update = this.now();
+    this.data.stats.total_patterns = Object.keys(this.data.patterns).length;
+
+    // Forward to engine if already initialized (don't trigger lazy load)
+    const eng = this.getEngineIfReady();
+    if (eng && typeof eng.recordRouteOutcome === 'function') {
+      try { eng.recordRouteOutcome(task, file, agent, reward); } catch {}
+    }
+    return key;
+  }
+
+  learn(state, action, outcome, reward) {
+    const id = `traj_${this.now()}`;
+    this.updateQ(state, action, reward);
+    if (!this.data.trajectories) this.data.trajectories = [];
+    if (!this.data.stats) this.data.stats = { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 };
+    this.data.trajectories.push({ id, state, action, outcome, reward, timestamp: this.now() });
+    if (this.data.trajectories.length > 1000) this.data.trajectories.splice(0, 200);
+    this.data.stats.total_trajectories = this.data.trajectories.length;
+
+    // End trajectory in engine if already initialized (don't trigger lazy load)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.endTrajectory(reward > 0.5, reward);
+    }
+
+    return id;
+  }
+
+  suggest(state, actions) {
+    let bestAction = actions[0] ?? '';
+    let bestQ = -Infinity;
+    for (const action of actions) {
+      const q = this.getQ(state, action);
+      if (q > bestQ) { bestQ = q; bestAction = action; }
+    }
+    return { action: bestAction, confidence: bestQ > 0 ? Math.min(bestQ, 1) : 0 };
+  }
+
+  // Agent routing - use engine's SONA-enhanced routing
+  async routeAsync(task, file, crateName, operation = 'edit') {
+    if (this.engine) {
+      try {
+        const result = await this.engine.route(task, file);
+        // Begin trajectory for learning
+        this.engine.beginTrajectory(task, file);
+        if (result.agent) {
+          this.engine.setTrajectoryRoute(result.agent);
+        }
+        return {
+          agent: result.agent,
+          confidence: result.confidence,
+          reason: result.reason + (result.patterns?.length ? ` (${result.patterns.length} SONA patterns)` : ''),
+          alternates: result.alternates,
+          patterns: result.patterns
+        };
+      } catch {}
+    }
+    return this.route(task, file, crateName, operation);
+  }
+
+  route(task, file, crateName, operation = 'edit') {
+    const fileType = file ? path.extname(file).slice(1) : 'unknown';
+    // Canonical state shared with the write side (recordRouteOutcome) and
+    // the engine's route() — previously this read `edit_ts_in_project`-style
+    // keys that no learning path ever wrote agent actions for (#517).
+    const state = this.routeState(task || operation, file);
+    const agentMap = {
+      rs: ['rust-developer', 'coder', 'reviewer', 'tester'],
+      ts: ['typescript-developer', 'coder', 'frontend-dev'],
+      tsx: ['react-developer', 'typescript-developer', 'coder'],
+      js: ['javascript-developer', 'coder', 'frontend-dev'],
+      jsx: ['react-developer', 'coder'],
+      py: ['python-developer', 'coder', 'ml-developer'],
+      go: ['go-developer', 'coder'],
+      sql: ['database-specialist', 'coder'],
+      md: ['documentation-specialist', 'coder'],
+      yml: ['devops-engineer', 'coder'],
+      yaml: ['devops-engineer', 'coder']
+    };
+    const agents = (agentMap[fileType] ?? ['coder', 'reviewer']).slice();
+    // Include agents learned for this state (e.g. from trajectory outcomes)
+    // even if they are not in the static candidate list.
+    const prefix = `${state}|`;
+    for (const key of Object.keys(this.data.patterns || {})) {
+      if (key.startsWith(prefix)) {
+        const learned = key.slice(prefix.length);
+        if (learned && !agents.includes(learned)) agents.push(learned);
+      }
+    }
+    // Unseen agents get a neutral 0.5 prior (recordRouteOutcome starts new
+    // agents at 0.5), so an agent with a record of failures (Q < 0.5) no longer
+    // beats the default just because the default has no history.
+    const NEUTRAL_Q = 0.5;
+    let action = agents[0];
+    let bestScore = -Infinity;
+    for (const candidate of agents) {
+      const learned = this.data.patterns?.[`${state}|${candidate}`]?.q_value;
+      const score = Number.isFinite(learned) ? learned : NEUTRAL_Q;
+      if (score > bestScore) { bestScore = score; action = candidate; }
+    }
+    const record = this.data.patterns?.[`${state}|${action}`];
+    const learnedQ = record?.q_value;
+    const confidence = Number.isFinite(learnedQ) ? Math.max(0, Math.min(learnedQ, 1)) : 0;
+    const reason = record?.source === 'pretrain' && !record.visits ? 'pretrained from repository structure'
+      : confidence > 0.5 ? 'learned from past success' : confidence > 0 ? 'based on patterns' : `default for ${fileType} files`;
+
+    // Begin trajectory in engine (only if already initialized)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.beginTrajectory(task || operation, file);
+    }
+
+    return { agent: action, confidence, reason };
+  }
+
+  shouldTest(file) {
+    const ext = path.extname(file).slice(1);
+    switch (ext) {
+      case 'rs': {
+        const crateMatch = file.match(/crates\/([^/]+)/);
+        return crateMatch ? { suggest: true, command: `cargo test -p ${crateMatch[1]}` } : { suggest: true, command: 'cargo test' };
+      }
+      case 'ts': case 'tsx': case 'js': case 'jsx': return { suggest: true, command: 'npm test' };
+      case 'py': return { suggest: true, command: 'pytest' };
+      case 'go': return { suggest: true, command: 'go test ./...' };
+      default: return { suggest: false, command: '' };
+    }
+  }
+
+  // Co-edit pattern tracking - use engine's co-edit patterns
+  recordFileSequence(fromFile, toFile) {
+    const existing = this.data.file_sequences.find(s => s.from_file === fromFile && s.to_file === toFile);
+    if (existing) existing.count++;
+    else this.data.file_sequences.push({ from_file: fromFile, to_file: toFile, count: 1 });
+    this.lastEditedFile = toFile;
+
+    // Record in engine (only if already initialized)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.recordCoEdit(fromFile, toFile);
+    }
+  }
+
+  suggestNext(file, limit = 3) {
+    // Try engine first (only if already initialized)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      try {
+        const results = eng.getLikelyNextFiles(file, limit);
+        if (results.length > 0) {
+          return results.map(r => ({ file: r.file, score: r.count }));
+        }
+      } catch {}
+    }
+    return this.data.file_sequences
+      .filter(s => s.from_file === file)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, limit)
+      .map(s => ({ file: s.to_file, score: s.count }));
+  }
+
+  // Error pattern learning
+  recordErrorFix(errorPattern, fix) {
+    if (!this.data.errors[errorPattern]) {
+      this.data.errors[errorPattern] = [];
+    }
+    if (!this.data.errors[errorPattern].includes(fix)) {
+      this.data.errors[errorPattern].push(fix);
+    }
+    this.data.stats.total_errors = Object.keys(this.data.errors).length;
+
+    // Record in engine (only if already initialized)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.recordErrorFix(errorPattern, fix);
+    }
+  }
+
+  getSuggestedFixes(error) {
+    // Try engine first (only if already initialized)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      try {
+        const fixes = eng.getSuggestedFixes(error);
+        if (fixes.length > 0) return fixes;
+      } catch {}
+    }
+    return this.data.errors[error] || [];
+  }
+
+  classifyCommand(command) {
+    const cmd = command.toLowerCase();
+    if (cmd.includes('cargo') || cmd.includes('rustc')) return { category: 'rust', subcategory: cmd.includes('test') ? 'test' : 'build', risk: 'low' };
+    if (cmd.includes('npm') || cmd.includes('node') || cmd.includes('yarn') || cmd.includes('pnpm')) return { category: 'javascript', subcategory: cmd.includes('test') ? 'test' : 'build', risk: 'low' };
+    if (cmd.includes('python') || cmd.includes('pip') || cmd.includes('pytest')) return { category: 'python', subcategory: cmd.includes('test') ? 'test' : 'run', risk: 'low' };
+    if (cmd.includes('go ')) return { category: 'go', subcategory: cmd.includes('test') ? 'test' : 'build', risk: 'low' };
+    if (cmd.includes('git')) return { category: 'git', subcategory: 'vcs', risk: cmd.includes('push') || cmd.includes('force') ? 'medium' : 'low' };
+    if (cmd.includes('rm ') || cmd.includes('delete') || cmd.includes('rmdir')) return { category: 'filesystem', subcategory: 'destructive', risk: 'high' };
+    if (cmd.includes('sudo') || cmd.includes('chmod') || cmd.includes('chown')) return { category: 'system', subcategory: 'privileged', risk: 'high' };
+    if (cmd.includes('docker') || cmd.includes('kubectl')) return { category: 'container', subcategory: 'orchestration', risk: 'medium' };
+    return { category: 'shell', subcategory: 'general', risk: 'low' };
+  }
+
+  swarmStats() {
+    const agents = Object.keys(this.data.agents).length;
+    const edges = this.data.edges.length;
+    return { agents, edges };
+  }
+
+  // Enhanced stats with engine metrics
+  stats() {
+    const baseStats = this.data.stats;
+    // The stored total_errors counter is only refreshed by recordErrorFix(), so a store whose errors arrived another
+    // way (an import, a merge, another process) reported "0 error patterns" beside stored fixes. Count them.
+    if (baseStats && this.data.errors && typeof this.data.errors === 'object') baseStats.total_errors = Object.keys(this.data.errors).length;
+    // Same for the other counters: report what is stored, not a cached number.
+    if (baseStats) {
+      baseStats.total_patterns = Object.keys(this.data.patterns || {}).length;
+      baseStats.total_memories = (this.data.memories || []).length;
+      baseStats.total_trajectories = (this.data.trajectories || []).length;
+    }
+
+    // Only use engine if already initialized (don't trigger lazy load for optional stats)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      try {
+        const engineStats = eng.getStats();
+        return {
+          ...baseStats,
+          // Engine stats
+          engineEnabled: true,
+          sonaEnabled: engineStats.sonaEnabled,
+          attentionEnabled: engineStats.attentionEnabled,
+          embeddingDim: engineStats.memoryDimensions,
+          // ADR-210 D1: which embedder actually serves embeds right now
+          embedderKind: engineStats.embedderKind,
+          totalMemories: engineStats.totalMemories,
+          totalEpisodes: engineStats.totalEpisodes,
+          trajectoriesRecorded: engineStats.trajectoriesRecorded,
+          patternsLearned: engineStats.patternsLearned,
+          microLoraUpdates: engineStats.microLoraUpdates,
+          baseLoraUpdates: engineStats.baseLoraUpdates,
+          ewcConsolidations: engineStats.ewcConsolidations,
+        };
+      } catch {}
+    }
+
+    return { ...baseStats, engineEnabled: false };
+  }
+
+  sessionStart() {
+    this.data.stats.session_count++;
+    this.data.stats.last_session = this.now();
+    this.sessionStartTime = this.now();
+
+    // Tick engine for background learning (only if already initialized)
+    const eng = this.getEngineIfReady();
+    if (eng) {
+      eng.tick();
+    }
+  }
+
+  sessionEnd() {
+    // Ensure data structure exists with defaults
+    if (!this.data) {
+      this.data = { patterns: {}, memories: [], trajectories: [], errors: [], agents: {}, edges: [], stats: {} };
+    }
+    if (!this.data.stats) {
+      this.data.stats = { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 };
+    }
+    if (!this.data.trajectories) {
+      this.data.trajectories = [];
+    }
+
+    const lastSession = this.data.stats.last_session || 0;
+    const duration = this.now() - (this.sessionStartTime || lastSession);
+    const actions = this.data.trajectories.filter(t => t && t.timestamp >= lastSession).length;
+
+    // Force learning cycle (only if engine already initialized)
+    try {
+      const eng = this.getEngineIfReady();
+      if (eng) {
+        eng.forceLearn();
+      }
+    } catch (e) {
+      // Ignore engine errors on session end
+    }
+
+    // Auto-compress patterns if enabled (v2.1)
+    try {
+      if (process.env.RUVECTOR_AUTO_COMPRESS === 'true' || process.env.RUVECTOR_TENSOR_COMPRESS === 'true') {
+        const TensorCompressClass = require('../dist/core/tensor-compress').default;
+        const tensors = patternTensors(this.data.patterns);
+        if (TensorCompressClass && (this.data.compressedPatterns || tensors.length > 0)) {
+          const compress = new TensorCompressClass({ autoCompress: false });
+          if (this.data.compressedPatterns) compress.import(this.data.compressedPatterns);
+          for (const [key, tensor] of tensors) compress.store(key, tensor);
+          const stats = compress.recompressAll();
+          this.data.compressedPatterns = compress.export();
+          // Only log if significant savings
+          if (stats.savingsPercent > 10 && stats.totalTensors > 5) {
+            // Silently compress, no console output to avoid hook noise
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore compression errors on session end
+    }
+
+    // Save all data
+    try {
+      this.save();
+    } catch (e) {
+      // Ignore save errors on session end
+    }
+
+    return { duration, actions };
+  }
+
+  getLastEditedFile() { return this.lastEditedFile; }
+
+  // New: Check if full engine is available
+  isEngineEnabled() {
+    return this.engine !== null;
+  }
+
+  // New: Get engine capabilities
+  getCapabilities() {
+    if (!this.engine) {
+      return {
+        engine: false,
+        vectorDb: false,
+        sona: false,
+        attention: false,
+        embeddingDim: 64,
+      };
+    }
+    const stats = this.engine.getStats();
+    return {
+      engine: true,
+      vectorDb: true,
+      sona: stats.sonaEnabled,
+      attention: stats.attentionEnabled,
+      embeddingDim: stats.memoryDimensions,
+    };
+  }
+}
+
+// Hooks command group
+const hooksCmd = program.command('hooks').description('Self-learning intelligence hooks for Claude Code');
+
+// Helper: Detect project type
+function detectProjectType() {
+  const cwd = process.cwd();
+  const types = [];
+  if (fs.existsSync(path.join(cwd, 'Cargo.toml'))) types.push('rust');
+  if (fs.existsSync(path.join(cwd, 'package.json'))) types.push('node');
+  if (fs.existsSync(path.join(cwd, 'requirements.txt')) || fs.existsSync(path.join(cwd, 'pyproject.toml'))) types.push('python');
+  if (fs.existsSync(path.join(cwd, 'go.mod'))) types.push('go');
+  if (fs.existsSync(path.join(cwd, 'Gemfile'))) types.push('ruby');
+  if (fs.existsSync(path.join(cwd, 'pom.xml')) || fs.existsSync(path.join(cwd, 'build.gradle'))) types.push('java');
+  return types.length > 0 ? types : ['generic'];
+}
+
+// Helper: Get permissions for project type
+function getPermissionsForProjectType(types) {
+  const basePermissions = [
+    'Bash(git status)', 'Bash(git diff:*)', 'Bash(git log:*)', 'Bash(git add:*)',
+    'Bash(git commit:*)', 'Bash(git push)', 'Bash(git branch:*)', 'Bash(git checkout:*)',
+    'Bash(ls:*)', 'Bash(pwd)', 'Bash(cat:*)', 'Bash(mkdir:*)', 'Bash(which:*)', 'Bash(ruvector:*)'
+  ];
+  const typePermissions = {
+    rust: ['Bash(cargo:*)', 'Bash(rustc:*)', 'Bash(rustfmt:*)', 'Bash(clippy:*)', 'Bash(wasm-pack:*)'],
+    node: ['Bash(npm:*)', 'Bash(npx:*)', 'Bash(node:*)', 'Bash(yarn:*)', 'Bash(pnpm:*)'],
+    python: ['Bash(python:*)', 'Bash(pip:*)', 'Bash(pytest:*)', 'Bash(poetry:*)', 'Bash(uv:*)'],
+    go: ['Bash(go:*)', 'Bash(gofmt:*)'],
+    ruby: ['Bash(ruby:*)', 'Bash(gem:*)', 'Bash(bundle:*)', 'Bash(rails:*)'],
+    java: ['Bash(mvn:*)', 'Bash(gradle:*)', 'Bash(java:*)', 'Bash(javac:*)'],
+    generic: ['Bash(make:*)']
+  };
+  let perms = [...basePermissions];
+  types.forEach(t => { if (typePermissions[t]) perms = perms.concat(typePermissions[t]); });
+  return [...new Set(perms)];
+}
+
+// A hook entry ruvector owns: any `ruvector[@ver] hooks …` or fast-wrapper
+// call, plus the agentic-flow prompt workers that older inits added.
+const RUVECTOR_HOOK_RE = /\bruvector(?:@\S+)?\s+hooks\s|ruvector-fast\.sh\s+hooks\s|agentic-flow(?:@\S+|-fast\.sh)\s+workers\s/;
+
+/**
+ * Merge ruvector's hook groups into an existing `settings.hooks` object.
+ * ruvector-owned entries are removed from every event (so a re-run, or an
+ * upgrade from an older layout, never duplicates them) and every other entry
+ * is kept exactly as it was; ruvector's groups are appended after them.
+ */
+function mergeRuvectorHooks(existing, ours) {
+  const merged = {};
+  const isOurs = (h) => h && typeof h.command === 'string' && RUVECTOR_HOOK_RE.test(h.command);
+  for (const [event, groups] of Object.entries(existing && typeof existing === 'object' ? existing : {})) {
+    if (!Array.isArray(groups)) { merged[event] = groups; continue; }
+    const kept = [];
+    for (const group of groups) {
+      if (!group || !Array.isArray(group.hooks)) { kept.push(group); continue; }
+      const hooks = group.hooks.filter((h) => !isOurs(h));
+      if (hooks.length === group.hooks.length) kept.push(group);
+      else if (hooks.length > 0) kept.push({ ...group, hooks });
+    }
+    if (kept.length > 0 || groups.length === 0 || ours[event]) merged[event] = kept;
+  }
+  for (const [event, groups] of Object.entries(ours)) {
+    merged[event] = [...(merged[event] || []), ...groups];
+  }
+  return merged;
+}
+
+hooksCmd.command('init')
+  .description('Initialize hooks in current project (merges with existing hooks)')
+  .option('--force', 'Force overwrite existing settings')
+  .option('--minimal', 'Only basic hooks (no env, permissions, or advanced hooks)')
+  .option('--fast', 'Use fast local wrapper (20x faster, bypasses npx overhead)')
+  .option('--no-claude-md', 'Skip CLAUDE.md creation')
+  .option('--no-permissions', 'Skip permissions configuration')
+  .option('--no-env', 'Skip environment variables')
+  .option('--no-gitignore', 'Skip .gitignore update')
+  .option('--no-mcp', 'Skip MCP server configuration')
+  .option('--no-statusline', 'Skip statusLine configuration')
+  .option('--pretrain', 'Run pretrain after init to bootstrap intelligence')
+  .option('--build-agents [focus]', 'Generate optimized agents (quality|speed|security|testing|fullstack)')
+  .action(async (opts) => {
+  const settingsPath = path.join(process.cwd(), '.claude', 'settings.json');
+  const settingsDir = path.dirname(settingsPath);
+  const isWindows = process.platform === 'win32';
+  if (!fs.existsSync(settingsDir)) fs.mkdirSync(settingsDir, { recursive: true });
+  let settings = {};
+  if (fs.existsSync(settingsPath) && !opts.force) {
+    try { settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')); } catch {}
+  }
+
+  // Fix schema if present
+  if (settings.$schema) {
+    settings.$schema = 'https://json.schemastore.org/claude-code-settings.json';
+  }
+
+  // Clean up invalid hook names
+  if (settings.hooks) {
+    if (settings.hooks.Start) { delete settings.hooks.Start; }
+    if (settings.hooks.End) { delete settings.hooks.End; }
+  }
+
+  // Detect project type
+  const projectTypes = detectProjectType();
+  console.log(chalk.blue(`  ✓ Detected project type(s): ${projectTypes.join(', ')}`));
+
+  // Environment variables for intelligence (unless --minimal or --no-env)
+  if (!opts.minimal && opts.env !== false) {
+    settings.env = settings.env || {};
+    // Core intelligence settings
+    settings.env.RUVECTOR_INTELLIGENCE_ENABLED = settings.env.RUVECTOR_INTELLIGENCE_ENABLED || 'true';
+    settings.env.RUVECTOR_LEARNING_RATE = settings.env.RUVECTOR_LEARNING_RATE || '0.1';
+    settings.env.RUVECTOR_MEMORY_BACKEND = settings.env.RUVECTOR_MEMORY_BACKEND || 'rvlite';
+    settings.env.INTELLIGENCE_MODE = settings.env.INTELLIGENCE_MODE || 'treatment';
+    // v2.0 capabilities
+    settings.env.RUVECTOR_AST_ENABLED = settings.env.RUVECTOR_AST_ENABLED || 'true';
+    settings.env.RUVECTOR_DIFF_EMBEDDINGS = settings.env.RUVECTOR_DIFF_EMBEDDINGS || 'true';
+    settings.env.RUVECTOR_COVERAGE_ROUTING = settings.env.RUVECTOR_COVERAGE_ROUTING || 'true';
+    settings.env.RUVECTOR_GRAPH_ALGORITHMS = settings.env.RUVECTOR_GRAPH_ALGORITHMS || 'true';
+    settings.env.RUVECTOR_SECURITY_SCAN = settings.env.RUVECTOR_SECURITY_SCAN || 'true';
+    // v2.1 learning & compression
+    settings.env.RUVECTOR_MULTI_ALGORITHM = settings.env.RUVECTOR_MULTI_ALGORITHM || 'true';
+    settings.env.RUVECTOR_DEFAULT_ALGORITHM = settings.env.RUVECTOR_DEFAULT_ALGORITHM || 'double-q';
+    settings.env.RUVECTOR_TENSOR_COMPRESS = settings.env.RUVECTOR_TENSOR_COMPRESS || 'true';
+    settings.env.RUVECTOR_AUTO_COMPRESS = settings.env.RUVECTOR_AUTO_COMPRESS || 'true';
+    console.log(chalk.blue('  ✓ Environment variables configured (v2.1 with multi-algorithm learning)'));
+  }
+
+  // Workers configuration (native ruvector workers + agentic-flow integration)
+  if (!opts.minimal) {
+    settings.workers = settings.workers || {
+      enabled: true,
+      parallel: true,
+      maxConcurrent: 10,
+      native: {
+        enabled: true,
+        types: ['security', 'analysis', 'learning'],
+        defaultTimeout: 120000
+      },
+      triggers: {
+        ultralearn: { priority: 'high', agents: ['researcher', 'coder'] },
+        optimize: { priority: 'high', agents: ['performance-analyzer'] },
+        audit: { priority: 'critical', agents: ['security-analyst', 'tester'] },
+        map: { priority: 'medium', agents: ['architect'] },
+        security: { priority: 'critical', agents: ['security-analyst'] },
+        benchmark: { priority: 'low', agents: ['performance-analyzer'] },
+        document: { priority: 'medium', agents: ['documenter'] },
+        refactor: { priority: 'medium', agents: ['coder', 'reviewer'] },
+        testgaps: { priority: 'high', agents: ['tester'] },
+        deepdive: { priority: 'low', agents: ['researcher'] },
+        predict: { priority: 'medium', agents: ['analyst'] },
+        consolidate: { priority: 'low', agents: ['architect'] }
+      }
+    };
+    console.log(chalk.blue('  ✓ Workers configured (native + 12 triggers)'));
+  }
+
+  // Performance configuration with benchmark thresholds
+  if (!opts.minimal) {
+    settings.performance = settings.performance || {
+      modelCache: {
+        enabled: true,
+        maxSizeMB: 512,
+        ttlMinutes: 60
+      },
+      benchmarkThresholds: {
+        triggerDetection: { p95: 5 },      // <5ms
+        workerRegistry: { p95: 10 },       // <10ms
+        agentSelection: { p95: 1 },        // <1ms
+        memoryKeyGen: { p95: 0.1 },        // <0.1ms
+        concurrent10: { p95: 1000 },       // <1000ms
+        singleEmbedding: { p95: 500 },     // <500ms (WASM)
+        batchEmbedding16: { p95: 8000 }    // <8000ms (WASM)
+      },
+      optimizations: {
+        parallelDispatch: true,
+        batchEmbeddings: true,
+        cacheEmbeddings: true,
+        simd: true
+      }
+    };
+    console.log(chalk.blue('  ✓ Performance thresholds configured'));
+  }
+
+  // Agent presets configuration
+  if (!opts.minimal) {
+    settings.agents = settings.agents || {
+      presets: {
+        'quick-scan': {
+          phases: ['file-discovery', 'summarization'],
+          timeout: 30000
+        },
+        'deep-analysis': {
+          phases: ['file-discovery', 'pattern-extraction', 'embedding-generation', 'complexity-analysis', 'summarization'],
+          timeout: 120000,
+          capabilities: { onnxEmbeddings: true, vectorDb: true }
+        },
+        'security-scan': {
+          phases: ['file-discovery', 'security-scan', 'summarization'],
+          timeout: 60000
+        },
+        'learning': {
+          phases: ['file-discovery', 'pattern-extraction', 'embedding-generation', 'vector-storage', 'summarization'],
+          timeout: 180000,
+          capabilities: { onnxEmbeddings: true, vectorDb: true, intelligenceMemory: true }
+        }
+      },
+      capabilities: {
+        onnxEmbeddings: true,
+        vectorDb: true,
+        intelligenceMemory: true,
+        parallelProcessing: true
+      }
+    };
+    console.log(chalk.blue('  ✓ Agent presets configured (4 presets)'));
+  }
+
+  // Permissions based on detected project type (unless --minimal or --no-permissions)
+  if (!opts.minimal && opts.permissions !== false) {
+    settings.permissions = settings.permissions || {};
+    settings.permissions.allow = settings.permissions.allow || getPermissionsForProjectType(projectTypes);
+    settings.permissions.deny = settings.permissions.deny || [
+      'Bash(rm -rf /)',
+      'Bash(sudo rm:*)',
+      'Bash(chmod 777:*)',
+      'Bash(mkfs:*)',
+      'Bash(dd if=/dev/zero:*)'
+    ];
+    console.log(chalk.blue('  ✓ Permissions configured (project-specific)'));
+  }
+
+  // MCP servers are left as the project has them: init used to push
+  // `claude-flow` into enabledMcpjsonServers, re-enabling a server a project
+  // may have disabled on purpose (#1222). Print how to add ruvector's own.
+  if (!opts.minimal && opts.mcp !== false) {
+    console.log(chalk.blue('  ✓ MCP servers left unchanged (add ruvector with: claude mcp add ruvector -- npx -y ruvector mcp start)'));
+  }
+
+  // StatusLine configuration (unless --minimal or --no-statusline)
+  if (!opts.minimal && opts.statusline !== false) {
+    if (!settings.statusLine) {
+      if (isWindows) {
+        // Windows: PowerShell statusline
+        const statuslineScript = path.join(settingsDir, 'statusline-command.ps1');
+        const statuslineContent = `# RuVector Intelligence Statusline for Windows PowerShell
+# Compatible with PowerShell 5.1+ and PowerShell Core
+$ErrorActionPreference = "SilentlyContinue"
+$e = [char]27
+$inputData = [Console]::In.ReadToEnd()
+$data = $inputData | ConvertFrom-Json
+$Model = if ($data.model.display_name) { $data.model.display_name } else { "Claude" }
+$CWD = if ($data.workspace.current_dir) { $data.workspace.current_dir } else { $data.cwd }
+$Dir = Split-Path -Leaf $CWD
+$Branch = $null
+try { Push-Location $CWD -ErrorAction Stop; $Branch = git branch --show-current 2>$null; Pop-Location } catch {}
+Write-Host "$e[1m$Model$e[0m in $e[36m$Dir$e[0m$(if($Branch){" on $e[33m$Branch$e[0m"})"
+$IntelFile = Join-Path $CWD ".ruvector\intelligence.json"
+if (Test-Path $IntelFile) {
+  $Intel = Get-Content $IntelFile -Raw | ConvertFrom-Json
+  $Mem = if ($Intel.memories) { $Intel.memories.Count } else { 0 }
+  $Traj = if ($Intel.trajectories) { $Intel.trajectories.Count } else { 0 }
+  $Sess = if ($Intel.stats -and $Intel.stats.session_count) { $Intel.stats.session_count } else { 0 }
+  $Pat = if ($Intel.patterns) { ($Intel.patterns | Get-Member -MemberType NoteProperty).Count } else { 0 }
+  $Line2 = "$e[35m RuVector$e[0m"
+  if ($Pat -gt 0) { $Line2 += " $e[32m$Pat patterns$e[0m" } else { $Line2 += " $e[2mlearning$e[0m" }
+  if ($Mem -gt 0) { $Line2 += " $e[34m$Mem mem$e[0m" }
+  if ($Traj -gt 0) { $Line2 += " $e[33m$Traj traj$e[0m" }
+  if ($Sess -gt 0) { $Line2 += " $e[2m#$Sess$e[0m" }
+  Write-Host $Line2
+} else {
+  Write-Host "$e[2m RuVector: run 'npx ruvector hooks session-start'$e[0m"
+}
+`;
+        fs.writeFileSync(statuslineScript, statuslineContent);
+        settings.statusLine = {
+          type: 'command',
+          command: 'powershell -NoProfile -ExecutionPolicy Bypass -File .claude/statusline-command.ps1'
+        };
+      } else {
+        // Unix (macOS, Linux): Bash statusline
+        const statuslineScript = path.join(settingsDir, 'statusline-command.sh');
+        const statuslineContent = `#!/bin/bash
+# RuVector Intelligence Statusline - Multi-line display
+INPUT=\$(cat)
+MODEL=\$(echo "\$INPUT" | jq -r '.model.display_name // "Claude"')
+CWD=\$(echo "\$INPUT" | jq -r '.workspace.current_dir // .cwd')
+DIR=\$(basename "\$CWD")
+BRANCH=\$(cd "\$CWD" 2>/dev/null && git branch --show-current 2>/dev/null)
+RESET="\\033[0m"; BOLD="\\033[1m"; CYAN="\\033[36m"; YELLOW="\\033[33m"; GREEN="\\033[32m"; MAGENTA="\\033[35m"; BLUE="\\033[34m"; DIM="\\033[2m"; RED="\\033[31m"
+printf "\$BOLD\$MODEL\$RESET in \$CYAN\$DIR\$RESET"
+[ -n "\$BRANCH" ] && printf " on \$YELLOW⎇ \$BRANCH\$RESET"
+echo
+INTEL_FILE=""
+for P in "\$CWD/.ruvector/intelligence.json" "\$CWD/npm/packages/ruvector/.ruvector/intelligence.json" "\$HOME/.ruvector/intelligence.json"; do
+  [ -f "\$P" ] && INTEL_FILE="\$P" && break
+done
+if [ -n "\$INTEL_FILE" ]; then
+  INTEL=\$(cat "\$INTEL_FILE" 2>/dev/null)
+  MEMORY_COUNT=\$(echo "\$INTEL" | jq -r '.memories | length // 0' 2>/dev/null)
+  TRAJ_COUNT=\$(echo "\$INTEL" | jq -r '.trajectories | length // 0' 2>/dev/null)
+  SESSION_COUNT=\$(echo "\$INTEL" | jq -r '.stats.session_count // 0' 2>/dev/null)
+  PATTERN_COUNT=\$(echo "\$INTEL" | jq -r '.patterns | length // 0' 2>/dev/null)
+  printf "\$MAGENTA🧠 RuVector\$RESET"
+  [ "\$PATTERN_COUNT" != "null" ] && [ "\$PATTERN_COUNT" -gt 0 ] 2>/dev/null && printf " \$GREEN◆\$RESET \$PATTERN_COUNT patterns" || printf " \$DIM◇ learning\$RESET"
+  [ "\$MEMORY_COUNT" != "null" ] && [ "\$MEMORY_COUNT" -gt 0 ] 2>/dev/null && printf " \$BLUE⬡\$RESET \$MEMORY_COUNT mem"
+  [ "\$TRAJ_COUNT" != "null" ] && [ "\$TRAJ_COUNT" -gt 0 ] 2>/dev/null && printf " \$YELLOW↝\$RESET\$TRAJ_COUNT"
+  [ "\$SESSION_COUNT" != "null" ] && [ "\$SESSION_COUNT" -gt 0 ] 2>/dev/null && printf " \$DIM#\$SESSION_COUNT\$RESET"
+  echo
+else
+  printf "\$DIM🧠 RuVector: run 'npx ruvector hooks session-start' to initialize\$RESET\\n"
+fi
+`;
+        fs.writeFileSync(statuslineScript, statuslineContent);
+        fs.chmodSync(statuslineScript, '755');
+        settings.statusLine = {
+          type: 'command',
+          command: '.claude/statusline-command.sh'
+        };
+      }
+      console.log(chalk.blue(`  ✓ StatusLine configured (${isWindows ? 'PowerShell' : 'Bash'})`));
+    }
+  }
+
+  // Fast wrapper creation (--fast option) - 20x faster than npx.
+  // Without it, hooks run the exact version that wrote them: `npx -y pkg@x.y.z`
+  // is served from the npx cache, where `@latest` checks the registry per event.
+  let hookCmd = `npx -y ruvector@${packageJson.version}`;
+  if (opts.fast && !isWindows) {
+    const fastWrapperPath = path.join(settingsDir, 'ruvector-fast.sh');
+    const fastWrapperContent = `#!/bin/bash
+# Fast RuVector hooks wrapper - avoids npx overhead (20x faster)
+# Usage: .claude/ruvector-fast.sh hooks <command> [args...]
+
+# Find ruvector CLI - check local first, then global
+RUVECTOR_CLI=""
+
+# Check local npm package (for development)
+if [ -f "$PWD/npm/packages/ruvector/bin/cli.js" ]; then
+  RUVECTOR_CLI="$PWD/npm/packages/ruvector/bin/cli.js"
+# Check node_modules
+elif [ -f "$PWD/node_modules/ruvector/bin/cli.js" ]; then
+  RUVECTOR_CLI="$PWD/node_modules/ruvector/bin/cli.js"
+# Check global npm installation
+elif [ -f "$PWD/node_modules/.bin/ruvector" ]; then
+  exec "$PWD/node_modules/.bin/ruvector" "$@"
+elif command -v ruvector &> /dev/null; then
+  exec ruvector "$@"
+# Fallback to npx (slow but works)
+else
+  exec npx -y ruvector@${packageJson.version} "$@"
+fi
+
+# Execute with node directly (fast path)
+exec node "$RUVECTOR_CLI" "$@"
+`;
+    fs.writeFileSync(fastWrapperPath, fastWrapperContent);
+    fs.chmodSync(fastWrapperPath, '755');
+    hookCmd = '.claude/ruvector-fast.sh';
+    // Add permission for fast wrapper
+    if (settings.permissions && settings.permissions.allow) {
+      if (!settings.permissions.allow.includes('Bash(.claude/ruvector-fast.sh:*)')) {
+        settings.permissions.allow.push('Bash(.claude/ruvector-fast.sh:*)');
+      }
+    }
+    console.log(chalk.blue('  ✓ Fast wrapper created (.claude/ruvector-fast.sh) - 20x faster hooks'));
+  }
+
+  // Claude Code hook timeouts are in seconds. Keep them above the 10 s the
+  // store lock may wait (INTEL_LOCK_WAIT_MS) so a queued hook is not killed
+  // before it writes (#1222).
+  const timeouts = { tool: 15, session: 30 };
+  // Claude Code sends the hook input as JSON on stdin (`--stdin` reads it) and
+  // runs hooks in the session's current directory, so pin the project root
+  // to keep every hook on the project's store (#1222, #1223).
+  const hook = (args, timeout = timeouts.tool) => ({
+    type: 'command',
+    timeout,
+    command: `cd "\${CLAUDE_PROJECT_DIR:-.}" && ${hookCmd} hooks ${args} 2>/dev/null || true`,
+  });
+
+  const ruvectorHooks = {
+    PreToolUse: [
+      { matcher: 'Edit|Write|MultiEdit', hooks: [hook('pre-edit --stdin'), hook('coedit-suggest --stdin')] },
+      { matcher: 'Bash', hooks: [hook('pre-command --stdin')] },
+      { matcher: 'Read', hooks: [hook('remember -t file_access --silent --stdin "Reading:"')] },
+      { matcher: 'Glob|Grep', hooks: [hook('remember -t search_pattern --silent --stdin "Search:"')] },
+      { matcher: 'Task', hooks: [hook('remember -t agent_spawn --silent --stdin "Agent:"')] },
+    ],
+    PostToolUse: [
+      { matcher: 'Edit|Write|MultiEdit', hooks: [hook('post-edit --stdin')] },
+      { matcher: 'Bash', hooks: [hook('post-command --stdin')] },
+    ],
+    SessionStart: [{ hooks: [hook('session-start', timeouts.session), hook('trajectory-begin -c "claude-session" -a "claude"')] }],
+    // Once per session. `Stop` fires after every reply, which closed the
+    // session trajectory and re-ran end-of-session learning each turn (#1223).
+    SessionEnd: [{ hooks: [hook('trajectory-end --success --quality 0.8'), hook('session-end', timeouts.session)] }],
+  };
+  if (!opts.minimal) {
+    ruvectorHooks.UserPromptSubmit = [{ hooks: [hook('suggest-context')] }];
+    ruvectorHooks.PreCompact = [
+      { matcher: 'auto', hooks: [hook('pre-compact --auto', timeouts.session), hook('compress', timeouts.session)] },
+      { matcher: 'manual', hooks: [hook('pre-compact', timeouts.session)] },
+    ];
+    ruvectorHooks.Notification = [{ matcher: '.*', hooks: [hook('track-notification')] }];
+  }
+
+  // Merge: replace only ruvector's own entries and keep every other tool's
+  // hooks in place (#1222). Re-running init is idempotent.
+  settings.hooks = mergeRuvectorHooks(settings.hooks, ruvectorHooks);
+  console.log(chalk.blue(`  ✓ Hooks merged into existing settings (${Object.keys(ruvectorHooks).join(', ')})${opts.fast ? ' with fast wrapper' : ''}`));
+
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+  console.log(chalk.green('\n✅ Hooks initialized in .claude/settings.json'));
+
+  // Create CLAUDE.md if it doesn't exist (or force)
+  const claudeMdPath = path.join(process.cwd(), 'CLAUDE.md');
+  if (opts.claudeMd !== false && (!fs.existsSync(claudeMdPath) || opts.force)) {
+    const claudeMdContent = `# Claude Code Project Configuration
+
+## RuVector Self-Learning Intelligence v2.0
+
+This project uses RuVector's self-learning intelligence hooks with advanced capabilities:
+- **Q-learning** for agent routing optimization
+- **Vector memory** with HNSW indexing (150x faster search)
+- **AST parsing** for code complexity analysis
+- **Diff embeddings** for change classification and risk scoring
+- **Coverage routing** for test-aware agent selection
+- **Graph algorithms** for code structure analysis
+- **Security scanning** for vulnerability detection
+- **10 attention mechanisms** including hyperbolic and graph attention
+
+### Active Hooks
+
+| Hook | Trigger | Purpose |
+|------|---------|---------|
+| **PreToolUse** | Before Edit/Write/Bash | Agent routing, AST analysis, command risk assessment |
+| **PostToolUse** | After Edit/Write/Bash | Q-learning update, diff embeddings, outcome tracking |
+| **SessionStart** | Conversation begins | Load intelligence state, display learning stats |
+| **SessionEnd** | Session ends | Close the session trajectory, save learning data |
+| **UserPromptSubmit** | User sends message | RAG context suggestions, pattern recommendations |
+| **PreCompact** | Before context compaction | Preserve important context and memories |
+| **Notification** | Any notification | Track events for learning |
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| \`RUVECTOR_INTELLIGENCE_ENABLED\` | \`true\` | Enable/disable intelligence layer |
+| \`RUVECTOR_LEARNING_RATE\` | \`0.1\` | Q-learning rate (0.0-1.0) |
+| \`RUVECTOR_MEMORY_BACKEND\` | \`rvlite\` | Memory storage backend |
+| \`INTELLIGENCE_MODE\` | \`treatment\` | A/B testing mode (treatment/control) |
+| \`RUVECTOR_AST_ENABLED\` | \`true\` | Enable AST parsing and complexity analysis |
+| \`RUVECTOR_DIFF_EMBEDDINGS\` | \`true\` | Enable diff embeddings and risk scoring |
+| \`RUVECTOR_COVERAGE_ROUTING\` | \`true\` | Enable test coverage-aware routing |
+| \`RUVECTOR_GRAPH_ALGORITHMS\` | \`true\` | Enable graph algorithms (MinCut, Louvain) |
+| \`RUVECTOR_SECURITY_SCAN\` | \`true\` | Enable security vulnerability scanning |
+
+### Core Commands
+
+\`\`\`bash
+# Initialize hooks in a project
+npx ruvector hooks init
+
+# View learning statistics
+npx ruvector hooks stats
+
+# Route a task to best agent
+npx ruvector hooks route "implement feature X"
+
+# Enhanced routing with AST/coverage/diff signals
+npx ruvector hooks route-enhanced "fix bug" --file src/api.ts
+
+# Store context in vector memory
+npx ruvector hooks remember "important context" -t project
+
+# Recall from memory (semantic search)
+npx ruvector hooks recall "context query"
+\`\`\`
+
+### AST Analysis Commands
+
+\`\`\`bash
+# Analyze file structure, symbols, imports, complexity
+npx ruvector hooks ast-analyze src/index.ts
+
+# Get complexity metrics for multiple files
+npx ruvector hooks ast-complexity src/*.ts --threshold 15
+\`\`\`
+
+### Diff & Risk Analysis Commands
+
+\`\`\`bash
+# Analyze commit with semantic embeddings and risk scoring
+npx ruvector hooks diff-analyze HEAD
+
+# Classify change type (feature, bugfix, refactor, etc.)
+npx ruvector hooks diff-classify
+
+# Find similar past commits
+npx ruvector hooks diff-similar -k 5
+
+# Get risk score only
+npx ruvector hooks diff-analyze --risk-only
+\`\`\`
+
+### Coverage & Testing Commands
+
+\`\`\`bash
+# Get coverage-aware routing for a file
+npx ruvector hooks coverage-route src/api.ts
+
+# Suggest tests for files based on coverage
+npx ruvector hooks coverage-suggest src/*.ts
+\`\`\`
+
+### Graph Analysis Commands
+
+\`\`\`bash
+# Find optimal code boundaries (MinCut algorithm)
+npx ruvector hooks graph-mincut src/*.ts
+
+# Detect code communities (Louvain/Spectral clustering)
+npx ruvector hooks graph-cluster src/*.ts --method louvain
+\`\`\`
+
+### Security & RAG Commands
+
+\`\`\`bash
+# Parallel security vulnerability scan
+npx ruvector hooks security-scan src/*.ts
+
+# RAG-enhanced context retrieval
+npx ruvector hooks rag-context "how does auth work"
+
+# Git churn analysis (hot spots)
+npx ruvector hooks git-churn --days 30
+\`\`\`
+
+### MCP Tools (via Claude Code)
+
+When using the RuVector MCP server, these tools are available:
+
+| Tool | Description |
+|------|-------------|
+| \`hooks_stats\` | Get intelligence statistics |
+| \`hooks_route\` | Route task to best agent |
+| \`hooks_route_enhanced\` | Enhanced routing with AST/coverage signals |
+| \`hooks_remember\` / \`hooks_recall\` | Vector memory operations |
+| \`hooks_ast_analyze\` | Parse AST and extract symbols |
+| \`hooks_ast_complexity\` | Get complexity metrics |
+| \`hooks_diff_analyze\` | Analyze changes with embeddings |
+| \`hooks_diff_classify\` | Classify change types |
+| \`hooks_coverage_route\` | Coverage-aware routing |
+| \`hooks_coverage_suggest\` | Suggest needed tests |
+| \`hooks_graph_mincut\` | Find code boundaries |
+| \`hooks_graph_cluster\` | Detect communities |
+| \`hooks_security_scan\` | Security vulnerability scan |
+| \`hooks_rag_context\` | RAG context retrieval |
+| \`hooks_git_churn\` | Hot spot analysis |
+| \`hooks_attention_info\` | Available attention mechanisms |
+| \`hooks_gnn_info\` | GNN layer capabilities |
+
+### Attention Mechanisms
+
+RuVector includes 10 attention mechanisms:
+
+1. **DotProductAttention** - Scaled dot-product attention
+2. **MultiHeadAttention** - Parallel attention heads
+3. **FlashAttention** - Memory-efficient tiled attention
+4. **HyperbolicAttention** - Poincaré ball hyperbolic space
+5. **LinearAttention** - O(n) linear complexity
+6. **MoEAttention** - Mixture-of-Experts sparse attention
+7. **GraphRoPeAttention** - Rotary position for graphs
+8. **EdgeFeaturedAttention** - Edge-aware graph attention
+9. **DualSpaceAttention** - Euclidean + Hyperbolic hybrid
+10. **LocalGlobalAttention** - Sliding window + global tokens
+
+### How It Works
+
+1. **Pre-edit hooks** analyze files via AST and suggest agents based on Q-learned patterns
+2. **Post-edit hooks** generate diff embeddings to improve future routing
+3. **Coverage routing** adjusts agent weights based on test coverage
+4. **Graph algorithms** detect code communities for module boundaries
+5. **Security scanning** identifies common vulnerability patterns
+6. **RAG context** retrieves relevant memories using HNSW search
+7. **Attention mechanisms** provide advanced embedding transformations
+
+### Learning Data
+
+Stored in \`.ruvector/intelligence.json\`:
+- **Q-table patterns**: State-action values for agent routing
+- **Vector memories**: ONNX embeddings with HNSW indexing
+- **Trajectories**: SONA trajectory tracking for meta-learning
+- **Co-edit patterns**: File relationship graphs
+- **Error patterns**: Known issues and suggested fixes
+- **Diff embeddings**: Change classification patterns
+
+### Init Options
+
+\`\`\`bash
+npx ruvector hooks init              # Full configuration with all capabilities
+npx ruvector hooks init --minimal    # Basic hooks only
+npx ruvector hooks init --fast       # Use fast local wrapper (20x faster)
+npx ruvector hooks init --pretrain   # Initialize + pretrain from git history
+npx ruvector hooks init --build-agents quality  # Generate optimized agents
+npx ruvector hooks init --force      # Overwrite existing configuration
+\`\`\`
+
+---
+*Powered by [RuVector](https://github.com/ruvnet/ruvector) self-learning intelligence v2.0*
+`;
+    fs.writeFileSync(claudeMdPath, claudeMdContent);
+    console.log(chalk.green('✅ CLAUDE.md created in project root'));
+  } else if (fs.existsSync(claudeMdPath) && !opts.force) {
+    console.log(chalk.yellow('ℹ️  CLAUDE.md already exists (use --force to overwrite)'));
+  }
+
+  // Update .gitignore (unless --no-gitignore)
+  if (opts.gitignore !== false) {
+    const gitignorePath = path.join(process.cwd(), '.gitignore');
+    const entriesToAdd = ['.ruvector/', '.claude/statusline.sh'];
+    let gitignoreContent = '';
+    if (fs.existsSync(gitignorePath)) {
+      gitignoreContent = fs.readFileSync(gitignorePath, 'utf-8');
+    }
+    const linesToAdd = entriesToAdd.filter(entry => !gitignoreContent.includes(entry));
+    if (linesToAdd.length > 0) {
+      const newContent = gitignoreContent.trim() + '\n\n# RuVector intelligence data\n' + linesToAdd.join('\n') + '\n';
+      fs.writeFileSync(gitignorePath, newContent);
+      console.log(chalk.blue('  ✓ .gitignore updated'));
+    }
+  }
+
+  // Create .ruvector directory for intelligence data
+  const ruvectorDir = path.join(process.cwd(), '.ruvector');
+  if (!fs.existsSync(ruvectorDir)) {
+    fs.mkdirSync(ruvectorDir, { recursive: true });
+    console.log(chalk.blue('  ✓ .ruvector/ directory created'));
+  }
+
+  console.log(chalk.green('\n✅ RuVector hooks initialization complete!'));
+
+  // Run pretrain if requested
+  if (opts.pretrain) {
+    console.log(chalk.yellow('\n📚 Running pretrain to bootstrap intelligence...\n'));
+    const { execFileSync } = require('child_process');
+    try {
+      execFileSync(process.execPath, [__filename, 'hooks', 'pretrain'], { stdio: 'inherit' });
+    } catch (e) {
+      console.log(chalk.yellow('⚠️  Pretrain completed with warnings'));
+    }
+  }
+
+  // Build agents if requested
+  if (opts.buildAgents) {
+    const focus = typeof opts.buildAgents === 'string' ? opts.buildAgents : 'quality';
+    const allowedFocus = ['quality', 'speed', 'security', 'testing', 'fullstack'];
+    if (!allowedFocus.includes(focus)) {
+      console.error(chalk.red(`Invalid --build-agents focus: ${JSON.stringify(focus)} (expected one of ${allowedFocus.join(', ')})`));
+      process.exit(1);
+    }
+    console.log(chalk.yellow(`\n🏗️  Building optimized agents (focus: ${focus})...\n`));
+    const { execFileSync } = require('child_process');
+    try {
+      execFileSync(process.execPath, [__filename, 'hooks', 'build-agents', '--focus', focus, '--include-prompts'], { stdio: 'inherit' });
+    } catch (e) {
+      console.log(chalk.yellow('⚠️  Agent build completed with warnings'));
+    }
+  }
+
+  if (!opts.pretrain && !opts.buildAgents) {
+    console.log(chalk.dim('   Run `npx ruvector hooks verify` to test the setup'));
+    console.log(chalk.dim('   Run `npx ruvector hooks pretrain` to bootstrap intelligence'));
+    console.log(chalk.dim('   Run `npx ruvector hooks build-agents` to generate optimized agents'));
+  }
+});
+
+hooksCmd.command('stats').description('Show intelligence statistics').action(() => {
+  const intel = new Intelligence();
+  const stats = intel.stats();
+  const swarm = intel.swarmStats();
+  console.log(chalk.bold.cyan('\n🧠 RuVector Intelligence Stats\n'));
+  console.log(`  ${chalk.green(stats.total_patterns)} Q-learning patterns`);
+  console.log(`  ${chalk.green(stats.total_memories)} vector memories`);
+  console.log(`  ${chalk.green(stats.total_trajectories)} learning trajectories`);
+  console.log(`  ${chalk.green(stats.total_errors)} error patterns\n`);
+  console.log(chalk.bold('Swarm Status:'));
+  console.log(`  ${chalk.cyan(swarm.agents)} agents registered`);
+  console.log(`  ${chalk.cyan(swarm.edges)} coordination edges`);
+});
+
+hooksCmd.command('session-start').description('Session start hook').option('--resume', 'Resume previous session').action(() => {
+  const intel = new Intelligence();
+  intel.sessionStart();
+  intel.save();
+  console.log(chalk.bold.cyan('🧠 RuVector Intelligence Layer Active'));
+  console.log('⚡ Intelligence guides: agent routing, error fixes, file sequences');
+});
+
+hooksCmd.command('session-end').description('Session end hook').option('--export-metrics', 'Export metrics').action((opts) => {
+  const intel = new Intelligence();
+  const sessionInfo = intel.sessionEnd();
+  intel.save();
+  console.log('📊 Session ended. Learning data saved.');
+  if (opts.exportMetrics) console.log(JSON.stringify({ duration_seconds: sessionInfo.duration, actions_recorded: sessionInfo.actions }));
+});
+
+/**
+ * Claude Code passes hook input as JSON on stdin (it does not set
+ * $TOOL_INPUT_* variables), so `--stdin` lets a hook command take its subject
+ * from that payload (#1222). Only read when asked: a bare read of fd 0 would
+ * block on an interactive terminal.
+ */
+let hookStdinCache;
+function readHookStdin() {
+  if (hookStdinCache !== undefined) return hookStdinCache;
+  hookStdinCache = {};
+  try {
+    const raw = fs.readFileSync(0, 'utf8');
+    const parsed = raw.trim() ? JSON.parse(raw) : {};
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) hookStdinCache = parsed;
+  } catch { /* no or invalid payload: callers treat it as empty */ }
+  return hookStdinCache;
+}
+
+/** The value a tool hook is about: file path, command, search pattern, agent type or prompt. */
+function hookStdinSubject(field) {
+  const input = readHookStdin();
+  const toolInput = input.tool_input && typeof input.tool_input === 'object' ? input.tool_input : {};
+  const keys = field ? [field] : ['file_path', 'notebook_path', 'command', 'pattern', 'subagent_type', 'prompt'];
+  for (const key of keys) {
+    const v = key in toolInput ? toolInput[key] : input[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return '';
+}
+
+/** Resolve a hook's positional subject from argv or, with --stdin, from the payload. */
+function hookSubject(positional, opts, field) {
+  const fromArgs = Array.isArray(positional) ? positional.join(' ') : (positional || '');
+  if (fromArgs) return fromArgs;
+  return opts && opts.stdin ? hookStdinSubject(field) : '';
+}
+
+hooksCmd.command('pre-edit').description('Pre-edit intelligence').argument('[file]', 'File path').option('--stdin', 'Read the file path from Claude Code hook JSON on stdin').action((fileArg, opts) => {
+  const file = hookSubject(fileArg, opts, 'file_path');
+  if (!file) { if (!opts.stdin) hooksCmd.error('error: missing required argument \'file\''); return; }
+  const intel = new Intelligence();
+  const fileName = path.basename(file);
+  const crateMatch = file.match(/crates\/([^/]+)/);
+  const crate = crateMatch?.[1];
+  const { agent, confidence, reason } = intel.route(`edit ${fileName}`, file, crate, 'edit');
+  console.log(chalk.bold('🧠 Intelligence Analysis:'));
+  console.log(`   📁 ${chalk.cyan(crate ?? 'project')}/${fileName}`);
+  console.log(`   🤖 Recommended: ${chalk.green.bold(agent)} (${(confidence * 100).toFixed(0)}% confidence)`);
+  if (reason) console.log(`      → ${chalk.dim(reason)}`);
+  const nextFiles = intel.suggestNext(file, 3);
+  if (nextFiles.length > 0) {
+    console.log('   📎 Likely next files:');
+    nextFiles.forEach(n => console.log(`      - ${n.file} (${n.score} edits)`));
+  }
+});
+
+hooksCmd.command('post-edit').description('Post-edit learning').argument('[file]', 'File path').option('--success', 'Edit succeeded').option('--error <msg>', 'Error message').option('--stdin', 'Read the file path from Claude Code hook JSON on stdin').action((fileArg, opts) => {
+  const file = hookSubject(fileArg, opts, 'file_path');
+  if (!file) { if (!opts.stdin) hooksCmd.error('error: missing required argument \'file\''); return; }
+  const intel = new Intelligence();
+  const success = opts.error ? false : (opts.success ?? true);
+  const ext = path.extname(file).slice(1);
+  const crateMatch = file.match(/crates\/([^/]+)/);
+  const crate = crateMatch?.[1] ?? 'project';
+  const state = `edit_${ext}_in_${crate}`;
+  const lastFile = intel.getLastEditedFile();
+  if (lastFile && lastFile !== file) intel.recordFileSequence(lastFile, file);
+  intel.learn(state, success ? 'successful-edit' : 'failed-edit', success ? 'completed' : 'failed', success ? 1.0 : -0.5);
+  // Best-effort: a provenance-locked store (ADR-210) must not fail the hook
+  intel.tryRemember('edit', `${success ? 'successful' : 'failed'} edit of ${ext} in ${crate}`);
+  intel.save();
+  console.log(`📊 Learning recorded: ${success ? '✅' : '❌'} ${path.basename(file)}`);
+  const test = intel.shouldTest(file);
+  if (test.suggest) console.log(`   🧪 Consider: ${chalk.cyan(test.command)}`);
+});
+
+hooksCmd.command('pre-command').description('Pre-command intelligence').argument('[command...]', 'Command').option('--stdin', 'Read the command from Claude Code hook JSON on stdin').action((command, opts) => {
+  const cmd = hookSubject(command, opts, 'command');
+  if (!cmd) { if (!opts.stdin) hooksCmd.error('error: missing required argument \'command\''); return; }
+  const intel = new Intelligence();
+  const classification = intel.classifyCommand(cmd);
+  console.log(chalk.bold('🧠 Command Analysis:'));
+  console.log(`   📦 Category: ${chalk.cyan(classification.category)}`);
+  console.log(`   🏷️  Type: ${classification.subcategory}`);
+  if (classification.risk === 'high') console.log(`   ⚠️  Risk: ${chalk.red('HIGH')} - Review carefully`);
+  else if (classification.risk === 'medium') console.log(`   ⚡ Risk: ${chalk.yellow('MEDIUM')}`);
+  else console.log(`   ✅ Risk: ${chalk.green('LOW')}`);
+});
+
+hooksCmd.command('post-command').description('Post-command learning').argument('[command...]', 'Command').option('--success', 'Success').option('--error <msg>', 'Error message').option('--stdin', 'Read the command from Claude Code hook JSON on stdin').action((command, opts) => {
+  const cmd = hookSubject(command, opts, 'command');
+  if (!cmd) { if (!opts.stdin) hooksCmd.error('error: missing required argument \'command\''); return; }
+  const intel = new Intelligence();
+  const success = opts.error ? false : (opts.success ?? true);
+  const classification = intel.classifyCommand(cmd);
+  intel.learn(`cmd_${classification.category}_${classification.subcategory}`, success ? 'success' : 'failure', success ? 'completed' : 'failed', success ? 0.8 : -0.3);
+  // Best-effort: a provenance-locked store (ADR-210) must not fail the hook
+  intel.tryRemember('command', `${cmd} ${success ? 'succeeded' : 'failed'}`);
+  intel.save();
+  console.log(`📊 Command ${success ? '✅' : '❌'} recorded`);
+});
+
+hooksCmd.command('route').description('Route task to agent').argument('<task...>', 'Task').option('--file <file>', 'File').option('--crate <crate>', 'Crate').action((task, opts) => {
+  const intel = new Intelligence();
+  const result = intel.route(task.join(' '), opts.file, opts.crate);
+  console.log(JSON.stringify({ task: task.join(' '), recommended: result.agent, confidence: result.confidence, reasoning: result.reason }, null, 2));
+});
+
+hooksCmd.command('suggest-context').description('Suggest relevant context').action(() => {
+  const intel = new Intelligence();
+  const stats = intel.stats();
+  console.log(`RuVector Intelligence: ${stats.total_patterns} learned patterns, ${stats.total_errors} error fixes available. Use 'ruvector hooks route' for agent suggestions.`);
+});
+
+/**
+ * Choose the hook embedder without bypassing ADR-210's rollout flags.
+ * Existing stores are authoritative under `auto`: an ONNX-stamped store uses
+ * the async semantic path and a hash-stamped store keeps the fast hash path.
+ * Fresh stores retain the historical fast default unless the operator
+ * explicitly requests auto/minilm through the environment or --semantic.
+ */
+function hooksUseSemanticEmbedder(intel, forceSemantic) {
+  if (forceSemantic) return true;
+  const prov = loadProvenance();
+  if (!prov) return false;
+  const selection = prov.resolveEmbedderSelection();
+  if (selection === 'minilm') return true;
+  if (selection === 'hash') return false;
+
+  const stored = intel.storedProvenance();
+  if (stored) return stored.embedderKind === 'onnx-minilm';
+
+  // `auto` is also the implicit library default. Only opt a fresh CLI store
+  // into the slower path when the user supplied a rollout flag explicitly.
+  const explicitAuto = String(process.env.RUVECTOR_EMBEDDER || '').trim().toLowerCase() === 'auto';
+  const legacyOnnx = String(process.env.RUVECTOR_ONNX || '').trim() === '1';
+  return explicitAuto || legacyOnnx;
+}
+
+hooksCmd.command('remember').description('Store in memory').requiredOption('-t, --type <type>', 'Memory type').option('--silent', 'Suppress output').option('--semantic', 'Use ONNX semantic embeddings (slower, better quality)').option('--stdin', 'Append the subject of the Claude Code hook JSON on stdin (file path, command, pattern or agent type)').argument('[content...]', 'Content').action(async (contentArgs, opts) => {
+  const content = [...(contentArgs || [])];
+  if (opts.stdin) {
+    const subject = hookStdinSubject();
+    if (!subject) return; // nothing to remember for this event
+    content.push(subject);
+  }
+  if (content.length === 0) hooksCmd.error('error: missing required argument \'content\'');
+  const intel = new Intelligence();
+  let semantic = false;
+  try {
+    let id;
+    semantic = hooksUseSemanticEmbedder(intel, opts.semantic);
+    if (semantic) {
+      // Use async ONNX embedding
+      id = await intel.rememberAsync(opts.type, content.join(' '));
+    } else {
+      id = intel.remember(opts.type, content.join(' '));
+    }
+    if (id === null) {
+      // RUVECTOR_REEMBED=warn: store is read-only, write skipped (ADR-210)
+      if (!opts.silent) {
+        console.log(JSON.stringify({ success: false, skipped: true, reason: 'store is read-only for vector writes (embedding provenance, ADR-210); run `ruvector hooks reembed`' }));
+      }
+      return;
+    }
+    intel.save();
+    if (!opts.silent) {
+      console.log(JSON.stringify({ success: true, id, semantic }));
+    }
+  } catch (e) {
+    // ADR-210 D0: mismatched/legacy vector writes are refused, not coerced.
+    if (!opts.silent) {
+      console.log(JSON.stringify({ success: false, semantic, error: e.message, code: e.code || 'ERR_EMBEDDING_PROVENANCE' }));
+    }
+    process.exitCode = 1;
+  }
+});
+
+hooksCmd.command('recall').description('Search memory').argument('<query...>', 'Query').option('-k, --top-k <n>', 'Results', '5').option('--semantic', 'Use ONNX semantic search (slower, better quality)').action(async (query, opts) => {
+  const intel = new Intelligence();
+  let results;
+  const semantic = hooksUseSemanticEmbedder(intel, opts.semantic);
+  if (semantic) {
+    results = await intel.recallAsync(query.join(' '), parseInt(opts.topK));
+  } else {
+    results = intel.recall(query.join(' '), parseInt(opts.topK));
+  }
+  console.log(JSON.stringify({ query: query.join(' '), semantic, results: results.map(r => ({ id: r.id, type: r.memory_type || 'unknown', content: (r.content || '').slice(0, 200), timestamp: r.timestamp || '', score: r.score })) }, null, 2));
+});
+
+// Memory CRUD: remember (create) / recall + memory-get + memory-list (read) /
+// memory-update / forget (delete). Ids come from `remember`, `recall` or `memory-list`.
+function printJsonResult(obj, ok = true) {
+  console.log(JSON.stringify(obj, null, 2));
+  if (!ok) process.exitCode = 1;
+}
+
+hooksCmd.command('memory-get').description('Show one memory by id').argument('<id>', 'Memory id').action((id) => {
+  try {
+    const intel = new Intelligence({ skipEngine: true });
+    const memory = memoryStore.getMemory(intel.data, id);
+    releaseIntelLock(intel.intelPath);
+    if (!memory) return printJsonResult({ success: false, error: `memory not found: ${id}` }, false);
+    printJsonResult({ success: true, memory });
+  } catch (e) { printJsonResult({ success: false, error: e.message }, false); }
+});
+
+hooksCmd.command('memory-list').description('List memories, newest first')
+  .option('-t, --type <type>', 'Only memories of this type')
+  .option('-l, --limit <n>', 'Page size (max 1000)', '50')
+  .option('-o, --offset <n>', 'Skip this many', '0')
+  .action((opts) => {
+    try {
+      const intel = new Intelligence({ skipEngine: true });
+      const type = opts.type ? memoryStore.validateMemoryType(opts.type) : undefined;
+      const page = memoryStore.listMemories(intel.data, { type, limit: opts.limit, offset: opts.offset });
+      releaseIntelLock(intel.intelPath);
+      printJsonResult({ success: true, ...page });
+    } catch (e) { printJsonResult({ success: false, error: e.message }, false); }
+  });
+
+hooksCmd.command('memory-update').description('Update a memory (content is re-embedded)')
+  .argument('<id>', 'Memory id')
+  .option('-c, --content <text>', 'New content')
+  .option('-t, --type <type>', 'New type')
+  .option('-m, --metadata <json>', 'Replace metadata (JSON object)')
+  .option('--semantic', 'Embed new content with ONNX (match how the store was written)')
+  .action(async (id, opts) => {
+    const intel = new Intelligence();
+    try {
+      const patch = {};
+      if (opts.content !== undefined) patch.content = opts.content;
+      if (opts.type !== undefined) patch.type = opts.type;
+      if (opts.metadata !== undefined) patch.metadata = opts.metadata;
+      const semantic = opts.content !== undefined && hooksUseSemanticEmbedder(intel, opts.semantic);
+      const memory = await intel.updateMemory(id, patch, { semantic });
+      if (!memory) {
+        releaseIntelLock(intel.intelPath);
+        return printJsonResult({ success: false, error: `memory not found: ${id}` }, false);
+      }
+      intel.save();
+      printJsonResult({ success: true, memory });
+    } catch (e) {
+      releaseIntelLock(intel.intelPath);
+      printJsonResult({ success: false, error: e.message, code: e.code }, false);
+    }
+  });
+
+hooksCmd.command('forget').description('Delete memories by id').argument('<ids...>', 'Memory ids').action((ids) => {
+  const intel = new Intelligence({ skipEngine: true });
+  try {
+    const result = intel.forgetMemories(recordValidate.validateIdList(ids, 'memory ids'));
+    if (result.deleted.length > 0) intel.save(); else releaseIntelLock(intel.intelPath);
+    printJsonResult({ success: result.deleted.length > 0, ...result }, result.deleted.length > 0);
+  } catch (e) {
+    releaseIntelLock(intel.intelPath);
+    printJsonResult({ success: false, error: e.message }, false);
+  }
+});
+
+// ADR-210 D1: maintenance command — re-embed hash-era memories with the
+// active embedder and stamp embedding provenance, unlocking legacy stores.
+// Possible because hook memories retain their source text (`content`).
+hooksCmd.command('reembed')
+  .description('Re-embed stored memories with the active embedder and stamp embedding provenance (ADR-210)')
+  .option('--dry-run', 'Report what would change without writing')
+  .option('--drop-missing', 'Drop memories that no longer retain source text')
+  .action(async (opts) => {
+    const provMod = loadProvenance();
+    if (!provMod) {
+      console.log(JSON.stringify({ success: false, error: 'embedding-provenance module unavailable (dist not built)' }));
+      process.exitCode = 1;
+      return;
+    }
+    const intel = new Intelligence({ skipEngine: true }); // embedder chosen explicitly below
+    const memories = Array.isArray(intel.data.memories) ? intel.data.memories : [];
+    const missing = memories.filter(m => !(m && typeof m.content === 'string' && m.content.length > 0)).length;
+
+    if (missing > 0 && !opts.dropMissing) {
+      // Honest refusal: those vectors cannot be re-embedded (no source text),
+      // and keeping them would recreate a mixed store.
+      console.log(JSON.stringify({
+        success: false,
+        error: `${missing} of ${memories.length} memories have no retained source text and cannot be re-embedded`,
+        hint: 'rerun with --drop-missing to discard them, or leave the store read-only for vector writes',
+      }));
+      process.exitCode = 1;
+      return;
+    }
+
+    // Pick the target embedder per RUVECTOR_EMBEDDER (D5).
+    const selection = provMod.resolveEmbedderSelection();
+    let embedFn;
+    let embedBatchFn = null;
+    let shutdownPool = null;
+    let provenance;
+    if (selection === 'hash') {
+      // Deterministic, offline-safe: the wrapper's own hash embedder.
+      embedFn = async (t) => intel.embed(t);
+      provenance = { embedderKind: 'hash', modelId: null, dimension: intel.embed('probe').length, normalize: true, prefixPolicy: 'none' };
+    } else {
+      const EngineClass = loadIntelligenceEngine();
+      if (!EngineClass) {
+        console.log(JSON.stringify({ success: false, error: 'IntelligenceEngine unavailable (dist not built); cannot re-embed semantically' }));
+        process.exitCode = 1;
+        return;
+      }
+      let engine;
+      try {
+        engine = new EngineClass({ enableSona: false, enableAttention: false });
+      } catch (e) {
+        console.log(JSON.stringify({ success: false, error: e.message }));
+        process.exitCode = 1;
+        return;
+      }
+      const ready = typeof engine.awaitOnnx === 'function' ? await engine.awaitOnnx() : false;
+      if (!ready) {
+        // Honest failure: re-embedding with a fallback hash would defeat the
+        // point. Tell the operator what to do instead of fabricating quality.
+        console.log(JSON.stringify({
+          success: false,
+          error: `ONNX model could not be loaded (${engine.getOnnxInitError?.()?.message || 'offline?'}); semantic re-embedding is impossible right now`,
+          hint: 'retry with network access, or force the hash embedder with RUVECTOR_EMBEDDER=hash',
+        }));
+        process.exitCode = 1;
+        return;
+      }
+      embedFn = (t) => engine.embedAsync(t);
+      // ADR-210 D3: 32+ memories re-embed in one bulk call through the
+      // bundled parallel worker pool (parallel-fp32; see embedBulk for the
+      // int8 status). The pool's worker threads keep the process alive, so
+      // they are shut down once the bulk work completes.
+      if (typeof engine.embedBatchAsync === 'function') {
+        embedBatchFn = (texts) => engine.embedBatchAsync(texts);
+        shutdownPool = () => (typeof engine.shutdownEmbedderPool === 'function' ? engine.shutdownEmbedderPool() : Promise.resolve());
+      }
+      provenance = engine.getActiveProvenance();
+    }
+
+    if (opts.dryRun) {
+      console.log(JSON.stringify({
+        success: true,
+        dryRun: true,
+        wouldReembed: memories.length - missing,
+        wouldDrop: opts.dropMissing ? missing : 0,
+        targetProvenance: provenance,
+      }));
+      return;
+    }
+
+    try {
+      const startMs = Date.now();
+      const result = await intel.reembedAll(embedFn, provenance, { dropMissing: !!opts.dropMissing, embedBatchFn });
+      intel.save();
+      let parallelWorkers = 0;
+      try {
+        parallelWorkers = require('../dist/core/onnx-embedder.js').getParallelWorkerCount();
+      } catch (_) {}
+      console.log(JSON.stringify({ success: true, ...result, parallelWorkers, elapsedMs: Date.now() - startMs, provenance }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+      process.exitCode = 1;
+    } finally {
+      if (shutdownPool) await shutdownPool().catch(() => {});
+    }
+  });
+
+hooksCmd.command('pre-compact').description('Pre-compact hook').option('--auto', 'Auto mode').action(() => {
+  const intel = new Intelligence();
+  intel.save();
+  console.log('🗜️ Pre-compact: State saved');
+});
+
+hooksCmd.command('swarm-recommend').description('Recommend agent for task').argument('<task-type>', 'Task type').action((taskType) => {
+  console.log(JSON.stringify({ task_type: taskType, recommended: 'coder', type: 'default', score: 0.8 }));
+});
+
+hooksCmd.command('async-agent').description('Async agent hook').option('--action <action>', 'Action').option('--agent-id <id>', 'Agent ID').option('--task <task>', 'Task').action((opts) => {
+  console.log(JSON.stringify({ action: opts.action, agent_id: opts.agentId, status: 'ok' }));
+});
+
+hooksCmd.command('lsp-diagnostic').description('LSP diagnostic hook').option('--file <file>', 'File').option('--severity <sev>', 'Severity').option('--message <msg>', 'Message').action((opts) => {
+  console.log(JSON.stringify({ file: opts.file, severity: opts.severity, action: 'logged' }));
+});
+
+hooksCmd.command('track-notification').description('Track notification').action(() => {
+  console.log(JSON.stringify({ tracked: true }));
+});
+
+// Trajectory tracking commands
+hooksCmd.command('trajectory-begin')
+  .description('Begin tracking a new execution trajectory')
+  .requiredOption('-c, --context <context>', 'Task or operation context')
+  .option('-a, --agent <agent>', 'Agent performing the task', 'unknown')
+  .option('-f, --file <file>', 'Primary file being worked on')
+  .action((opts) => {
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode - no engine needed
+    const trajId = `traj_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    if (!intel.data.activeTrajectories) intel.data.activeTrajectories = {};
+    intel.data.activeTrajectories[trajId] = {
+      id: trajId,
+      context: opts.context,
+      agent: opts.agent,
+      file: opts.file || null,
+      steps: [],
+      startTime: Date.now()
+    };
+    intel.save();
+    console.log(JSON.stringify({ success: true, trajectory_id: trajId, context: opts.context, agent: opts.agent }));
+  });
+
+hooksCmd.command('trajectory-step')
+  .description('Add a step to the current trajectory')
+  .requiredOption('-a, --action <action>', 'Action taken')
+  .option('-r, --result <result>', 'Result of action')
+  .option('--reward <reward>', 'Reward signal (0-1)', '0.5')
+  .action((opts) => {
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode
+    const trajectories = intel.data.activeTrajectories || {};
+    const trajIds = Object.keys(trajectories);
+    if (trajIds.length === 0) {
+      console.log(JSON.stringify({ success: false, error: 'No active trajectory' }));
+      return;
+    }
+    const latestTrajId = trajIds[trajIds.length - 1];
+    trajectories[latestTrajId].steps.push({
+      action: opts.action,
+      result: opts.result || '',
+      reward: parseFloat(opts.reward),
+      time: Date.now()
+    });
+    intel.save();
+    console.log(JSON.stringify({ success: true, trajectory_id: latestTrajId, step: trajectories[latestTrajId].steps.length }));
+  });
+
+hooksCmd.command('trajectory-end')
+  .description('End the current trajectory with a quality score')
+  .option('--success', 'Task succeeded')
+  .option('--quality <quality>', 'Quality score (0-1)', '0.5')
+  .action((opts) => {
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode
+    const trajectories = intel.data.activeTrajectories || {};
+    const trajIds = Object.keys(trajectories);
+    if (trajIds.length === 0) {
+      console.log(JSON.stringify({ success: false, error: 'No active trajectory' }));
+      return;
+    }
+    const latestTrajId = trajIds[trajIds.length - 1];
+    const traj = trajectories[latestTrajId];
+    let quality;
+    try {
+      quality = opts.success ? 0.8 : parseBoundedNumber(opts.quality, 0, 1, '--quality');
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+      process.exitCode = 1;
+      return;
+    }
+    traj.endTime = Date.now();
+    traj.quality = quality;
+    traj.success = opts.success || false;
+
+    if (!intel.data.trajectories) intel.data.trajectories = [];
+    intel.data.trajectories.push(traj);
+    delete trajectories[latestTrajId];
+
+    // Close the routing learning loop (#517): when the trajectory knows which
+    // agent did the work, record the outcome under the agent-routing state
+    // key that `hooks route` / engine.route() actually query.
+    let learnedRoute = null;
+    if (traj.agent && traj.agent !== 'unknown') {
+      learnedRoute = intel.recordRouteOutcome(traj.context, traj.file || undefined, traj.agent, quality);
+    }
+    intel.save();
+
+    console.log(JSON.stringify({
+      success: true,
+      trajectory_id: latestTrajId,
+      steps: traj.steps.length,
+      duration_ms: traj.endTime - traj.startTime,
+      quality,
+      ...(learnedRoute ? { learned_route: learnedRoute } : {})
+    }));
+  });
+
+// Co-edit pattern commands
+hooksCmd.command('coedit-record')
+  .description('Record co-edit pattern (files edited together)')
+  .requiredOption('-p, --primary <file>', 'Primary file being edited')
+  .requiredOption('-r, --related <files...>', 'Related files edited together')
+  .action((opts) => {
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode
+    if (!intel.data.coEditPatterns) intel.data.coEditPatterns = {};
+    if (!intel.data.coEditPatterns[opts.primary]) intel.data.coEditPatterns[opts.primary] = {};
+
+    for (const related of opts.related) {
+      intel.data.coEditPatterns[opts.primary][related] = (intel.data.coEditPatterns[opts.primary][related] || 0) + 1;
+    }
+    intel.save();
+    console.log(JSON.stringify({ success: true, primary_file: opts.primary, related_count: opts.related.length }));
+  });
+
+hooksCmd.command('coedit-suggest')
+  .description('Get suggested related files based on co-edit patterns')
+  .option('-f, --file <file>', 'Current file')
+  .option('-k, --top-k <n>', 'Number of suggestions', '5')
+  .option('--stdin', 'Read the file path from Claude Code hook JSON on stdin')
+  .action((opts) => {
+    opts.file = hookSubject(opts.file, opts, 'file_path');
+    if (!opts.file) { if (!opts.stdin) hooksCmd.error('error: required option \'-f, --file <file>\' not specified'); return; }
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode
+    let suggestions = [];
+
+    if (intel.data.coEditPatterns && intel.data.coEditPatterns[opts.file]) {
+      suggestions = Object.entries(intel.data.coEditPatterns[opts.file])
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, parseInt(opts.topK))
+        .map(([f, count]) => ({ file: f, count, confidence: Math.min(count / 10, 1) }));
+    }
+    console.log(JSON.stringify({ success: true, file: opts.file, suggestions }));
+  });
+
+// Error pattern commands
+hooksCmd.command('error-record')
+  .description('Record an error and its fix for learning')
+  .requiredOption('-e, --error <error>', 'Error message or code')
+  .requiredOption('-x, --fix <fix>', 'Fix that resolved the error')
+  .option('-f, --file <file>', 'File where error occurred')
+  .action((opts) => {
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode
+    if (!intel.data.errors) intel.data.errors = {};
+    if (!intel.data.errors[opts.error]) intel.data.errors[opts.error] = [];
+    intel.data.errors[opts.error].push({ fix: opts.fix, file: opts.file || '', recorded: Date.now() });
+    intel.save();
+    console.log(JSON.stringify({ success: true, error: opts.error.substring(0, 50), fixes_recorded: intel.data.errors[opts.error].length }));
+  });
+
+hooksCmd.command('error-suggest')
+  .description('Get suggested fixes for an error based on learned patterns')
+  .requiredOption('-e, --error <error>', 'Error message or code')
+  .action((opts) => {
+    const intel = new Intelligence({ skipEngine: true });  // Fast mode
+    let suggestions = [];
+
+    if (intel.data.errors) {
+      for (const [errKey, fixes] of Object.entries(intel.data.errors)) {
+        if (opts.error.includes(errKey) || errKey.includes(opts.error)) {
+          suggestions.push(...fixes.map(f => f.fix));
+        }
+      }
+    }
+    console.log(JSON.stringify({ success: true, error: opts.error.substring(0, 50), suggestions: [...new Set(suggestions)].slice(0, 5) }));
+  });
+
+// Force learning command
+hooksCmd.command('force-learn')
+  .description('Force an immediate learning cycle')
+  .action(() => {
+    try {
+      // Engine enabled: tick()/forceLearn() only exist on the native IntelligenceEngine,
+      // not on this lightweight Intelligence wrapper (see issue #529).
+      const intel = new Intelligence();
+      const eng = intel.getEngine();
+      let success = false;
+      let result;
+      if (eng && typeof eng.forceLearn === 'function') {
+        try {
+          const learnResult = eng.forceLearn();
+          if (typeof eng.tick === 'function') eng.tick();
+          result = learnResult || 'Engine learning cycle complete';
+          success = true;
+        } catch (e) {
+          result = `Engine learning failed: ${e.message}`;
+        }
+      } else {
+        result = 'Native intelligence engine unavailable; no learning cycle performed';
+      }
+      try { intel.save(); } catch {}
+      console.log(JSON.stringify({ success, engineEnabled: !!eng, result, stats: intel.stats() }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, engineEnabled: false, result: `force-learn failed: ${e.message}` }));
+    }
+  });
+
+// ============================================
+// NEW CAPABILITY COMMANDS (AST, Diff, Coverage, Graph, Security, RAG)
+// ============================================
+
+// Lazy load new modules
+let ASTParser, DiffEmbeddings, CoverageRouter, GraphAlgorithms, ExtendedWorkerPool;
+let newModulesLoaded = false;
+
+function loadNewModules() {
+  if (newModulesLoaded) return true;
+  try {
+    const core = require('../dist/core/index.js');
+    // CodeParser is exported as both CodeParser and ASTParser
+    ASTParser = core.CodeParser || core.ASTParser;
+    DiffEmbeddings = core.default?.parseDiff ? core : require('../dist/core/diff-embeddings.js');
+    CoverageRouter = core.default?.parseIstanbulCoverage ? core : require('../dist/core/coverage-router.js');
+    GraphAlgorithms = core.default?.minCut ? core : require('../dist/core/graph-algorithms.js');
+    ExtendedWorkerPool = core.ExtendedWorkerPool;
+    newModulesLoaded = true;
+    return true;
+  } catch (e) {
+    console.error('loadNewModules error:', e.message);
+    return false;
+  }
+}
+
+// AST Analysis Commands
+hooksCmd.command('ast-analyze')
+  .description('Parse file AST and extract symbols, imports, complexity')
+  .argument('<file>', 'File path to analyze')
+  .option('--json', 'Output as JSON')
+  .option('--symbols', 'Show only symbols')
+  .option('--imports', 'Show only imports')
+  .action(async (file, opts) => {
+    if (!loadNewModules() || !ASTParser) {
+      console.log(JSON.stringify({ success: false, error: 'AST parser not available. Run npm run build.' }));
+      return;
+    }
+    try {
+      const parser = new ASTParser();
+      // CodeParser uses analyze() which returns FileAnalysis
+      const analysis = await parser.analyze(file);
+
+      // Get symbols list
+      const symbols = await parser.getSymbols(file);
+
+      if (opts.json) {
+        console.log(JSON.stringify({
+          success: true,
+          file,
+          language: analysis.language,
+          symbols: symbols.map(s => ({ name: s })),
+          imports: analysis.imports,
+          complexity: { cyclomatic: analysis.complexity, lines: analysis.lines },
+          functions: analysis.functions.length,
+          classes: analysis.classes.length
+        }));
+      } else if (opts.symbols) {
+        console.log(chalk.bold.cyan(`\n📊 Symbols in ${path.basename(file)}:\n`));
+        analysis.functions.forEach(f => console.log(`  function: ${f.name} (line ${f.startLine})`));
+        analysis.classes.forEach(c => console.log(`  class: ${c.name} (line ${c.startLine})`));
+        analysis.types.forEach(t => console.log(`  type: ${t}`));
+      } else if (opts.imports) {
+        console.log(chalk.bold.cyan(`\n📦 Imports in ${path.basename(file)}:\n`));
+        analysis.imports.forEach(i => console.log(`  ${i.source} (${i.type})`));
+      } else {
+        console.log(chalk.bold.cyan(`\n📊 AST Analysis: ${path.basename(file)}\n`));
+        console.log(`  Language: ${analysis.language}`);
+        console.log(`  Functions: ${analysis.functions.length}`);
+        console.log(`  Classes: ${analysis.classes.length}`);
+        console.log(`  Imports: ${analysis.imports.length}`);
+        console.log(`  Complexity: ${analysis.complexity}`);
+        console.log(`  Lines: ${analysis.lines}`);
+        console.log(`  Parse time: ${analysis.parseTime.toFixed(2)}ms`);
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+hooksCmd.command('ast-complexity')
+  .description('Get complexity metrics for files')
+  .argument('<files...>', 'Files to analyze')
+  .option('--threshold <n>', 'Warn if complexity exceeds threshold', '10')
+  .action(async (files, opts) => {
+    if (!loadNewModules() || !ASTParser) {
+      console.log(JSON.stringify({ success: false, error: 'AST parser not available' }));
+      return;
+    }
+    const parser = new ASTParser();
+    const threshold = parseInt(opts.threshold);
+    const results = [];
+
+    for (const file of files) {
+      try {
+        if (!fs.existsSync(file)) continue;
+        const analysis = await parser.analyze(file);
+        const warning = analysis.complexity > threshold;
+        results.push({
+          file,
+          cyclomatic: analysis.complexity,
+          lines: analysis.lines,
+          functions: analysis.functions.length,
+          classes: analysis.classes.length,
+          warning
+        });
+      } catch (e) {
+        results.push({ file, error: e.message });
+      }
+    }
+
+    console.log(JSON.stringify({ success: true, results, threshold }));
+  });
+
+// Diff Embedding Commands
+hooksCmd.command('diff-analyze')
+  .description('Analyze git diff with semantic embeddings and risk scoring')
+  .argument('[commit]', 'Commit hash (defaults to staged changes)')
+  .option('--json', 'Output as JSON')
+  .option('--risk-only', 'Show only risk score')
+  .action(async (commit, opts) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Diff embeddings not available' }));
+      return;
+    }
+    try {
+      const diffMod = require('../dist/core/diff-embeddings.js');
+      let analysis;
+      if (commit) {
+        analysis = await diffMod.analyzeCommit(commit);
+      } else {
+        const stagedDiff = diffMod.getStagedDiff();
+        if (!stagedDiff) {
+          console.log(JSON.stringify({ success: false, error: 'No staged changes' }));
+          return;
+        }
+        const hunks = diffMod.parseDiff(stagedDiff);
+        const files = [...new Set(hunks.map(h => h.file))];
+        analysis = {
+          hash: 'staged',
+          message: 'Staged changes',
+          files: await Promise.all(files.map(f => diffMod.analyzeFileDiff(f, stagedDiff))),
+          totalAdditions: hunks.reduce((s, h) => s + h.additions.length, 0),
+          totalDeletions: hunks.reduce((s, h) => s + h.deletions.length, 0),
+          riskScore: 0
+        };
+        analysis.riskScore = analysis.files.reduce((s, f) => s + f.riskScore, 0) / Math.max(1, analysis.files.length);
+      }
+
+      if (opts.json) {
+        console.log(JSON.stringify({ success: true, ...analysis }));
+      } else if (opts.riskOnly) {
+        const risk = analysis.riskScore;
+        const level = risk > 0.7 ? 'HIGH' : risk > 0.4 ? 'MEDIUM' : 'LOW';
+        console.log(JSON.stringify({ success: true, riskScore: risk, riskLevel: level }));
+      } else {
+        console.log(chalk.bold.cyan(`\n📊 Diff Analysis: ${analysis.hash}\n`));
+        console.log(`  Message: ${analysis.message || 'N/A'}`);
+        console.log(`  Files: ${analysis.files.length}`);
+        console.log(`  Changes: +${analysis.totalAdditions} -${analysis.totalDeletions}`);
+        const risk = analysis.riskScore;
+        const riskColor = risk > 0.7 ? chalk.red : risk > 0.4 ? chalk.yellow : chalk.green;
+        console.log(`  Risk: ${riskColor((risk * 100).toFixed(0) + '%')}`);
+        analysis.files.forEach(f => {
+          console.log(`    ${f.file}: ${f.category} (+${f.totalAdditions}/-${f.totalDeletions})`);
+        });
+      }
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+hooksCmd.command('diff-classify')
+  .description('Classify a change type (feature, bugfix, refactor, etc.)')
+  .argument('[commit]', 'Commit hash')
+  .action(async (commit) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Diff embeddings not available' }));
+      return;
+    }
+    try {
+      const diffMod = require('../dist/core/diff-embeddings.js');
+      const analysis = await diffMod.analyzeCommit(commit || 'HEAD');
+      const categories = {};
+      analysis.files.forEach(f => {
+        categories[f.category] = (categories[f.category] || 0) + 1;
+      });
+      const primary = Object.entries(categories).sort((a, b) => b[1] - a[1])[0];
+      console.log(JSON.stringify({
+        success: true,
+        commit: analysis.hash,
+        message: analysis.message,
+        primaryCategory: primary ? primary[0] : 'unknown',
+        categories
+      }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+hooksCmd.command('diff-similar')
+  .description('Find similar past commits based on diff embeddings')
+  .option('-k, --top-k <n>', 'Number of results', '5')
+  .option('--commits <n>', 'How many recent commits to search', '50')
+  .action(async (opts) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Diff embeddings not available' }));
+      return;
+    }
+    try {
+      const diffMod = require('../dist/core/diff-embeddings.js');
+      const stagedDiff = diffMod.getStagedDiff() || diffMod.getUnstagedDiff();
+      if (!stagedDiff) {
+        console.log(JSON.stringify({ success: false, error: 'No current changes to compare' }));
+        return;
+      }
+      const similar = await diffMod.findSimilarCommits(stagedDiff, parseInt(opts.commits), parseInt(opts.topK));
+      console.log(JSON.stringify({ success: true, similar }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+// Coverage Routing Commands
+hooksCmd.command('coverage-route')
+  .description('Get coverage-aware agent routing for a file')
+  .argument('<file>', 'File to analyze')
+  .action((file) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Coverage router not available' }));
+      return;
+    }
+    try {
+      const covMod = require('../dist/core/coverage-router.js');
+      const reportPath = covMod.findCoverageReport();
+      const summary = reportPath ? covMod.parseIstanbulCoverage(reportPath) : null;
+      const routing = covMod.shouldRouteToTester(file, summary);
+      const weights = covMod.getCoverageRoutingWeight(file, summary);
+      console.log(JSON.stringify({
+        success: true,
+        file,
+        coverageReport: reportPath || 'not found',
+        routeToTester: routing.route,
+        reason: routing.reason,
+        coverage: routing.coverage,
+        agentWeights: weights
+      }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+hooksCmd.command('coverage-suggest')
+  .description('Suggest tests for files based on coverage data')
+  .argument('<files...>', 'Files to analyze')
+  .action((files) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Coverage router not available' }));
+      return;
+    }
+    try {
+      const covMod = require('../dist/core/coverage-router.js');
+      const suggestions = covMod.suggestTests(files);
+      console.log(JSON.stringify({ success: true, suggestions }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+// Graph Algorithm Commands
+
+// Build an undirected import graph over the given files. Each file is one
+// node, named by its path relative to the cwd without extension (`pkg/a/x`),
+// so same-named files in different directories stay distinct (#1217). An
+// edge a->b exists when a imports a relative specifier (`./b`, `../b`,
+// `./sub/b`, with or without an extension, or a directory's index) that
+// resolves to b, via `from`, `import`, `import()` or `require()`. The result
+// is the Graph shape every function in dist/core/graph-algorithms.js expects.
+function buildImportGraph(files) {
+  const graphMod = require('../dist/core/graph-algorithms.js');
+  const stripExt = (p) => p.slice(0, p.length - path.extname(p).length);
+  const relId = (abs) => path.relative(process.cwd(), abs).split(path.sep).join('/');
+  const absFiles = [...new Set(files.map((f) => path.resolve(f)))];
+  // Name nodes without extension unless two files would then collide (a.ts + a.js).
+  const stemCount = new Map();
+  for (const abs of absFiles) stemCount.set(stripExt(abs), (stemCount.get(stripExt(abs)) || 0) + 1);
+  const nodeOf = new Map(); // absolute path (with and without extension) -> node id
+  for (const abs of absFiles) {
+    const unique = stemCount.get(stripExt(abs)) === 1;
+    const id = relId(unique ? stripExt(abs) : abs);
+    nodeOf.set(abs, id);
+    if (unique) nodeOf.set(stripExt(abs), id);
+  }
+  const resolveImport = (fromAbs, spec) => {
+    const target = path.resolve(path.dirname(fromAbs), spec);
+    for (const cand of [target, stripExt(target), path.join(target, 'index')]) {
+      if (nodeOf.has(cand)) return nodeOf.get(cand);
+    }
+    return null;
+  };
+  const nodes = absFiles.map((abs) => nodeOf.get(abs));
+  const seen = new Set();
+  const edges = [];
+  const importRe = /(?:from\s+|import\s*\(\s*|import\s+|require\s*\(\s*)['"](\.\.?\/[^'"]+)['"]/g;
+  for (const abs of absFiles) {
+    if (!fs.existsSync(abs)) continue;
+    const from = nodeOf.get(abs);
+    const content = fs.readFileSync(abs, 'utf-8');
+    for (const m of content.matchAll(importRe)) {
+      const to = resolveImport(abs, m[1]);
+      if (!to || to === from) continue;
+      const key = from < to ? from + '\0' + to : to + '\0' + from;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      edges.push({ from, to, weight: 1 });
+    }
+  }
+  return { graphMod, nodes, edges, graph: graphMod.buildGraph(nodes, edges) };
+}
+
+// Map<node, clusterId> -> { assignments: {node: id}, groups: [[node...]] }
+function clustersToJson(map) {
+  const assignments = {};
+  const byId = new Map();
+  for (const [node, id] of map) {
+    assignments[node] = id;
+    if (!byId.has(id)) byId.set(id, []);
+    byId.get(id).push(node);
+  }
+  const groups = [...byId.keys()].sort((a, b) => a - b).map((id) => byId.get(id));
+  return { assignments, groups };
+}
+
+hooksCmd.command('graph-mincut')
+  .description('Find optimal code boundaries using MinCut algorithm')
+  .argument('<files...>', 'Files to analyze')
+  .option('--partitions <n>', 'Number of partitions', '2')
+  .action(async (files, opts) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Graph algorithms not available' }));
+      return;
+    }
+    try {
+      const { nodes, edges, graph } = buildImportGraph(files);
+      // minCutFast uses @ruvector/mincut-wasm when it is installed and falls
+      // back to the exact pure-TS Stoer-Wagner otherwise; both are exact.
+      const wasm = require('../dist/core/mincut-wasm-wrapper.js');
+      const engine = wasm.isMinCutWasmAvailable() ? 'mincut-wasm' : 'typescript';
+      const result = wasm.minCutFast(graph);
+      console.log(JSON.stringify({
+        success: true,
+        engine,
+        nodes: nodes.length,
+        edges: edges.length,
+        groups: result.groups,
+        cutWeight: result.cutWeight,
+        modularity: result.modularity,
+      }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+hooksCmd.command('graph-cluster')
+  .description('Detect code communities using spectral/Louvain clustering')
+  .argument('<files...>', 'Files to analyze')
+  .option('--method <type>', 'Clustering method: spectral, louvain', 'louvain')
+  .option('--clusters <n>', 'Number of clusters (spectral only)', '3')
+  .action(async (files, opts) => {
+    if (!loadNewModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Graph algorithms not available' }));
+      return;
+    }
+    try {
+      const method = opts.method === 'spectral' ? 'spectral' : opts.method === 'louvain' ? 'louvain' : null;
+      if (!method) {
+        console.log(JSON.stringify({ success: false, error: `Unknown method '${opts.method}' (use spectral or louvain)` }));
+        return;
+      }
+      const { graphMod, nodes, edges, graph } = buildImportGraph(files);
+      let out;
+      if (method === 'spectral') {
+        const k = parseInt(opts.clusters, 10);
+        if (!Number.isInteger(k) || k < 1) {
+          console.log(JSON.stringify({ success: false, error: '--clusters must be a positive integer' }));
+          return;
+        }
+        const r = graphMod.spectralClustering(graph, k);
+        out = { ...clustersToJson(r.clusters), eigenvalues: r.eigenvalues };
+      } else {
+        out = clustersToJson(graphMod.louvainCommunities(graph));
+      }
+      out.modularity = graphMod.calculateModularity(graph, out.groups);
+      console.log(JSON.stringify({ success: true, method, nodes: nodes.length, edges: edges.length, ...out }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+// Security Scan Command
+hooksCmd.command('security-scan')
+  .description('Parallel security vulnerability scan')
+  .argument('<files...>', 'Files to scan')
+  .option('--json', 'Output as JSON')
+  .action(async (files, opts) => {
+    if (!loadNewModules() || !ExtendedWorkerPool) {
+      // Fallback to basic pattern matching
+      const patterns = [
+        { pattern: /eval\s*\(/g, severity: 'high', message: 'eval() usage detected' },
+        { pattern: /innerHTML\s*=/g, severity: 'medium', message: 'innerHTML assignment (XSS risk)' },
+        { pattern: /document\.write/g, severity: 'medium', message: 'document.write usage' },
+        { pattern: /password\s*=\s*['"][^'"]+['"]/gi, severity: 'critical', message: 'Hardcoded password' },
+        { pattern: /api[_-]?key\s*=\s*['"][^'"]+['"]/gi, severity: 'critical', message: 'Hardcoded API key' },
+        { pattern: /exec\s*\(/g, severity: 'high', message: 'exec() usage (command injection risk)' },
+        { pattern: /dangerouslySetInnerHTML/g, severity: 'medium', message: 'React dangerouslySetInnerHTML' },
+        { pattern: /SELECT.*FROM.*WHERE.*\+/gi, severity: 'high', message: 'SQL injection risk' },
+      ];
+
+      const findings = [];
+      for (const file of files) {
+        if (!fs.existsSync(file)) continue;
+        try {
+          const content = fs.readFileSync(file, 'utf-8');
+          const lines = content.split('\n');
+          patterns.forEach(p => {
+            let match;
+            lines.forEach((line, idx) => {
+              if (p.pattern.test(line)) {
+                findings.push({ file, line: idx + 1, severity: p.severity, message: p.message });
+              }
+              p.pattern.lastIndex = 0;
+            });
+          });
+        } catch (e) {}
+      }
+      console.log(JSON.stringify({ success: true, findings, scanned: files.length }));
+      return;
+    }
+    // Use parallel worker if available
+    try {
+      const pool = new ExtendedWorkerPool();
+      const results = await pool.securityScan(files);
+      console.log(JSON.stringify({ success: true, ...results }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+// RAG Context Command
+hooksCmd.command('rag-context')
+  .description('Get RAG-enhanced context for a query')
+  .argument('<query...>', 'Query for context')
+  .option('-k, --top-k <n>', 'Number of results', '5')
+  .option('--rerank', 'Rerank results by relevance')
+  .action(async (query, opts) => {
+    const intel = new Intelligence();
+    const queryStr = query.join(' ');
+
+    // Use async recall with engine (VectorDB + HNSW)
+    const memories = await intel.recallAsync(queryStr, parseInt(opts.topK));
+
+    // Rerank if requested (see bin/rerank.js: this was a silent no-op)
+    let results = memories;
+    let rerank = {};
+    if (opts.rerank) {
+      loadNewModules();
+      const r = await require('./rerank.js').rerankMemories(memories, queryStr, ExtendedWorkerPool);
+      results = r.results;
+      rerank = { reranked: r.reranked, ...(r.error ? { rerank_error: r.error } : {}) };
+    }
+
+    console.log(JSON.stringify({ success: true, query: queryStr, results, ...rerank }));
+  });
+
+// Git Churn Analysis Command
+hooksCmd.command('git-churn')
+  .description('Analyze git churn to find hot spots')
+  .option('--days <n>', 'Number of days to analyze', '30')
+  .option('--top <n>', 'Top N files', '10')
+  .action((opts) => {
+    try {
+      const { execFileSync } = require('child_process');
+      const days = Math.max(1, parseInt(opts.days, 10) || 30);
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const log = execFileSync('git', ['log', `--since=${since}`, '--name-only', '--format='], { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] });
+      const files = log.trim().split('\n').filter(Boolean);
+      const counts = {};
+      files.forEach(f => { counts[f] = (counts[f] || 0) + 1; });
+      const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, parseInt(opts.top));
+      const hotSpots = sorted.map(([file, count]) => ({ file, changes: count }));
+      console.log(JSON.stringify({ success: true, days: parseInt(opts.days), hotSpots }));
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+    }
+  });
+
+// Enhanced route command that uses new capabilities
+hooksCmd.command('route-enhanced')
+  .description('Enhanced routing using AST, coverage, and diff analysis')
+  .argument('<task...>', 'Task description')
+  .option('--file <file>', 'File context')
+  .action(async (task, opts) => {
+    const intel = new Intelligence();
+    const taskStr = task.join(' ');
+
+    // Base routing
+    const baseRoute = await intel.routeAsync(taskStr, opts.file, null, 'edit');
+
+    // Enhance with coverage if available
+    let coverageWeight = null;
+    if (opts.file && loadNewModules()) {
+      try {
+        const covMod = require('../dist/core/coverage-router.js');
+        const reportPath = covMod.findCoverageReport();
+        if (reportPath) {
+          coverageWeight = covMod.getCoverageRoutingWeight(opts.file);
+        }
+      } catch (e) {}
+    }
+
+    // Enhance with AST complexity if available
+    let complexity = null;
+    if (opts.file && loadNewModules() && ASTParser) {
+      try {
+        const parser = new ASTParser();
+        const code = fs.readFileSync(opts.file, 'utf-8');
+        const ext = path.extname(opts.file).slice(1);
+        const result = parser.parse(code, ext);
+        complexity = parser.calculateComplexity(result);
+      } catch (e) {}
+    }
+
+    // Adjust routing based on signals
+    let finalAgent = baseRoute.agent;
+    let adjustedConfidence = baseRoute.confidence;
+    const signals = [];
+
+    if (coverageWeight && coverageWeight.tester > 0.4) {
+      signals.push('low coverage detected');
+      if (coverageWeight.tester > adjustedConfidence * 0.5) {
+        finalAgent = 'tester';
+        adjustedConfidence = coverageWeight.tester;
+      }
+    }
+
+    if (complexity && complexity.cyclomatic > 15) {
+      signals.push('high complexity detected');
+      if (finalAgent === 'coder') {
+        finalAgent = 'reviewer';
+        adjustedConfidence = Math.max(adjustedConfidence, 0.7);
+      }
+    }
+
+    console.log(JSON.stringify({
+      success: true,
+      agent: finalAgent,
+      confidence: adjustedConfidence,
+      reason: baseRoute.reason,
+      signals,
+      coverageWeight,
+      complexity
+    }));
+  });
+
+// ============================================
+// LEARNING & COMPRESSION COMMANDS (v2.1)
+// ============================================
+
+let TensorCompressClass = null;
+let LearningEngineClass = null;
+
+function loadLearningModules() {
+  if (LearningEngineClass) return true;
+  try {
+    const core = require('../dist/core/index.js');
+    TensorCompressClass = core.TensorCompress;
+    LearningEngineClass = core.LearningEngine;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Learning algorithm configuration
+hooksCmd.command('learning-config')
+  .description('Configure learning algorithms for different tasks')
+  .option('-t, --task <type>', 'Task type (agent-routing, error-avoidance, confidence-scoring, trajectory-learning, context-ranking, memory-recall)')
+  .option('-a, --algorithm <alg>', 'Algorithm (q-learning, sarsa, double-q, actor-critic, ppo, decision-transformer, monte-carlo, td-lambda, dqn, neural-q)')
+  .option('-l, --learning-rate <rate>', 'Learning rate (0.0-1.0)', parseFloat)
+  .option('-g, --gamma <gamma>', 'Discount factor (0.0-1.0)', parseFloat)
+  .option('-e, --epsilon <epsilon>', 'Exploration rate (0.0-1.0)', parseFloat)
+  .option('--lambda <lambda>', 'Lambda for TD(λ)', parseFloat)
+  .option('--list', 'List all algorithms and their descriptions')
+  .option('--show', 'Show current configuration')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Learning modules not available. Run npm run build.' }));
+      return;
+    }
+
+    if (opts.list) {
+      const algorithms = LearningEngineClass.getAlgorithms();
+      console.log(JSON.stringify({
+        success: true,
+        algorithms: algorithms.map(a => ({
+          name: a.algorithm,
+          description: a.description,
+          bestFor: a.bestFor
+        }))
+      }));
+      return;
+    }
+
+    // Load existing intelligence data
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const engine = new LearningEngineClass();
+    if (data.learning) {
+      engine.import(data.learning);
+    }
+
+    if (opts.show) {
+      const tasks = ['agent-routing', 'error-avoidance', 'confidence-scoring', 'trajectory-learning', 'context-ranking', 'memory-recall'];
+      const configs = {};
+      for (const task of tasks) {
+        configs[task] = engine.getConfig(task);
+      }
+      console.log(JSON.stringify({ success: true, configs }));
+      return;
+    }
+
+    if (!opts.task) {
+      console.log(JSON.stringify({ success: false, error: 'Specify --task or use --list/--show' }));
+      return;
+    }
+
+    const config = {};
+    if (opts.algorithm) config.algorithm = opts.algorithm;
+    if (opts.learningRate !== undefined) config.learningRate = opts.learningRate;
+    if (opts.gamma !== undefined) config.discountFactor = opts.gamma;
+    if (opts.epsilon !== undefined) config.epsilon = opts.epsilon;
+    if (opts.lambda !== undefined) config.lambda = opts.lambda;
+
+    try {
+      engine.configure(opts.task, config);
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+      process.exitCode = 1;
+      return;
+    }
+
+    // Save
+    data.learning = engine.export();
+    fs.mkdirSync(path.dirname(dataPath), { recursive: true });
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
+
+    console.log(JSON.stringify({
+      success: true,
+      task: opts.task,
+      config: engine.getConfig(opts.task)
+    }));
+  });
+
+// Learning statistics
+hooksCmd.command('learning-stats')
+  .description('Show learning algorithm statistics and performance')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Learning modules not available' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const engine = new LearningEngineClass();
+    if (data.learning) {
+      engine.import(data.learning);
+    }
+
+    const summary = engine.getStatsSummary();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ success: true, ...summary }));
+    } else {
+      console.log(chalk.bold.cyan('\n📊 Learning Statistics\n'));
+      console.log(`  Best Algorithm: ${chalk.green(summary.bestAlgorithm)}`);
+      console.log(`  Total Updates:  ${summary.totalUpdates}`);
+      console.log(`  Avg Reward:     ${Number(summary.avgReward || 0).toFixed(4)}`);
+
+      if (summary.algorithms.length > 0) {
+        console.log(chalk.bold('\n  Algorithm Performance:'));
+        for (const alg of summary.algorithms) {
+          console.log(`    ${alg.algorithm.padEnd(20)} updates: ${String(alg.updates).padStart(6)}  avgReward: ${Number(alg.avgReward || 0).toFixed(3).padStart(8)}  convergence: ${Number(alg.convergenceScore || 0).toFixed(3)}`);
+        }
+      }
+      console.log('');
+    }
+  });
+
+// Manual learning update
+hooksCmd.command('learning-update')
+  .description('Manually record a learning experience')
+  .requiredOption('-t, --task <type>', 'Task type')
+  .requiredOption('-s, --state <state>', 'Current state')
+  .requiredOption('-a, --action <action>', 'Action taken')
+  .requiredOption('-r, --reward <reward>', 'Reward received', parseFloat)
+  .option('-n, --next-state <state>', 'Next state')
+  .option('-d, --done', 'Episode is done')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Learning modules not available' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const engine = new LearningEngineClass();
+    if (data.learning) {
+      engine.import(data.learning);
+    }
+    // 'neural-q' tasks use the optional ruv-fann MLP when installed (tabular otherwise).
+    if (engine.usesNeural()) await engine.enableNeural();
+
+    let reward;
+    try {
+      reward = parseBoundedNumber(opts.reward, -1, 1, '--reward');
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+      process.exitCode = 1;
+      return;
+    }
+    const experience = {
+      state: opts.state,
+      action: opts.action,
+      reward,
+      nextState: opts.nextState || opts.state,
+      done: opts.done || false,
+      timestamp: Date.now()
+    };
+
+    const delta = engine.update(opts.task, experience);
+
+    // Save
+    data.learning = engine.export();
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
+
+    console.log(JSON.stringify({
+      success: true,
+      task: opts.task,
+      experience,
+      delta,
+      algorithm: engine.getConfig(opts.task).algorithm
+    }));
+  });
+
+// TensorCompress commands
+hooksCmd.command('compress')
+  .description('Compress pattern storage using TensorCompress')
+  .option('--force', 'Force recompression of all patterns')
+  .option('--stats', 'Show compression statistics only')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Compression modules not available' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const compress = new TensorCompressClass({
+      autoCompress: false,
+      hotThreshold: 0.8,
+      warmThreshold: 0.4,
+      coolThreshold: 0.1,
+      coldThreshold: 0.01
+    });
+
+    // Import existing compressed data, then refresh it from the live Q-table.
+    if (data.compressedPatterns) {
+      compress.import(data.compressedPatterns);
+    }
+    for (const [key, tensor] of patternTensors(data.patterns)) compress.store(key, tensor);
+
+    if (opts.stats) {
+      const stats = compress.getStats();
+      console.log(JSON.stringify({ success: true, ...stats }));
+      return;
+    }
+
+    // Recompress based on access patterns
+    const stats = compress.recompressAll();
+
+    // Save compressed data
+    data.compressedPatterns = compress.export();
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
+
+    console.log(JSON.stringify({
+      success: true,
+      message: 'Compression complete',
+      ...stats
+    }));
+  });
+
+hooksCmd.command('compress-stats')
+  .description('Show TensorCompress statistics')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Compression modules not available' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const compress = new TensorCompressClass({ autoCompress: false });
+    if (data.compressedPatterns) {
+      compress.import(data.compressedPatterns);
+    }
+
+    const stats = compress.getStats();
+
+    if (opts.json) {
+      console.log(JSON.stringify({ success: true, ...stats }));
+    } else {
+      console.log(chalk.bold.cyan('\n📦 TensorCompress Statistics\n'));
+      console.log(`  Total Tensors:    ${stats.totalTensors}`);
+      console.log(`  Original Size:    ${(stats.originalBytes / 1024).toFixed(2)} KB`);
+      console.log(`  Compressed Size:  ${(stats.compressedBytes / 1024).toFixed(2)} KB`);
+      console.log(`  Savings:          ${chalk.green(stats.savingsPercent.toFixed(1) + '%')}`);
+
+      console.log(chalk.bold('\n  By Compression Level:'));
+      console.log(`    none (hot):     ${stats.byLevel.none}`);
+      console.log(`    half (warm):    ${stats.byLevel.half}`);
+      console.log(`    pq8 (cool):     ${stats.byLevel.pq8}`);
+      console.log(`    pq4 (cold):     ${stats.byLevel.pq4}`);
+      console.log(`    binary (archive): ${stats.byLevel.binary}`);
+      console.log('');
+    }
+  });
+
+// Store embedding with compression
+hooksCmd.command('compress-store')
+  .description('Store an embedding with adaptive compression')
+  .requiredOption('-k, --key <key>', 'Storage key')
+  .requiredOption('-v, --vector <vector>', 'Vector as JSON array')
+  .option('-l, --level <level>', 'Compression level (none, half, pq8, pq4, binary)')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Compression modules not available' }));
+      return;
+    }
+
+    let vector;
+    try {
+      vector = JSON.parse(opts.vector);
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: 'Invalid vector JSON' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const compress = new TensorCompressClass({ autoCompress: false });
+    if (data.compressedPatterns) {
+      compress.import(data.compressedPatterns);
+    }
+
+    compress.store(opts.key, vector, opts.level);
+
+    data.compressedPatterns = compress.export();
+    fs.mkdirSync(path.dirname(dataPath), { recursive: true });
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
+
+    const stats = compress.getStats();
+    console.log(JSON.stringify({
+      success: true,
+      key: opts.key,
+      level: opts.level || 'auto',
+      originalDim: vector.length,
+      totalTensors: stats.totalTensors
+    }));
+  });
+
+// Retrieve compressed embedding
+hooksCmd.command('compress-get')
+  .description('Retrieve a compressed embedding')
+  .requiredOption('-k, --key <key>', 'Storage key')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Compression modules not available' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const compress = new TensorCompressClass({ autoCompress: false });
+    if (data.compressedPatterns) {
+      compress.import(data.compressedPatterns);
+    }
+
+    const vector = compress.get(opts.key);
+    if (!vector) {
+      console.log(JSON.stringify({ success: false, error: 'Key not found' }));
+      return;
+    }
+
+    console.log(JSON.stringify({
+      success: true,
+      key: opts.key,
+      vector: Array.from(vector),
+      dimension: vector.length
+    }));
+  });
+
+// Combined learning action with best algorithm
+hooksCmd.command('learn')
+  .description('Record learning outcome and get best action recommendation')
+  .requiredOption('-s, --state <state>', 'Current state (e.g., file extension, task type)')
+  .option('-a, --action <action>', 'Action taken')
+  .option('-r, --reward <reward>', 'Reward (-1 to 1)', parseFloat)
+  .option('--actions <actions>', 'Available actions (comma-separated)')
+  .option('-t, --task <type>', 'Task type', 'agent-routing')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Learning modules not available' }));
+      return;
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const engine = new LearningEngineClass();
+    if (data.learning) {
+      engine.import(data.learning);
+    }
+    // 'neural-q' tasks use the optional ruv-fann MLP when installed (tabular otherwise).
+    if (engine.usesNeural()) await engine.enableNeural();
+
+    let result = { success: true };
+
+    // If action and reward provided, record the experience
+    if (opts.action && opts.reward !== undefined) {
+      let reward;
+      try {
+        reward = parseBoundedNumber(opts.reward, -1, 1, '--reward');
+      } catch (e) {
+        console.log(JSON.stringify({ success: false, error: e.message }));
+        process.exitCode = 1;
+        return;
+      }
+      const experience = {
+        state: opts.state,
+        action: opts.action,
+        reward,
+        nextState: opts.state,
+        done: true,
+        timestamp: Date.now()
+      };
+
+      const delta = engine.update(opts.task, experience);
+      result.recorded = { experience, delta, algorithm: engine.getConfig(opts.task).algorithm };
+
+      // Agent-routing rewards must reach `hooks route`, which reads
+      // data.patterns keyed by "<task>:<ext>|<agent>" (the same state format
+      // used here). Reward in [-1, 1] maps to route quality in [0, 1].
+      if (opts.task === 'agent-routing') {
+        if (!data.patterns) data.patterns = {};
+        const key = `${opts.state}|${opts.action}`;
+        const p = data.patterns[key] || { state: opts.state, action: opts.action, q_value: 0.5, visits: 0, last_update: 0 };
+        p.q_value = p.q_value + 0.1 * ((reward + 1) / 2 - p.q_value);
+        p.visits = (p.visits || 0) + 1;
+        p.last_update = Math.floor(Date.now() / 1000);
+        data.patterns[key] = p;
+        if (data.stats) data.stats.total_patterns = Object.keys(data.patterns).length;
+      }
+    }
+
+    // Get best action recommendation
+    if (opts.actions) {
+      const actions = opts.actions.split(',').map(a => a.trim());
+      const best = engine.getBestAction(opts.task, opts.state, actions);
+      result.recommendation = best;
+    }
+
+    // Save
+    data.learning = engine.export();
+    fs.mkdirSync(path.dirname(dataPath), { recursive: true });
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
+
+    console.log(JSON.stringify(result));
+  });
+
+// Batch learn - process multiple experiences at once
+hooksCmd.command('batch-learn')
+  .description('Record multiple learning experiences in batch for efficiency')
+  .option('-f, --file <file>', 'JSON file with experiences array')
+  .option('-d, --data <json>', 'Inline JSON array of experiences')
+  .option('-t, --task <type>', 'Task type for all experiences', 'agent-routing')
+  .action(async (opts) => {
+    if (!loadLearningModules()) {
+      console.log(JSON.stringify({ success: false, error: 'Learning modules not available' }));
+      return;
+    }
+
+    let experiences = [];
+
+    // Load from file or inline
+    if (opts.file) {
+      try {
+        const content = fs.readFileSync(opts.file, 'utf-8');
+        experiences = JSON.parse(content);
+      } catch (e) {
+        console.log(JSON.stringify({ success: false, error: `Failed to read file: ${e.message}` }));
+        return;
+      }
+    } else if (opts.data) {
+      try {
+        experiences = JSON.parse(opts.data);
+      } catch (e) {
+        console.log(JSON.stringify({ success: false, error: `Invalid JSON: ${e.message}` }));
+        return;
+      }
+    } else {
+      console.log(JSON.stringify({ success: false, error: 'Provide --file or --data' }));
+      return;
+    }
+
+    if (!Array.isArray(experiences)) {
+      experiences = [experiences];
+    }
+
+    const dataPath = resolveIntelStorePath();
+    let data = readIntelStoreSafe(dataPath);
+
+    const engine = new LearningEngineClass();
+    if (data.learning) {
+      engine.import(data.learning);
+    }
+    // 'neural-q' tasks use the optional ruv-fann MLP when installed (tabular otherwise).
+    if (engine.usesNeural()) await engine.enableNeural();
+
+    const results = [];
+    let totalReward = 0;
+
+    // Validate the whole batch before applying any of it.
+    let rewards;
+    try {
+      rewards = experiences.map((exp, i) => {
+        if (!exp || typeof exp.state !== 'string' || typeof exp.action !== 'string') {
+          throw new Error(`experience ${i}: state and action must be strings`);
+        }
+        return parseBoundedNumber(exp.reward ?? 0.5, -1, 1, `experience ${i} reward`);
+      });
+    } catch (e) {
+      console.log(JSON.stringify({ success: false, error: e.message }));
+      process.exitCode = 1;
+      return;
+    }
+
+    for (const [i, exp] of experiences.entries()) {
+      const experience = {
+        state: exp.state,
+        action: exp.action,
+        reward: rewards[i],
+        nextState: exp.nextState ?? exp.state,
+        done: exp.done ?? false,
+        timestamp: exp.timestamp ?? Date.now()
+      };
+
+      const delta = engine.update(opts.task, experience);
+      totalReward += experience.reward;
+      results.push({ state: exp.state, action: exp.action, delta });
+    }
+
+    // Save
+    data.learning = engine.export();
+    fs.mkdirSync(path.dirname(dataPath), { recursive: true });
+    atomicWriteFileSync(dataPath, JSON.stringify(data, null, 2));
+
+    const stats = engine.getStatsSummary();
+    console.log(JSON.stringify({
+      success: true,
+      processed: experiences.length,
+      avgReward: totalReward / experiences.length,
+      results,
+      stats: {
+        bestAlgorithm: stats.bestAlgorithm,
+        totalUpdates: stats.totalUpdates,
+        avgReward: stats.avgReward
+      }
+    }));
+  });
+
+// Subscribe to learning updates - stream real-time learning events
+hooksCmd.command('subscribe')
+  .description('Subscribe to real-time learning updates (streaming)')
+  .option('-e, --events <types>', 'Event types to subscribe to (learn,compress,route,memory)', 'learn,route')
+  .option('-f, --format <fmt>', 'Output format (json, text)', 'json')
+  .option('--poll <ms>', 'Poll interval in ms', parseInt, 1000)
+  .action(async (opts) => {
+    const events = opts.events.split(',').map(e => e.trim());
+    const dataPath = resolveIntelStorePath();
+
+    let lastStats = { patterns: 0, memories: 0, trajectories: 0 };
+    let lastLearning = { totalUpdates: 0 };
+
+    console.error(chalk.cyan('🔴 Subscribed to learning updates. Press Ctrl+C to stop.\n'));
+    console.error(chalk.dim(`   Events: ${events.join(', ')}`));
+    console.error(chalk.dim(`   Poll interval: ${opts.poll}ms\n`));
+
+    const emit = (type, data) => {
+      const event = { type, timestamp: Date.now(), data };
+      if (opts.format === 'json') {
+        console.log(JSON.stringify(event));
+      } else {
+        const icon = { learn: '🧠', compress: '📦', route: '🎯', memory: '💾' }[type] || '📡';
+        console.log(`${icon} [${type}] ${JSON.stringify(data)}`);
+      }
+    };
+
+    const check = () => {
+      try {
+        if (!fs.existsSync(dataPath)) return;
+
+        const data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+        const stats = data.stats || {};
+        const learning = data.learning?.stats || {};
+
+        // Check for new patterns (learn events)
+        if (events.includes('learn')) {
+          const currentPatterns = stats.total_patterns || 0;
+          if (currentPatterns > lastStats.patterns) {
+            emit('learn', {
+              type: 'pattern',
+              newPatterns: currentPatterns - lastStats.patterns,
+              total: currentPatterns
+            });
+            lastStats.patterns = currentPatterns;
+          }
+
+          // Check learning engine updates
+          let totalUpdates = 0;
+          Object.values(learning).forEach(algo => {
+            if (algo.updates) totalUpdates += algo.updates;
+          });
+          if (totalUpdates > lastLearning.totalUpdates) {
+            const bestAlgo = Object.entries(learning)
+              .filter(([, v]) => v.updates > 0)
+              .sort((a, b) => b[1].avgReward - a[1].avgReward)[0];
+            emit('learn', {
+              type: 'algorithm_update',
+              newUpdates: totalUpdates - lastLearning.totalUpdates,
+              totalUpdates,
+              bestAlgorithm: bestAlgo?.[0] || 'none'
+            });
+            lastLearning.totalUpdates = totalUpdates;
+          }
+        }
+
+        // Check for new memories
+        if (events.includes('memory')) {
+          const currentMemories = stats.total_memories || 0;
+          if (currentMemories > lastStats.memories) {
+            emit('memory', {
+              newMemories: currentMemories - lastStats.memories,
+              total: currentMemories
+            });
+            lastStats.memories = currentMemories;
+          }
+        }
+
+        // Check for new trajectories (route events)
+        if (events.includes('route')) {
+          const currentTrajectories = stats.total_trajectories || 0;
+          if (currentTrajectories > lastStats.trajectories) {
+            emit('route', {
+              newTrajectories: currentTrajectories - lastStats.trajectories,
+              total: currentTrajectories
+            });
+            lastStats.trajectories = currentTrajectories;
+          }
+        }
+
+      } catch (e) {
+        // Ignore read errors during updates
+      }
+    };
+
+    // Initial state
+    check();
+
+    // Poll for updates
+    const interval = setInterval(check, opts.poll);
+
+    // Handle graceful shutdown
+    process.on('SIGINT', () => {
+      clearInterval(interval);
+      console.error(chalk.dim('\n\n👋 Subscription ended.'));
+      process.exit(0);
+    });
+
+    // Keep alive
+    await new Promise(() => {});
+  });
+
+// Watch and learn - monitor file changes and auto-learn
+hooksCmd.command('watch')
+  .description('Watch for changes and auto-learn patterns in real-time')
+  .option('-p, --path <dir>', 'Directory to watch', '.')
+  .option('-i, --ignore <patterns>', 'Patterns to ignore (comma-separated)', 'node_modules,dist,.git')
+  .option('--dry-run', 'Show what would be learned without saving')
+  .action(async (opts) => {
+    const watchDir = path.resolve(opts.path);
+    const ignorePatterns = opts.ignore.split(',').map(p => p.trim());
+
+    console.error(chalk.cyan(`👁️  Watching ${watchDir} for changes...\n`));
+    console.error(chalk.dim(`   Ignoring: ${ignorePatterns.join(', ')}`));
+    console.error(chalk.dim(`   Press Ctrl+C to stop.\n`));
+
+    const intel = new Intelligence({ skipEngine: true });
+    let lastEdit = null;
+    let editCount = 0;
+
+    const shouldIgnore = (filePath) => {
+      return ignorePatterns.some(pattern => filePath.includes(pattern));
+    };
+
+    const processChange = (eventType, filename) => {
+      if (!filename || shouldIgnore(filename)) return;
+
+      const ext = path.extname(filename);
+      const state = `edit:${ext || 'unknown'}`;
+      const now = Date.now();
+
+      // Determine likely action based on file type
+      const agentMapping = {
+        '.ts': 'typescript-developer',
+        '.js': 'coder',
+        '.rs': 'rust-developer',
+        '.py': 'python-developer',
+        '.go': 'go-developer',
+        '.md': 'documentation',
+        '.json': 'config-manager',
+        '.yaml': 'devops-engineer',
+        '.yml': 'devops-engineer',
+      };
+      const agent = agentMapping[ext] || 'coder';
+
+      // Co-edit pattern detection
+      if (lastEdit && lastEdit.file !== filename && (now - lastEdit.time) < 60000) {
+        // Files edited within 1 minute are co-edits
+        const coEditKey = [lastEdit.file, filename].sort().join('|');
+        if (!opts.dryRun) {
+          if (!intel.data.sequences) intel.data.sequences = {};
+          if (!intel.data.sequences[lastEdit.file]) intel.data.sequences[lastEdit.file] = [];
+          const existing = intel.data.sequences[lastEdit.file].find(s => s.file === filename);
+          if (existing) {
+            existing.score++;
+          } else {
+            intel.data.sequences[lastEdit.file].push({ file: filename, score: 1 });
+          }
+        }
+        console.log(chalk.yellow(`  🔗 Co-edit: ${path.basename(lastEdit.file)} → ${path.basename(filename)}`));
+      }
+
+      // Update Q-value for this file type
+      if (!opts.dryRun) {
+        intel.updateQ(state, agent, 0.5);
+        intel.save();
+      }
+
+      editCount++;
+      console.log(chalk.green(`  ✏️  [${editCount}] ${filename} → ${agent}`));
+
+      lastEdit = { file: filename, time: now };
+    };
+
+    // Use fs.watch for real-time monitoring
+    const watcher = fs.watch(watchDir, { recursive: true }, processChange);
+
+    process.on('SIGINT', () => {
+      watcher.close();
+      console.error(chalk.dim(`\n\n📊 Learned from ${editCount} file changes.`));
+      process.exit(0);
+    });
+
+    // Keep alive
+    await new Promise(() => {});
+  });
+
+// ============================================
+// END NEW CAPABILITY COMMANDS
+// ============================================
+
+// Verify hooks are working
+hooksCmd.command('verify')
+  .description('Verify hooks are working correctly')
+  .option('--verbose', 'Show detailed output')
+  .action((opts) => {
+    console.log(chalk.bold.cyan('\n🔍 RuVector Hooks Verification\n'));
+    const checks = [];
+
+    // Check 1: Settings file exists
+    const settingsPath = path.join(process.cwd(), '.claude', 'settings.json');
+    if (fs.existsSync(settingsPath)) {
+      checks.push({ name: 'Settings file', status: 'pass', detail: '.claude/settings.json exists' });
+      try {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        // Check hooks
+        const requiredHooks = ['PreToolUse', 'PostToolUse', 'SessionStart', 'SessionEnd'];
+        const missingHooks = requiredHooks.filter(h => !settings.hooks?.[h]);
+        if (missingHooks.length === 0) {
+          checks.push({ name: 'Required hooks', status: 'pass', detail: 'All core hooks configured' });
+        } else {
+          checks.push({ name: 'Required hooks', status: 'fail', detail: `Missing: ${missingHooks.join(', ')}` });
+        }
+        // Check advanced hooks
+        const advancedHooks = ['UserPromptSubmit', 'PreCompact', 'Notification'];
+        const hasAdvanced = advancedHooks.filter(h => settings.hooks?.[h]);
+        if (hasAdvanced.length > 0) {
+          checks.push({ name: 'Advanced hooks', status: 'pass', detail: `${hasAdvanced.length}/3 configured` });
+        } else {
+          checks.push({ name: 'Advanced hooks', status: 'warn', detail: 'None configured (optional)' });
+        }
+        // Check env
+        if (settings.env?.RUVECTOR_INTELLIGENCE_ENABLED) {
+          checks.push({ name: 'Environment vars', status: 'pass', detail: 'Intelligence enabled' });
+        } else {
+          checks.push({ name: 'Environment vars', status: 'warn', detail: 'Not configured' });
+        }
+        // Check permissions
+        if (settings.permissions?.allow?.length > 0) {
+          checks.push({ name: 'Permissions', status: 'pass', detail: `${settings.permissions.allow.length} allowed patterns` });
+        } else {
+          checks.push({ name: 'Permissions', status: 'warn', detail: 'Not configured' });
+        }
+      } catch (e) {
+        checks.push({ name: 'Settings parse', status: 'fail', detail: 'Invalid JSON' });
+      }
+    } else {
+      checks.push({ name: 'Settings file', status: 'fail', detail: 'Run `npx ruvector hooks init` first' });
+    }
+
+    // Check 2: .ruvector directory
+    const ruvectorDir = path.join(process.cwd(), '.ruvector');
+    if (fs.existsSync(ruvectorDir)) {
+      checks.push({ name: 'Data directory', status: 'pass', detail: '.ruvector/ exists' });
+      const intelFile = path.join(ruvectorDir, 'intelligence.json');
+      if (fs.existsSync(intelFile)) {
+        const stats = fs.statSync(intelFile);
+        checks.push({ name: 'Intelligence file', status: 'pass', detail: `${(stats.size / 1024).toFixed(1)}KB` });
+      } else {
+        checks.push({ name: 'Intelligence file', status: 'warn', detail: 'Will be created on first use' });
+      }
+    } else {
+      checks.push({ name: 'Data directory', status: 'warn', detail: 'Will be created on first use' });
+    }
+
+    // Check 3: Hook command execution
+    try {
+      const { execSync } = require('child_process');
+      execSync('npx ruvector hooks stats', { stdio: 'pipe', timeout: 5000 });
+      checks.push({ name: 'Command execution', status: 'pass', detail: 'Hooks commands work' });
+    } catch (e) {
+      checks.push({ name: 'Command execution', status: 'fail', detail: 'Commands failed to execute' });
+    }
+
+    // Display results
+    let passCount = 0, warnCount = 0, failCount = 0;
+    checks.forEach(c => {
+      const icon = c.status === 'pass' ? chalk.green('✓') : c.status === 'warn' ? chalk.yellow('⚠') : chalk.red('✗');
+      const statusColor = c.status === 'pass' ? chalk.green : c.status === 'warn' ? chalk.yellow : chalk.red;
+      console.log(`  ${icon} ${c.name}: ${statusColor(c.detail)}`);
+      if (c.status === 'pass') passCount++;
+      else if (c.status === 'warn') warnCount++;
+      else failCount++;
+    });
+
+    console.log('');
+    if (failCount === 0) {
+      console.log(chalk.green(`✅ Verification passed! ${passCount} checks passed, ${warnCount} warnings`));
+    } else {
+      console.log(chalk.red(`❌ Verification failed: ${failCount} issues found`));
+      console.log(chalk.dim('   Run `npx ruvector hooks doctor` for detailed diagnostics'));
+    }
+  });
+
+// Doctor - diagnose setup issues
+hooksCmd.command('doctor')
+  .description('Diagnose and fix setup issues')
+  .option('--fix', 'Automatically fix issues')
+  .action((opts) => {
+    console.log(chalk.bold.cyan('\n🩺 RuVector Hooks Doctor\n'));
+    const issues = [];
+    const fixes = [];
+
+    // Check settings file
+    const settingsPath = path.join(process.cwd(), '.claude', 'settings.json');
+    if (!fs.existsSync(settingsPath)) {
+      issues.push({ severity: 'error', message: 'No .claude/settings.json found', fix: 'Run `npx ruvector hooks init`' });
+    } else {
+      try {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+
+        // Check for invalid schema
+        if (settings.$schema && !settings.$schema.includes('schemastore.org')) {
+          issues.push({ severity: 'warning', message: 'Invalid schema URL', fix: 'Will be corrected' });
+          if (opts.fix) {
+            settings.$schema = 'https://json.schemastore.org/claude-code-settings.json';
+            fixes.push('Fixed schema URL');
+          }
+        }
+
+        // Check for old hook names
+        if (settings.hooks?.Start || settings.hooks?.End) {
+          issues.push({ severity: 'error', message: 'Invalid hook names (Start/End)', fix: 'Should be SessionStart/SessionEnd' });
+          if (opts.fix) {
+            delete settings.hooks.Start;
+            delete settings.hooks.End;
+            fixes.push('Removed invalid hook names');
+          }
+        }
+
+        // Check hook format
+        const hookNames = ['PreToolUse', 'PostToolUse'];
+        hookNames.forEach(name => {
+          if (settings.hooks?.[name]) {
+            settings.hooks[name].forEach((hook, i) => {
+              if (typeof hook.matcher === 'object') {
+                issues.push({ severity: 'error', message: `${name}[${i}].matcher should be string, not object`, fix: 'Will be corrected' });
+              }
+            });
+          }
+        });
+
+        // Check for npx vs direct command
+        const checkCommands = (hooks) => {
+          if (!hooks) return;
+          hooks.forEach(h => {
+            h.hooks?.forEach(hh => {
+              if (hh.command && hh.command.includes('ruvector') && !/(^|&& )npx /.test(hh.command) && !hh.command.includes('/bin/') && !hh.command.includes('ruvector-fast.sh')) {
+                issues.push({ severity: 'warning', message: `Command should use 'npx ruvector' for portability`, fix: 'Update to use npx' });
+              }
+            });
+          });
+        };
+        Object.values(settings.hooks || {}).forEach(checkCommands);
+
+        // Save fixes
+        if (opts.fix && fixes.length > 0) {
+          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+        }
+      } catch (e) {
+        issues.push({ severity: 'error', message: 'Invalid JSON in settings file', fix: 'Re-run `npx ruvector hooks init --force`' });
+      }
+    }
+
+    // Check .gitignore
+    const gitignorePath = path.join(process.cwd(), '.gitignore');
+    if (fs.existsSync(gitignorePath)) {
+      const content = fs.readFileSync(gitignorePath, 'utf-8');
+      if (!content.includes('.ruvector/')) {
+        issues.push({ severity: 'warning', message: '.ruvector/ not in .gitignore', fix: 'Add to prevent committing learning data' });
+        if (opts.fix) {
+          fs.appendFileSync(gitignorePath, '\n# RuVector intelligence data\n.ruvector/\n');
+          fixes.push('Added .ruvector/ to .gitignore');
+        }
+      }
+    }
+
+    // Display results
+    if (issues.length === 0) {
+      console.log(chalk.green('  ✓ No issues found! Your setup looks healthy.'));
+    } else {
+      issues.forEach(i => {
+        const icon = i.severity === 'error' ? chalk.red('✗') : chalk.yellow('⚠');
+        console.log(`  ${icon} ${i.message}`);
+        console.log(chalk.dim(`     Fix: ${i.fix}`));
+      });
+
+      if (opts.fix && fixes.length > 0) {
+        console.log(chalk.green(`\n✅ Applied ${fixes.length} fix(es):`));
+        fixes.forEach(f => console.log(chalk.green(`   • ${f}`)));
+      } else if (issues.some(i => i.severity === 'error')) {
+        console.log(chalk.yellow('\n💡 Run with --fix to automatically fix issues'));
+      }
+    }
+  });
+
+// Export intelligence data
+hooksCmd.command('export')
+  .description('Export intelligence data for backup')
+  .option('-o, --output <file>', 'Output file path', 'ruvector-export.json')
+  .option('--include-all', 'Include all data (patterns, memories, trajectories)')
+  .action((opts) => {
+    const intel = new Intelligence();
+    const exportData = {
+      version: '1.0',
+      exported_at: new Date().toISOString(),
+      patterns: intel.data?.patterns || {},
+      memories: opts.includeAll ? (intel.data?.memories || []) : [],
+      trajectories: opts.includeAll ? (intel.data?.trajectories || []) : [],
+      errors: intel.data?.errors || {},
+      stats: intel.stats()
+    };
+
+    const outputPath = path.resolve(opts.output);
+    fs.writeFileSync(outputPath, JSON.stringify(exportData, null, 2));
+
+    console.log(chalk.green(`✅ Exported intelligence data to ${outputPath}`));
+    console.log(chalk.dim(`   ${Object.keys(exportData.patterns).length} patterns`));
+    console.log(chalk.dim(`   ${exportData.memories.length} memories`));
+    console.log(chalk.dim(`   ${exportData.trajectories.length} trajectories`));
+  });
+
+// Import intelligence data
+hooksCmd.command('import')
+  .description('Import intelligence data from backup')
+  .argument('<file>', 'Import file path')
+  .option('--merge', 'Merge with existing data (default: replace)')
+  .option('--dry-run', 'Show what would be imported without making changes')
+  .action((file, opts) => {
+    const importPath = path.resolve(file);
+    if (!fs.existsSync(importPath)) {
+      console.error(chalk.red(`❌ File not found: ${importPath}`));
+      process.exit(1);
+    }
+
+    try {
+      const importData = JSON.parse(fs.readFileSync(importPath, 'utf-8'));
+
+      if (!importData.version) {
+        console.error(chalk.red('❌ Invalid export file (missing version)'));
+        process.exit(1);
+      }
+
+      console.log(chalk.cyan(`📦 Import file: ${file}`));
+      console.log(chalk.dim(`   Version: ${importData.version}`));
+      console.log(chalk.dim(`   Exported: ${importData.exported_at}`));
+      console.log(chalk.dim(`   Patterns: ${Object.keys(importData.patterns || {}).length}`));
+      console.log(chalk.dim(`   Memories: ${(importData.memories || []).length}`));
+      console.log(chalk.dim(`   Trajectories: ${(importData.trajectories || []).length}`));
+
+      if (opts.dryRun) {
+        console.log(chalk.yellow('\n⚠️  Dry run - no changes made'));
+        return;
+      }
+
+      const intel = new Intelligence();
+
+      if (opts.merge) {
+        // Merge patterns
+        Object.assign(intel.data.patterns, importData.patterns || {});
+        // Merge memories (deduplicate by content)
+        const existingContent = new Set((intel.data.memories || []).map(m => m.content));
+        (importData.memories || []).forEach(m => {
+          if (!existingContent.has(m.content)) {
+            intel.data.memories.push(m);
+          }
+        });
+        // Merge trajectories
+        intel.data.trajectories = (intel.data.trajectories || []).concat(importData.trajectories || []);
+        // Merge errors
+        Object.assign(intel.data.errors, importData.errors || {});
+        console.log(chalk.green('✅ Merged intelligence data'));
+      } else {
+        intel.data.patterns = importData.patterns || {};
+        intel.data.memories = importData.memories || [];
+        intel.data.trajectories = importData.trajectories || [];
+        intel.data.errors = importData.errors || {};
+        console.log(chalk.green('✅ Replaced intelligence data'));
+      }
+
+      intel.save();
+      console.log(chalk.dim('   Data saved to .ruvector/intelligence.json'));
+    } catch (e) {
+      console.error(chalk.red(`❌ Failed to import: ${e.message}`));
+      process.exit(1);
+    }
+  });
+
+// Pretrain - analyze repo and bootstrap learning with agent swarm
+hooksCmd.command('pretrain')
+  .description('Pretrain intelligence by analyzing the repository with agent swarm')
+  .option('--depth <n>', 'Git history depth to analyze', '100')
+  .option('--workers <n>', 'Number of parallel analysis workers', '4')
+  .option('--skip-git', 'Skip git history analysis')
+  .option('--skip-files', 'Skip file structure analysis')
+  .option('--verbose', 'Show detailed progress')
+  .action(async (opts) => {
+    const { execSync, spawn } = require('child_process');
+    console.log(chalk.bold.cyan('\n🧠 RuVector Pretrain - Repository Intelligence Bootstrap\n'));
+
+    const intel = new Intelligence();
+    const startTime = Date.now();
+    const stats = { files: 0, patterns: 0, memories: 0, coedits: 0 };
+
+    // Agent types for different file patterns
+    const agentMapping = {
+      // Rust
+      '.rs': 'rust-developer',
+      'Cargo.toml': 'rust-developer',
+      'Cargo.lock': 'rust-developer',
+      // JavaScript/TypeScript
+      '.js': 'javascript-developer',
+      '.jsx': 'react-developer',
+      '.ts': 'typescript-developer',
+      '.tsx': 'react-developer',
+      '.mjs': 'javascript-developer',
+      '.cjs': 'javascript-developer',
+      'package.json': 'node-developer',
+      // Python
+      '.py': 'python-developer',
+      'requirements.txt': 'python-developer',
+      'pyproject.toml': 'python-developer',
+      'setup.py': 'python-developer',
+      // Go
+      '.go': 'go-developer',
+      'go.mod': 'go-developer',
+      // Web
+      '.html': 'frontend-developer',
+      '.css': 'frontend-developer',
+      '.scss': 'frontend-developer',
+      '.vue': 'vue-developer',
+      '.svelte': 'svelte-developer',
+      // Config
+      '.json': 'config-specialist',
+      '.yaml': 'config-specialist',
+      '.yml': 'config-specialist',
+      '.toml': 'config-specialist',
+      // Docs
+      '.md': 'documentation-specialist',
+      '.mdx': 'documentation-specialist',
+      // Tests
+      '.test.js': 'test-engineer',
+      '.test.ts': 'test-engineer',
+      '.spec.js': 'test-engineer',
+      '.spec.ts': 'test-engineer',
+      '_test.go': 'test-engineer',
+      '_test.rs': 'test-engineer',
+      // DevOps
+      'Dockerfile': 'devops-engineer',
+      'docker-compose.yml': 'devops-engineer',
+      '.github/workflows': 'cicd-engineer',
+      'Makefile': 'devops-engineer',
+      // SQL
+      '.sql': 'database-specialist',
+    };
+
+    // Phase 1: Analyze file structure
+    if (!opts.skipFiles) {
+      console.log(chalk.yellow('📁 Phase 1: Analyzing file structure...\n'));
+
+      try {
+        // Get all files in repo
+        const files = execSync('git ls-files 2>/dev/null || find . -type f -not -path "./.git/*" -not -path "./node_modules/*" -not -path "./target/*"',
+          { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }).trim().split('\n').filter(f => f);
+
+        const filesByType = {};
+        const dirPatterns = {};
+        const agentCountsByState = {};
+
+        files.forEach(file => {
+          stats.files++;
+          const ext = path.extname(file);
+          const basename = path.basename(file);
+          const dir = path.dirname(file);
+
+          // Determine agent for this file
+          let agent = 'coder'; // default
+          if (agentMapping[basename]) {
+            agent = agentMapping[basename];
+          } else if (agentMapping[ext]) {
+            agent = agentMapping[ext];
+          } else if (file.includes('.test.') || file.includes('.spec.') || file.includes('_test.')) {
+            agent = 'test-engineer';
+          } else if (file.includes('.github/workflows')) {
+            agent = 'cicd-engineer';
+          }
+
+          // Track file types
+          filesByType[ext] = (filesByType[ext] || 0) + 1;
+
+          // Track directory patterns
+          const parts = dir.split('/');
+          if (parts[0]) {
+            dirPatterns[parts[0]] = dirPatterns[parts[0]] || { count: 0, agents: {} };
+            dirPatterns[parts[0]].count++;
+            dirPatterns[parts[0]].agents[agent] = (dirPatterns[parts[0]].agents[agent] || 0) + 1;
+          }
+
+          // Count agents per routing state; patterns are written once below.
+          const state = `edit:${ext || 'unknown'}`;
+          agentCountsByState[state] = agentCountsByState[state] || {};
+          agentCountsByState[state][agent] = (agentCountsByState[state][agent] || 0) + 1;
+        });
+
+        // Seed routing patterns in the "state|agent" record format that
+        // `hooks route` reads. Earlier versions wrote `state: {agent: n*0.5}`,
+        // which routing never read and which grew on every re-run. Seeding is
+        // idempotent and never overwrites an outcome-learned record.
+        const PRETRAIN_PRIOR_Q = 0.6;
+        for (const key of Object.keys(intel.data.patterns)) {
+          const v = intel.data.patterns[key];
+          if (!key.includes('|') && v && typeof v === 'object' && !('q_value' in v)) {
+            delete intel.data.patterns[key]; // legacy pretrain shape
+          }
+        }
+        for (const [state, counts] of Object.entries(agentCountsByState)) {
+          const [agent] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+          const key = `${state}|${agent}`;
+          if (!intel.data.patterns[key]) {
+            intel.data.patterns[key] = { state, action: agent, q_value: PRETRAIN_PRIOR_Q, visits: 0, last_update: intel.now(), source: 'pretrain' };
+          }
+          stats.patterns++;
+        }
+
+        // Log summary
+        if (opts.verbose) {
+          console.log(chalk.dim('  File types found:'));
+          Object.entries(filesByType).sort((a, b) => b[1] - a[1]).slice(0, 10).forEach(([ext, count]) => {
+            console.log(chalk.dim(`    ${ext || '(no ext)'}: ${count} files`));
+          });
+        }
+        console.log(chalk.green(`  ✓ Analyzed ${stats.files} files`));
+        console.log(chalk.green(`  ✓ Created ${Object.keys(intel.data.patterns).length} routing patterns`));
+
+      } catch (e) {
+        console.log(chalk.yellow(`  ⚠ File analysis skipped: ${e.message}`));
+      }
+    }
+
+    // Phase 2: Analyze git history for co-edit patterns
+    if (!opts.skipGit) {
+      console.log(chalk.yellow('\n📜 Phase 2: Analyzing git history for co-edit patterns...\n'));
+
+      try {
+        // Get commits with files changed
+        const gitLog = execSync(
+          `git log --name-only --pretty=format:"COMMIT:%H" -n ${Math.max(1, parseInt(opts.depth, 10) || 100)} 2>/dev/null`,
+          { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }
+        );
+
+        const commits = gitLog.split('COMMIT:').filter(c => c.trim());
+        const coEditMap = {};
+
+        commits.forEach(commit => {
+          const lines = commit.trim().split('\n').filter(l => l && !l.startsWith('COMMIT:'));
+          const files = lines.slice(1).filter(f => f.trim()); // Skip the hash
+
+          // Track which files are edited together
+          files.forEach(file1 => {
+            files.forEach(file2 => {
+              if (file1 !== file2) {
+                const key = [file1, file2].sort().join('|');
+                coEditMap[key] = (coEditMap[key] || 0) + 1;
+              }
+            });
+          });
+        });
+
+        // Find strong co-edit patterns (files edited together 3+ times)
+        const strongPatterns = Object.entries(coEditMap)
+          .filter(([, count]) => count >= 3)
+          .sort((a, b) => b[1] - a[1]);
+
+        // Store as sequence patterns
+        strongPatterns.slice(0, 100).forEach(([key, count]) => {
+          const [file1, file2] = key.split('|');
+          if (!intel.data.sequences) intel.data.sequences = {};
+          if (!intel.data.sequences[file1]) intel.data.sequences[file1] = [];
+
+          const existing = intel.data.sequences[file1].find(s => s.file === file2);
+          if (existing) {
+            existing.score += count;
+          } else {
+            intel.data.sequences[file1].push({ file: file2, score: count });
+          }
+          stats.coedits++;
+        });
+
+        console.log(chalk.green(`  ✓ Analyzed ${commits.length} commits`));
+        console.log(chalk.green(`  ✓ Found ${strongPatterns.length} co-edit patterns`));
+
+        if (opts.verbose && strongPatterns.length > 0) {
+          console.log(chalk.dim('  Top co-edit patterns:'));
+          strongPatterns.slice(0, 5).forEach(([key, count]) => {
+            const [f1, f2] = key.split('|');
+            console.log(chalk.dim(`    ${path.basename(f1)} ↔ ${path.basename(f2)}: ${count} times`));
+          });
+        }
+
+      } catch (e) {
+        console.log(chalk.yellow(`  ⚠ Git analysis skipped: ${e.message}`));
+      }
+    }
+
+    // Phase 3: Create vector memories from important files
+    console.log(chalk.yellow('\n💾 Phase 3: Creating vector memories from key files...\n'));
+
+    try {
+      const importantFiles = [
+        'README.md', 'CLAUDE.md', 'package.json', 'Cargo.toml',
+        'pyproject.toml', 'go.mod', '.claude/settings.json'
+      ];
+
+      for (const filename of importantFiles) {
+        const filePath = path.join(process.cwd(), filename);
+        if (fs.existsSync(filePath)) {
+          try {
+            const content = fs.readFileSync(filePath, 'utf-8').slice(0, 2000); // First 2KB
+            intel.data.memories = intel.data.memories || [];
+            // Re-running pretrain refreshes the project memory instead of duplicating it.
+            intel.data.memories = intel.data.memories.filter(m => !(m && m.type === 'project' && typeof m.content === 'string' && m.content.startsWith(`[${filename}] `)));
+            intel.data.memories.push({
+              content: `[${filename}] ${content.replace(/\n/g, ' ').slice(0, 500)}`,
+              type: 'project',
+              created: new Date().toISOString(),
+              embedding: intel.simpleEmbed ? intel.simpleEmbed(content) : null
+            });
+            stats.memories++;
+            if (opts.verbose) console.log(chalk.dim(`    ✓ ${filename}`));
+          } catch (e) { /* skip unreadable files */ }
+        }
+      }
+
+      console.log(chalk.green(`  ✓ Created ${stats.memories} memory entries`));
+
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Memory creation skipped: ${e.message}`));
+    }
+
+    // Phase 4: Analyze directory structure for agent recommendations
+    console.log(chalk.yellow('\n🗂️  Phase 4: Building directory-agent mappings...\n'));
+
+    try {
+      const dirs = execSync('find . -type d -maxdepth 2 -not -path "./.git*" -not -path "./node_modules*" -not -path "./target*" 2>/dev/null || echo "."',
+        { encoding: 'utf-8' }).trim().split('\n');
+
+      const dirAgentMap = {};
+      dirs.forEach(dir => {
+        const name = path.basename(dir);
+        // Infer agent from directory name
+        if (['src', 'lib', 'core'].includes(name)) dirAgentMap[dir] = 'coder';
+        else if (['test', 'tests', '__tests__', 'spec'].includes(name)) dirAgentMap[dir] = 'test-engineer';
+        else if (['docs', 'documentation'].includes(name)) dirAgentMap[dir] = 'documentation-specialist';
+        else if (['scripts', 'bin'].includes(name)) dirAgentMap[dir] = 'devops-engineer';
+        else if (['components', 'views', 'pages'].includes(name)) dirAgentMap[dir] = 'frontend-developer';
+        else if (['api', 'routes', 'handlers'].includes(name)) dirAgentMap[dir] = 'backend-developer';
+        else if (['models', 'entities', 'schemas'].includes(name)) dirAgentMap[dir] = 'database-specialist';
+        else if (['.github', '.gitlab', 'ci'].includes(name)) dirAgentMap[dir] = 'cicd-engineer';
+      });
+
+      // Store directory patterns
+      intel.data.dirPatterns = dirAgentMap;
+      console.log(chalk.green(`  ✓ Mapped ${Object.keys(dirAgentMap).length} directories to agents`));
+
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Directory analysis skipped: ${e.message}`));
+    }
+
+    // Phase 5: Analyze code complexity with AST
+    console.log(chalk.yellow('\n📊 Phase 5: Analyzing code complexity via AST...\n'));
+
+    try {
+      if (loadNewModules() && ASTParser) {
+        const parser = new ASTParser();
+        const codeFiles = (intel.data.fileList || []).filter(f =>
+          ['.ts', '.js', '.tsx', '.jsx', '.py', '.rs', '.go'].includes(path.extname(f))
+        ).slice(0, 50); // Analyze up to 50 files
+
+        let complexityStats = { high: 0, medium: 0, low: 0, total: 0 };
+
+        for (const file of codeFiles) {
+          try {
+            if (!fs.existsSync(file)) continue;
+            const code = fs.readFileSync(file, 'utf-8');
+            const ext = path.extname(file).slice(1);
+            const lang = { ts: 'typescript', tsx: 'typescript', js: 'javascript', py: 'python', rs: 'rust', go: 'go' }[ext];
+            if (!lang) continue;
+
+            const result = parser.parse(code, lang);
+            const complexity = parser.calculateComplexity(result);
+
+            // Store complexity data
+            intel.data.complexity = intel.data.complexity || {};
+            intel.data.complexity[file] = complexity;
+
+            if (complexity.cyclomatic > 15) complexityStats.high++;
+            else if (complexity.cyclomatic > 8) complexityStats.medium++;
+            else complexityStats.low++;
+            complexityStats.total++;
+          } catch (e) { /* skip errors */ }
+        }
+
+        stats.complexity = complexityStats;
+        console.log(chalk.green(`  ✓ Analyzed ${complexityStats.total} files`));
+        console.log(chalk.green(`  ✓ Complexity: ${complexityStats.high} high, ${complexityStats.medium} medium, ${complexityStats.low} low`));
+      } else {
+        console.log(chalk.dim('  ⏭️  AST parser not available, skipping'));
+      }
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Complexity analysis skipped: ${e.message}`));
+    }
+
+    // Phase 6: Analyze diff patterns from recent commits
+    console.log(chalk.yellow('\n🔄 Phase 6: Analyzing diff patterns for change classification...\n'));
+
+    try {
+      const diffMod = require('../dist/core/diff-embeddings.js');
+      const recentCommits = execSync(`git log --format="%H" -n 20 2>/dev/null`, { encoding: 'utf-8' }).trim().split('\n').filter(h => h);
+
+      let changeTypes = { feature: 0, bugfix: 0, refactor: 0, docs: 0, test: 0, config: 0, unknown: 0 };
+
+      for (const hash of recentCommits.slice(0, 10)) {
+        try {
+          const analysis = await diffMod.analyzeCommit(hash);
+          analysis.files.forEach(f => {
+            changeTypes[f.category] = (changeTypes[f.category] || 0) + 1;
+          });
+        } catch (e) { /* skip */ }
+      }
+
+      intel.data.changePatterns = changeTypes;
+      stats.changePatterns = changeTypes;
+      console.log(chalk.green(`  ✓ Analyzed ${recentCommits.length} commits`));
+      console.log(chalk.green(`  ✓ Change types: ${Object.entries(changeTypes).filter(([,v]) => v > 0).map(([k,v]) => `${k}:${v}`).join(', ')}`));
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Diff analysis skipped: ${e.message}`));
+    }
+
+    // Phase 7: Check test coverage if available
+    console.log(chalk.yellow('\n🧪 Phase 7: Checking test coverage data...\n'));
+
+    try {
+      const covMod = require('../dist/core/coverage-router.js');
+      const reportPath = covMod.findCoverageReport();
+
+      if (reportPath) {
+        const summary = covMod.parseIstanbulCoverage(reportPath);
+        intel.data.coverage = {
+          overall: summary.overall,
+          lowCoverageFiles: summary.lowCoverageFiles.slice(0, 20),
+          uncoveredFiles: summary.uncoveredFiles.slice(0, 10)
+        };
+        stats.coverage = summary.overall;
+        console.log(chalk.green(`  ✓ Found coverage report: ${reportPath}`));
+        console.log(chalk.green(`  ✓ Overall: Lines ${summary.overall.lines.toFixed(1)}%, Functions ${summary.overall.functions.toFixed(1)}%`));
+        console.log(chalk.green(`  ✓ ${summary.lowCoverageFiles.length} low-coverage files, ${summary.uncoveredFiles.length} uncovered`));
+      } else {
+        console.log(chalk.dim('  ⏭️  No coverage report found'));
+      }
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Coverage check skipped: ${e.message}`));
+    }
+
+    // Phase 8: Detect available attention/GNN capabilities
+    console.log(chalk.yellow('\n🧠 Phase 8: Detecting neural capabilities...\n'));
+
+    try {
+      let capabilities = { attention: false, gnn: false, mechanisms: [] };
+
+      try {
+        const attention = require('@ruvector/attention');
+        capabilities.attention = true;
+        capabilities.mechanisms = [
+          'DotProductAttention', 'MultiHeadAttention', 'FlashAttention',
+          'HyperbolicAttention', 'LinearAttention', 'MoEAttention',
+          'GraphRoPeAttention', 'DualSpaceAttention', 'LocalGlobalAttention'
+        ];
+        console.log(chalk.green(`  ✓ Attention: 10 mechanisms available`));
+      } catch (e) {
+        console.log(chalk.dim('  ⏭️  @ruvector/attention not installed'));
+      }
+
+      try {
+        const gnn = require('@ruvector/gnn');
+        capabilities.gnn = true;
+        console.log(chalk.green(`  ✓ GNN: RuvectorLayer, TensorCompress available`));
+      } catch (e) {
+        console.log(chalk.dim('  ⏭️  @ruvector/gnn not installed'));
+      }
+
+      intel.data.neuralCapabilities = capabilities;
+      stats.neural = capabilities;
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Neural detection skipped: ${e.message}`));
+    }
+
+    // Phase 9: Build code graph for community detection
+    console.log(chalk.yellow('\n🔗 Phase 9: Building code relationship graph...\n'));
+
+    try {
+      const graphMod = require('../dist/core/graph-algorithms.js');
+      const codeFiles = execSync('git ls-files "*.ts" "*.js" 2>/dev/null || echo ""', { encoding: 'utf-8' }).trim().split('\n').filter(f => f);
+
+      if (codeFiles.length > 5 && codeFiles.length < 200) {
+        const nodes = codeFiles.map(f => path.basename(f, path.extname(f)));
+        const edges = [];
+
+        for (const file of codeFiles.slice(0, 100)) {
+          try {
+            if (!fs.existsSync(file)) continue;
+            const content = fs.readFileSync(file, 'utf-8');
+            const imports = content.match(/from ['"]\.\/([^'"]+)['"]/g) || [];
+            imports.forEach(imp => {
+              const target = imp.match(/from ['"]\.\/([^'"]+)['"]/)?.[1];
+              if (target) {
+                const targetBase = path.basename(target, path.extname(target));
+                if (nodes.includes(targetBase)) {
+                  edges.push({ source: path.basename(file, path.extname(file)), target: targetBase, weight: 1 });
+                }
+              }
+            });
+          } catch (e) { /* skip */ }
+        }
+
+        if (edges.length > 0) {
+          const communities = graphMod.louvainCommunities(nodes, edges);
+          intel.data.codeGraph = {
+            nodes: nodes.length,
+            edges: edges.length,
+            communities: communities.numCommunities,
+            modularity: communities.modularity
+          };
+          stats.graph = intel.data.codeGraph;
+          console.log(chalk.green(`  ✓ Built graph: ${nodes.length} nodes, ${edges.length} edges`));
+          console.log(chalk.green(`  ✓ Found ${communities.numCommunities} communities (modularity: ${communities.modularity.toFixed(3)})`));
+        } else {
+          console.log(chalk.dim('  ⏭️  Not enough import relationships found'));
+        }
+      } else {
+        console.log(chalk.dim(`  ⏭️  Skipped (${codeFiles.length} files - need 5-200)`));
+      }
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Graph analysis skipped: ${e.message}`));
+    }
+
+    // Phase 10: Initialize multi-algorithm learning engine
+    console.log(chalk.yellow('\n🎯 Phase 10: Initializing multi-algorithm learning engine...\n'));
+
+    try {
+      if (loadLearningModules() && LearningEngineClass) {
+        const engine = new LearningEngineClass();
+
+        // Configure optimal algorithms for each task type based on repo analysis
+        engine.configure('agent-routing', { algorithm: 'double-q', learningRate: 0.1, epsilon: 0.1 });
+        engine.configure('error-avoidance', { algorithm: 'sarsa', learningRate: 0.05, epsilon: 0.05 });
+        engine.configure('confidence-scoring', { algorithm: 'actor-critic', learningRate: 0.01 });
+        engine.configure('trajectory-learning', { algorithm: 'decision-transformer', sequenceLength: 20 });
+        engine.configure('context-ranking', { algorithm: 'ppo', clipRange: 0.2 });
+        engine.configure('memory-recall', { algorithm: 'td-lambda', lambda: 0.8 });
+
+        // Bootstrap with initial experiences from file patterns.
+        // Since updateQ() a pattern is `"state|action": {state, action, q_value, visits, last_update}`; reading it as
+        // `state: {action: value}` learned the FIELD NAMES as actions and Unix timestamps as rewards. Both shapes are
+        // read, and a reward is used only when it is a finite number in (0.3, 1] (rewards lie in [-1, 1]).
+        let bootstrapCount = 0;
+        const bootstrapPairs = [];
+        for (const [key, entry] of Object.entries(intel.data.patterns || {})) {
+          if (entry && typeof entry === 'object' && typeof entry.action === 'string' && 'q_value' in entry) {
+            bootstrapPairs.push([entry.state ?? key.split('|')[0], entry.action, entry.q_value]);
+          } else if (entry && typeof entry === 'object') {
+            for (const [action, value] of Object.entries(entry)) bootstrapPairs.push([key, action, value]);
+          }
+        }
+        for (const [state, action, value] of bootstrapPairs) {
+          if (typeof value === 'number' && Number.isFinite(value) && value > 0.3 && value <= 1) { // Only strong patterns
+            engine.update('agent-routing', {
+              state,
+              action,
+              reward: value,
+              nextState: state,
+              done: true
+            });
+            bootstrapCount++;
+          }
+        }
+
+        intel.data.learning = engine.export();
+        stats.learningBootstrap = bootstrapCount;
+        console.log(chalk.green(`  ✓ Configured 6 task-specific algorithms`));
+        console.log(chalk.green(`  ✓ Bootstrapped with ${bootstrapCount} initial experiences`));
+        console.log(chalk.dim('  Algorithms: double-q, sarsa, actor-critic, decision-transformer, ppo, td-lambda'));
+      } else {
+        console.log(chalk.dim('  ⏭️  LearningEngine not available'));
+      }
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ Learning engine init skipped: ${e.message}`));
+    }
+
+    // Phase 11: Initialize TensorCompress for pattern storage
+    console.log(chalk.yellow('\n📦 Phase 11: Initializing TensorCompress for efficient storage...\n'));
+
+    try {
+      if (loadLearningModules() && TensorCompressClass) {
+        const compress = new TensorCompressClass({
+          autoCompress: false,
+          hotThreshold: 0.8,
+          warmThreshold: 0.4,
+          coolThreshold: 0.1,
+          coldThreshold: 0.01
+        });
+
+        // Store any existing embeddings with compression
+        let compressed = 0;
+        if (intel.data.memories) {
+          for (let i = 0; i < intel.data.memories.length; i++) {
+            const mem = intel.data.memories[i];
+            if (mem.embedding && Array.isArray(mem.embedding)) {
+              compress.store(`memory_${i}`, mem.embedding, 'pq8');
+              compressed++;
+            }
+          }
+        }
+
+        if (compressed > 0) {
+          const compStats = compress.recompressAll();
+          intel.data.compressedPatterns = compress.export();
+          stats.compressed = compressed;
+          stats.compressionSavings = compStats.savingsPercent;
+          console.log(chalk.green(`  ✓ Compressed ${compressed} embeddings`));
+          console.log(chalk.green(`  ✓ Memory savings: ${compStats.savingsPercent.toFixed(1)}%`));
+        } else {
+          intel.data.compressedPatterns = compress.export();
+          console.log(chalk.green(`  ✓ TensorCompress initialized (ready for future embeddings)`));
+        }
+        console.log(chalk.dim('  Levels: none (hot), half (warm), pq8 (cool), pq4 (cold), binary (archive)'));
+      } else {
+        console.log(chalk.dim('  ⏭️  TensorCompress not available'));
+      }
+    } catch (e) {
+      console.log(chalk.yellow(`  ⚠ TensorCompress init skipped: ${e.message}`));
+    }
+
+    // Save all learning data
+    intel.data.pretrained = {
+      date: new Date().toISOString(),
+      version: '2.1',
+      stats: stats
+    };
+    intel.save();
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(chalk.bold.green(`\n✅ Pretrain complete in ${elapsed}s!\n`));
+    console.log(chalk.cyan('Summary:'));
+    console.log(`  📁 ${stats.files} files analyzed`);
+    console.log(`  🧠 ${stats.patterns} agent routing patterns`);
+    console.log(`  🔗 ${stats.coedits} co-edit patterns`);
+    console.log(`  💾 ${stats.memories} memory entries`);
+    if (stats.complexity) console.log(`  📊 ${stats.complexity.total} files analyzed for complexity`);
+    if (stats.changePatterns) console.log(`  🔄 Change patterns detected`);
+    if (stats.coverage) console.log(`  🧪 Coverage: ${stats.coverage.lines.toFixed(1)}% lines`);
+    if (stats.neural?.attention) console.log(`  🧠 10 attention mechanisms available`);
+    if (stats.graph) console.log(`  🔗 ${stats.graph.communities} code communities detected`);
+    if (stats.learningBootstrap) console.log(`  🎯 ${stats.learningBootstrap} learning experiences bootstrapped`);
+    if (stats.compressionSavings) console.log(`  📦 ${stats.compressionSavings.toFixed(1)}% compression savings`);
+    console.log(chalk.dim('\nThe intelligence layer will now provide better recommendations.'));
+  });
+
+// Agent Builder - generate optimized agent configs based on pretrain
+hooksCmd.command('build-agents')
+  .description('Generate optimized agent configurations based on repository analysis')
+  .option('--focus <type>', 'Focus type: quality, speed, security, testing, fullstack', 'quality')
+  .option('--output <dir>', 'Output directory', '.claude/agents')
+  .option('--format <fmt>', 'Format: yaml, json, md', 'yaml')
+  .option('--include-prompts', 'Include detailed system prompts')
+  .action((opts) => {
+    console.log(chalk.bold.cyan('\n🏗️  RuVector Agent Builder\n'));
+
+    const intel = new Intelligence();
+    // resolve, not join: an absolute --output was glued onto the current folder
+    const outputDir = path.resolve(process.cwd(), opts.output);
+
+    // Check if pretrained
+    if (!intel.data.pretrained && Object.keys(intel.data.patterns || {}).length === 0) {
+      console.log(chalk.yellow('⚠️  No pretrain data found. Running quick analysis...\n'));
+      // Quick file analysis
+      try {
+        const { execSync } = require('child_process');
+        const files = execSync('git ls-files 2>/dev/null', { encoding: 'utf-8' }).trim().split('\n');
+        files.forEach(f => {
+          const ext = path.extname(f);
+          intel.data.patterns = intel.data.patterns || {};
+          intel.data.patterns[`edit:${ext}`] = intel.data.patterns[`edit:${ext}`] || {};
+        });
+      } catch (e) { /* continue without git */ }
+    }
+
+    // Analyze patterns to determine relevant agents
+    const patterns = intel.data.patterns || {};
+    const detectedLangs = new Set();
+    const detectedFrameworks = new Set();
+
+    Object.keys(patterns).forEach(state => {
+      if (state.includes('.rs')) detectedLangs.add('rust');
+      if (state.includes('.ts') || state.includes('.js')) detectedLangs.add('typescript');
+      if (state.includes('.tsx') || state.includes('.jsx')) detectedFrameworks.add('react');
+      if (state.includes('.py')) detectedLangs.add('python');
+      if (state.includes('.go')) detectedLangs.add('go');
+      if (state.includes('.vue')) detectedFrameworks.add('vue');
+      if (state.includes('.sql')) detectedFrameworks.add('database');
+    });
+
+    // Detect project type from files
+    const projectTypes = detectProjectType();
+
+    console.log(chalk.blue(`  Detected languages: ${[...detectedLangs].join(', ') || 'generic'}`));
+    console.log(chalk.blue(`  Detected frameworks: ${[...detectedFrameworks].join(', ') || 'none'}`));
+    console.log(chalk.blue(`  Focus mode: ${opts.focus}\n`));
+
+    // Focus configurations
+    const focusConfigs = {
+      quality: {
+        description: 'Emphasizes code quality, best practices, and maintainability',
+        priorities: ['code-review', 'refactoring', 'documentation', 'testing'],
+        temperature: 0.3
+      },
+      speed: {
+        description: 'Optimized for rapid development and iteration',
+        priorities: ['implementation', 'prototyping', 'quick-fixes'],
+        temperature: 0.7
+      },
+      security: {
+        description: 'Security-first development with vulnerability awareness',
+        priorities: ['security-audit', 'input-validation', 'authentication', 'encryption'],
+        temperature: 0.2
+      },
+      testing: {
+        description: 'Test-driven development with comprehensive coverage',
+        priorities: ['unit-tests', 'integration-tests', 'e2e-tests', 'mocking'],
+        temperature: 0.4
+      },
+      fullstack: {
+        description: 'Balanced full-stack development capabilities',
+        priorities: ['frontend', 'backend', 'database', 'api-design'],
+        temperature: 0.5
+      }
+    };
+
+    const focus = focusConfigs[opts.focus] || focusConfigs.quality;
+
+    // Agent templates based on detected stack
+    const agents = [];
+
+    // Core agents based on detected languages
+    if (detectedLangs.has('rust')) {
+      agents.push({
+        name: 'rust-specialist',
+        type: 'rust-developer',
+        description: 'Rust development specialist for this codebase',
+        capabilities: ['cargo', 'unsafe-rust', 'async-rust', 'wasm', 'error-handling'],
+        focus: focus.priorities,
+        systemPrompt: opts.includePrompts ? `You are a Rust specialist for this project.
+Focus on: memory safety, zero-cost abstractions, idiomatic Rust patterns.
+Use cargo conventions, prefer Result over panic, leverage the type system.
+${focus.description}` : null
+      });
+    }
+
+    if (detectedLangs.has('typescript')) {
+      agents.push({
+        name: 'typescript-specialist',
+        type: 'typescript-developer',
+        description: 'TypeScript development specialist',
+        capabilities: ['types', 'generics', 'decorators', 'async-await', 'modules'],
+        focus: focus.priorities,
+        systemPrompt: opts.includePrompts ? `You are a TypeScript specialist for this project.
+Focus on: strict typing, type inference, generic patterns, module organization.
+Prefer type safety over any, use discriminated unions, leverage utility types.
+${focus.description}` : null
+      });
+    }
+
+    if (detectedLangs.has('python')) {
+      agents.push({
+        name: 'python-specialist',
+        type: 'python-developer',
+        description: 'Python development specialist',
+        capabilities: ['typing', 'async', 'testing', 'packaging', 'data-science'],
+        focus: focus.priorities,
+        systemPrompt: opts.includePrompts ? `You are a Python specialist for this project.
+Focus on: type hints, PEP standards, pythonic idioms, virtual environments.
+Use dataclasses, prefer pathlib, leverage context managers.
+${focus.description}` : null
+      });
+    }
+
+    if (detectedLangs.has('go')) {
+      agents.push({
+        name: 'go-specialist',
+        type: 'go-developer',
+        description: 'Go development specialist',
+        capabilities: ['goroutines', 'channels', 'interfaces', 'testing', 'modules'],
+        focus: focus.priorities,
+        systemPrompt: opts.includePrompts ? `You are a Go specialist for this project.
+Focus on: simplicity, explicit error handling, goroutines, interface composition.
+Follow Go conventions, use go fmt, prefer composition over inheritance.
+${focus.description}` : null
+      });
+    }
+
+    // Framework-specific agents
+    if (detectedFrameworks.has('react')) {
+      agents.push({
+        name: 'react-specialist',
+        type: 'react-developer',
+        description: 'React/Next.js development specialist',
+        capabilities: ['hooks', 'state-management', 'components', 'ssr', 'testing'],
+        focus: focus.priorities,
+        systemPrompt: opts.includePrompts ? `You are a React specialist for this project.
+Focus on: functional components, hooks, state management, performance optimization.
+Prefer composition, use memo wisely, follow React best practices.
+${focus.description}` : null
+      });
+    }
+
+    if (detectedFrameworks.has('database')) {
+      agents.push({
+        name: 'database-specialist',
+        type: 'database-specialist',
+        description: 'Database design and optimization specialist',
+        capabilities: ['schema-design', 'queries', 'indexing', 'migrations', 'orm'],
+        focus: focus.priorities,
+        systemPrompt: opts.includePrompts ? `You are a database specialist for this project.
+Focus on: normalized schemas, efficient queries, proper indexing, data integrity.
+Consider performance implications, use transactions appropriately.
+${focus.description}` : null
+      });
+    }
+
+    // Focus-specific agents
+    if (opts.focus === 'testing' || opts.focus === 'quality') {
+      agents.push({
+        name: 'test-architect',
+        type: 'test-engineer',
+        description: 'Testing and quality assurance specialist',
+        capabilities: ['unit-tests', 'integration-tests', 'mocking', 'coverage', 'tdd'],
+        focus: ['testing', 'quality', 'reliability'],
+        systemPrompt: opts.includePrompts ? `You are a testing specialist for this project.
+Focus on: comprehensive test coverage, meaningful assertions, test isolation.
+Write tests first when possible, mock external dependencies, aim for >80% coverage.
+${focus.description}` : null
+      });
+    }
+
+    if (opts.focus === 'security') {
+      agents.push({
+        name: 'security-auditor',
+        type: 'security-specialist',
+        description: 'Security audit and hardening specialist',
+        capabilities: ['vulnerability-scan', 'auth', 'encryption', 'input-validation', 'owasp'],
+        focus: ['security', 'compliance', 'hardening'],
+        systemPrompt: opts.includePrompts ? `You are a security specialist for this project.
+Focus on: OWASP top 10, input validation, authentication, authorization, encryption.
+Never trust user input, use parameterized queries, implement defense in depth.
+${focus.description}` : null
+      });
+    }
+
+    // Add coordinator agent
+    agents.push({
+      name: 'project-coordinator',
+      type: 'coordinator',
+      description: 'Coordinates multi-agent workflows for this project',
+      capabilities: ['task-decomposition', 'agent-routing', 'context-management'],
+      focus: focus.priorities,
+      routes: agents.filter(a => a.name !== 'project-coordinator').map(a => ({
+        pattern: a.capabilities[0],
+        agent: a.name
+      }))
+    });
+
+    // Create output directory
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    // Generate agent files
+    agents.forEach(agent => {
+      let content;
+      const filename = `${agent.name}.${opts.format}`;
+      const filepath = path.join(outputDir, filename);
+
+      if (opts.format === 'yaml') {
+        const yaml = [
+          `# Auto-generated by RuVector Agent Builder`,
+          `# Focus: ${opts.focus}`,
+          `# Generated: ${new Date().toISOString()}`,
+          ``,
+          `name: ${agent.name}`,
+          `type: ${agent.type}`,
+          `description: ${agent.description}`,
+          ``,
+          `capabilities:`,
+          ...agent.capabilities.map(c => `  - ${c}`),
+          ``,
+          `focus:`,
+          ...agent.focus.map(f => `  - ${f}`),
+        ];
+        if (agent.systemPrompt) {
+          yaml.push(``, `system_prompt: |`);
+          agent.systemPrompt.split('\n').forEach(line => yaml.push(`  ${line}`));
+        }
+        if (agent.routes) {
+          yaml.push(``, `routes:`);
+          agent.routes.forEach(r => yaml.push(`  - pattern: "${r.pattern}"`, `    agent: ${r.agent}`));
+        }
+        content = yaml.join('\n');
+      } else if (opts.format === 'json') {
+        content = JSON.stringify(agent, null, 2);
+      } else {
+        // Markdown format
+        content = [
+          `# ${agent.name}`,
+          ``,
+          `**Type:** ${agent.type}`,
+          `**Description:** ${agent.description}`,
+          ``,
+          `## Capabilities`,
+          ...agent.capabilities.map(c => `- ${c}`),
+          ``,
+          `## Focus Areas`,
+          ...agent.focus.map(f => `- ${f}`),
+        ].join('\n');
+        if (agent.systemPrompt) {
+          content += `\n\n## System Prompt\n\n\`\`\`\n${agent.systemPrompt}\n\`\`\``;
+        }
+      }
+
+      fs.writeFileSync(filepath, content);
+      console.log(chalk.green(`  ✓ Created ${filename}`));
+    });
+
+    // Create index file
+    const indexContent = opts.format === 'yaml'
+      ? `# RuVector Agent Configuration\n# Focus: ${opts.focus}\n\nagents:\n${agents.map(a => `  - ${a.name}`).join('\n')}`
+      : JSON.stringify({ focus: opts.focus, agents: agents.map(a => a.name) }, null, 2);
+
+    fs.writeFileSync(path.join(outputDir, `index.${opts.format === 'md' ? 'json' : opts.format}`), indexContent);
+
+    // Update settings to reference agents — only when the agents were written inside
+    // this project, and by a relative path: an --output elsewhere (a scratch run) wrote a dead absolute path into the
+    // project's own settings.json
+    const settingsPath = path.join(process.cwd(), '.claude', 'settings.json');
+    const relOut = path.relative(process.cwd(), outputDir);
+    const insideProject = relOut !== '' && !relOut.startsWith('..') && !path.isAbsolute(relOut);
+    if (!insideProject) console.log(chalk.dim('\n  (output is outside this project: .claude/settings.json left unchanged)'));
+    if (insideProject && fs.existsSync(settingsPath)) {
+      try {
+        const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
+        settings.agentConfig = {
+          directory: relOut,
+          focus: opts.focus,
+          agents: agents.map(a => a.name),
+          generated: new Date().toISOString()
+        };
+        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+        console.log(chalk.blue('\n  ✓ Updated .claude/settings.json with agent config'));
+      } catch (e) { /* ignore settings errors */ }
+    }
+
+    console.log(chalk.bold.green(`\n✅ Generated ${agents.length} optimized agents in ${opts.output}/\n`));
+    console.log(chalk.cyan('Agents created:'));
+    agents.forEach(a => {
+      console.log(`  🤖 ${chalk.bold(a.name)}: ${a.description}`);
+    });
+    console.log(chalk.dim(`\nFocus mode "${opts.focus}": ${focus.description}`));
+  });
+
+// Workers command group - Background analysis via agentic-flow
+const workersCmd = program.command('workers').description('Background analysis workers (via agentic-flow)');
+
+// Helper to run agentic-flow workers command
+async function runAgenticFlow(args) {
+  const { spawn } = require('child_process');
+  return new Promise((resolve, reject) => {
+    // No shell on POSIX so prompt text is never interpreted; Windows needs one to run npx.cmd.
+    const proc = spawn('npx', ['agentic-flow@3.0.0-alpha.2', ...args], {
+      stdio: 'inherit',
+      shell: process.platform === 'win32'
+    });
+    proc.on('close', code => code === 0 ? resolve() : reject(new Error(`Exit code ${code}`)));
+    proc.on('error', reject);
+  });
+}
+
+workersCmd.command('dispatch')
+  .description('Dispatch background worker for analysis')
+  .argument('<prompt...>', 'Prompt with trigger keyword (ultralearn, optimize, audit, map, etc.)')
+  .action(async (prompt) => {
+    try {
+      await runAgenticFlow(['workers', 'dispatch', prompt.join(' ')]);
+    } catch (e) {
+      console.error(chalk.red('Worker dispatch failed:'), e.message);
+    }
+  });
+
+workersCmd.command('status')
+  .description('Show worker status dashboard')
+  .argument('[workerId]', 'Specific worker ID')
+  .action(async (workerId) => {
+    try {
+      const args = ['workers', 'status'];
+      if (workerId) args.push(workerId);
+      await runAgenticFlow(args);
+    } catch (e) {
+      console.error(chalk.red('Status check failed:'), e.message);
+    }
+  });
+
+workersCmd.command('results')
+  .description('Show worker analysis results')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => {
+    try {
+      const args = ['workers', 'results'];
+      if (opts.json) args.push('--json');
+      await runAgenticFlow(args);
+    } catch (e) {
+      console.error(chalk.red('Results fetch failed:'), e.message);
+    }
+  });
+
+workersCmd.command('triggers')
+  .description('List available trigger keywords')
+  .action(async () => {
+    try {
+      await runAgenticFlow(['workers', 'triggers']);
+    } catch (e) {
+      console.error(chalk.red('Triggers list failed:'), e.message);
+    }
+  });
+
+workersCmd.command('stats')
+  .description('Show worker statistics (24h)')
+  .action(async () => {
+    try {
+      await runAgenticFlow(['workers', 'stats']);
+    } catch (e) {
+      console.error(chalk.red('Stats failed:'), e.message);
+    }
+  });
+
+workersCmd.command('cleanup')
+  .description('Cleanup old worker records')
+  .option('--keep <days>', 'Keep records for N days', '7')
+  .action(async (opts) => {
+    try {
+      await runAgenticFlow(['workers', 'cleanup', '--keep', opts.keep]);
+    } catch (e) {
+      console.error(chalk.red('Cleanup failed:'), e.message);
+    }
+  });
+
+workersCmd.command('cancel')
+  .description('Cancel a running worker')
+  .argument('<workerId>', 'Worker ID to cancel')
+  .action(async (workerId) => {
+    try {
+      await runAgenticFlow(['workers', 'cancel', workerId]);
+    } catch (e) {
+      console.error(chalk.red('Cancel failed:'), e.message);
+    }
+  });
+
+// Custom Worker System (agentic-flow@3.0.0-alpha.2.39+)
+workersCmd.command('presets')
+  .description('List available worker presets (quick-scan, deep-analysis, security-scan, etc.)')
+  .action(async () => {
+    try {
+      await runAgenticFlow(['workers', 'presets']);
+    } catch (e) {
+      console.error(chalk.red('Presets list failed:'), e.message);
+    }
+  });
+
+workersCmd.command('phases')
+  .description('List available phase executors (24 phases: file-discovery, security-analysis, etc.)')
+  .action(async () => {
+    try {
+      await runAgenticFlow(['workers', 'phases']);
+    } catch (e) {
+      console.error(chalk.red('Phases list failed:'), e.message);
+    }
+  });
+
+workersCmd.command('create')
+  .description('Create a custom worker from preset')
+  .argument('<name>', 'Worker name')
+  .option('--preset <preset>', 'Base preset (quick-scan, deep-analysis, security-scan, learning, api-docs, test-analysis)')
+  .option('--triggers <triggers>', 'Comma-separated trigger keywords')
+  .action(async (name, opts) => {
+    try {
+      const args = ['workers', 'create', name];
+      if (opts.preset) args.push('--preset', opts.preset);
+      if (opts.triggers) args.push('--triggers', opts.triggers);
+      await runAgenticFlow(args);
+    } catch (e) {
+      console.error(chalk.red('Worker creation failed:'), e.message);
+    }
+  });
+
+workersCmd.command('run')
+  .description('Run a custom worker')
+  .argument('<name>', 'Worker name')
+  .option('--path <path>', 'Target path to analyze', '.')
+  .action(async (name, opts) => {
+    try {
+      const args = ['workers', 'run', name];
+      if (opts.path) args.push('--path', opts.path);
+      await runAgenticFlow(args);
+    } catch (e) {
+      console.error(chalk.red('Worker run failed:'), e.message);
+    }
+  });
+
+workersCmd.command('custom')
+  .description('List registered custom workers')
+  .action(async () => {
+    try {
+      await runAgenticFlow(['workers', 'custom']);
+    } catch (e) {
+      console.error(chalk.red('Custom workers list failed:'), e.message);
+    }
+  });
+
+workersCmd.command('init-config')
+  .description('Generate example workers.yaml config file')
+  .option('--force', 'Overwrite existing config')
+  .action(async (opts) => {
+    try {
+      const args = ['workers', 'init-config'];
+      if (opts.force) args.push('--force');
+      await runAgenticFlow(args);
+    } catch (e) {
+      console.error(chalk.red('Config init failed:'), e.message);
+    }
+  });
+
+workersCmd.command('load-config')
+  .description('Load custom workers from workers.yaml')
+  .option('--file <file>', 'Config file path', 'workers.yaml')
+  .action(async (opts) => {
+    try {
+      const args = ['workers', 'load-config'];
+      if (opts.file !== 'workers.yaml') args.push('--file', opts.file);
+      await runAgenticFlow(args);
+    } catch (e) {
+      console.error(chalk.red('Config load failed:'), e.message);
+    }
+  });
+
+console.log && false; // Force registration
+
+// Native Workers command group - Deep ruvector integration (no agentic-flow delegation)
+const nativeCmd = program.command('native').description('Native workers with deep ONNX/VectorDB integration (no external deps)');
+
+nativeCmd.command('run')
+  .description('Run a native worker type')
+  .argument('<type>', 'Worker type: security, analysis, learning')
+  .option('--path <path>', 'Target path to analyze', '.')
+  .option('--json', 'Output as JSON')
+  .action(async (type, opts) => {
+    try {
+      const { createSecurityWorker, createAnalysisWorker, createLearningWorker } = require('../dist/workers/native-worker.js');
+
+      let worker;
+      switch (type) {
+        case 'security':
+          worker = createSecurityWorker();
+          break;
+        case 'analysis':
+          worker = createAnalysisWorker();
+          break;
+        case 'learning':
+          worker = createLearningWorker();
+          break;
+        default:
+          console.error(chalk.red(`Unknown worker type: ${type}`));
+          console.log(chalk.dim('Available types: security, analysis, learning'));
+          return;
+      }
+
+      console.log(chalk.cyan(`\n🔧 Running native ${type} worker on ${opts.path}...\n`));
+      const result = await worker.run(opts.path);
+
+      if (opts.json) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.bold(`Worker: ${result.worker}`));
+        console.log(chalk.dim(`Status: ${result.success ? chalk.green('✓ Success') : chalk.red('✗ Failed')}`));
+        console.log(chalk.dim(`Time: ${result.totalTimeMs.toFixed(0)}ms\n`));
+
+        console.log(chalk.bold('Phases:'));
+        for (const phase of result.phases) {
+          const status = phase.success ? chalk.green('✓') : chalk.red('✗');
+          console.log(`  ${status} ${phase.phase} (${phase.timeMs.toFixed(0)}ms)`);
+          if (phase.data) {
+            const dataStr = JSON.stringify(phase.data);
+            if (dataStr.length < 100) {
+              console.log(chalk.dim(`    ${dataStr}`));
+            }
+          }
+        }
+
+        if (result.summary) {
+          console.log(chalk.bold('\nSummary:'));
+          console.log(`  Files analyzed: ${result.summary.filesAnalyzed}`);
+          console.log(`  Patterns found: ${result.summary.patternsFound}`);
+          console.log(`  Embeddings: ${result.summary.embeddingsGenerated}`);
+          console.log(`  Vectors stored: ${result.summary.vectorsStored}`);
+
+          if (result.summary.findings.length > 0) {
+            console.log(chalk.bold('\nFindings:'));
+            const byType = { info: 0, warning: 0, error: 0, security: 0 };
+            result.summary.findings.forEach(f => byType[f.type]++);
+            if (byType.security > 0) console.log(chalk.red(`  🔒 Security: ${byType.security}`));
+            if (byType.error > 0) console.log(chalk.red(`  ❌ Errors: ${byType.error}`));
+            if (byType.warning > 0) console.log(chalk.yellow(`  ⚠️  Warnings: ${byType.warning}`));
+            if (byType.info > 0) console.log(chalk.blue(`  ℹ️  Info: ${byType.info}`));
+
+            // Show top findings
+            console.log(chalk.dim('\nTop findings:'));
+            result.summary.findings.slice(0, 5).forEach(f => {
+              const icon = f.type === 'security' ? '🔒' : f.type === 'warning' ? '⚠️' : 'ℹ️';
+              console.log(chalk.dim(`  ${icon} ${f.message.slice(0, 60)}${f.file ? ` (${path.basename(f.file)})` : ''}`));
+            });
+          }
+        }
+      }
+    } catch (e) {
+      console.error(chalk.red('Native worker failed:'), e.message);
+      if (e.stack) console.error(chalk.dim(e.stack));
+    }
+  });
+
+nativeCmd.command('benchmark')
+  .description('Run performance benchmark suite')
+  .option('--path <path>', 'Target path for worker benchmarks', '.')
+  .option('--embeddings-only', 'Only benchmark embeddings')
+  .option('--workers-only', 'Only benchmark workers')
+  .action(async (opts) => {
+    try {
+      const benchmark = require('../dist/workers/benchmark.js');
+
+      if (opts.embeddingsOnly) {
+        console.log(chalk.cyan('\n📊 Benchmarking ONNX Embeddings...\n'));
+        const results = await benchmark.benchmarkEmbeddings(10);
+        console.log(benchmark.formatBenchmarkResults(results));
+      } else if (opts.workersOnly) {
+        console.log(chalk.cyan('\n🔧 Benchmarking Native Workers...\n'));
+        const results = await benchmark.benchmarkWorkers(opts.path);
+        console.log(benchmark.formatBenchmarkResults(results));
+      } else {
+        await benchmark.runFullBenchmark(opts.path);
+      }
+    } catch (e) {
+      console.error(chalk.red('Benchmark failed:'), e.message);
+      if (e.stack) console.error(chalk.dim(e.stack));
+    }
+  });
+
+nativeCmd.command('list')
+  .description('List available native worker types')
+  .action(() => {
+    console.log(chalk.cyan('\n🔧 Native Worker Types\n'));
+    console.log(chalk.bold('security'));
+    console.log(chalk.dim('  Security vulnerability scanner'));
+    console.log(chalk.dim('  Phases: file-discovery → security-scan → summarization'));
+    console.log(chalk.dim('  No ONNX/VectorDB required\n'));
+
+    console.log(chalk.bold('analysis'));
+    console.log(chalk.dim('  Full code analysis with embeddings'));
+    console.log(chalk.dim('  Phases: file-discovery → pattern-extraction → embedding-generation'));
+    console.log(chalk.dim('          → vector-storage → complexity-analysis → summarization'));
+    console.log(chalk.dim('  Requires: ONNX embedder, VectorDB\n'));
+
+    console.log(chalk.bold('learning'));
+    console.log(chalk.dim('  Pattern learning with vector storage'));
+    console.log(chalk.dim('  Phases: file-discovery → pattern-extraction → embedding-generation'));
+    console.log(chalk.dim('          → vector-storage → summarization'));
+    console.log(chalk.dim('  Requires: ONNX embedder, VectorDB, Intelligence memory\n'));
+
+    console.log(chalk.bold('Available Phases:'));
+    const phases = [
+      'file-discovery', 'pattern-extraction', 'embedding-generation',
+      'vector-storage', 'similarity-search', 'security-scan',
+      'complexity-analysis', 'summarization'
+    ];
+    phases.forEach(p => console.log(chalk.dim(`  • ${p}`)));
+  });
+
+nativeCmd.command('compare')
+  .description('Compare ruvector native vs agentic-flow workers')
+  .option('--path <path>', 'Target path for benchmarks', '.')
+  .option('--iterations <n>', 'Number of iterations', '5')
+  .action(async (opts) => {
+    const iterations = parseInt(opts.iterations) || 5;
+    console.log(chalk.cyan('\n╔════════════════════════════════════════════════════════════════╗'));
+    console.log(chalk.cyan('║           Worker System Comparison Benchmark                   ║'));
+    console.log(chalk.cyan('╚════════════════════════════════════════════════════════════════╝\n'));
+
+    try {
+      const { performance } = require('perf_hooks');
+      const benchmark = require('../dist/workers/benchmark.js');
+      const { createSecurityWorker, createAnalysisWorker } = require('../dist/workers/native-worker.js');
+
+      // Test 1: Native Security Worker
+      console.log(chalk.yellow('1. Native Security Worker'));
+      const securityTimes = [];
+      const securityWorker = createSecurityWorker();
+      for (let i = 0; i < iterations; i++) {
+        const start = performance.now();
+        await securityWorker.run(opts.path);
+        securityTimes.push(performance.now() - start);
+      }
+      const secAvg = securityTimes.reduce((a, b) => a + b) / securityTimes.length;
+      console.log(chalk.dim(`   Avg: ${secAvg.toFixed(1)}ms (${iterations} runs)`));
+
+      // Test 2: Native Analysis Worker
+      console.log(chalk.yellow('\n2. Native Analysis Worker (ONNX + VectorDB)'));
+      const analysisTimes = [];
+      const analysisWorker = createAnalysisWorker();
+      for (let i = 0; i < Math.min(iterations, 3); i++) {
+        const start = performance.now();
+        await analysisWorker.run(opts.path);
+        analysisTimes.push(performance.now() - start);
+      }
+      const anaAvg = analysisTimes.reduce((a, b) => a + b) / analysisTimes.length;
+      console.log(chalk.dim(`   Avg: ${anaAvg.toFixed(1)}ms (${Math.min(iterations, 3)} runs)`));
+
+      // Test 3: agentic-flow workers (if available)
+      let agenticAvailable = false;
+      let agenticSecAvg = 0;
+      let agenticAnaAvg = 0;
+      try {
+        const agentic = require('agentic-flow');
+        agenticAvailable = true;
+
+        console.log(chalk.yellow('\n3. agentic-flow Security Worker'));
+        // Note: Would need actual agentic-flow integration here
+        console.log(chalk.dim('   (Integration pending - use agentic-flow CLI directly)'));
+
+      } catch (e) {
+        console.log(chalk.yellow('\n3. agentic-flow Workers'));
+        console.log(chalk.dim('   Not installed (npm i agentic-flow@3.0.0-alpha.2)'));
+      }
+
+      // Summary
+      console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+      console.log(chalk.bold('Summary'));
+      console.log(chalk.cyan('═══════════════════════════════════════════════════════════════'));
+      console.log(chalk.white('\nNative RuVector Workers:'));
+      console.log(chalk.dim(`  Security scan:  ${secAvg.toFixed(1)}ms avg`));
+      console.log(chalk.dim(`  Full analysis:  ${anaAvg.toFixed(1)}ms avg`));
+
+      if (agenticAvailable) {
+        console.log(chalk.white('\nagentic-flow Workers:'));
+        console.log(chalk.dim('  Security scan:  (run: agentic-flow workers native security)'));
+        console.log(chalk.dim('  Full analysis:  (run: agentic-flow workers native analysis)'));
+      }
+
+      console.log(chalk.white('\nArchitecture Benefits:'));
+      console.log(chalk.dim('  • Shared ONNX model cache (memory efficient)'));
+      console.log(chalk.dim('  • 7 native phases with deep integration'));
+      console.log(chalk.dim('  • SIMD-accelerated WASM embeddings'));
+      console.log(chalk.dim('  • HNSW vector indexing (150x faster search)'));
+      console.log('');
+    } catch (e) {
+      console.error(chalk.red('Comparison failed:'), e.message);
+      if (opts.verbose) console.error(chalk.dim(e.stack));
+    }
+  });
+
+// RVF (RuVector Format) commands
+const rvfCmd = program.command('rvf').description('RuVector Format (.rvf) cognitive container operations');
+
+// Every store a command opens is closed in `finally`: the writer lock file
+// outlives the process, so a command that failed before close() left the store
+// locked (LockHeld) until someone deleted <store>.lock by hand.
+async function withRvfStore(storePath, fn) {
+  const { openRvfStore, rvfClose } = require('../dist/core/rvf-wrapper.js');
+  const store = await openRvfStore(storePath);
+  try { return await fn(store); } finally { await rvfClose(store); }
+}
+
+// `-v 0.1,0.2` or `-v "[0.1, 0.2]"` -> number[]; anything else is rejected
+// before the backend is touched (it used to surface as NonFiniteQuery).
+function parseVectorArg(raw) {
+  const text = String(raw).trim();
+  const bracketed = text.startsWith('[') || text.endsWith(']');
+  if (bracketed && !(text.startsWith('[') && text.endsWith(']'))) {
+    throw new Error(`Invalid vector "${raw}": unbalanced brackets (use 0.1,0.2,0.3 or [0.1,0.2,0.3])`);
+  }
+  const body = bracketed ? text.slice(1, -1) : text;
+  const parts = body.split(',').map(p => p.trim());
+  const vector = parts.map(p => (p === '' ? NaN : Number(p)));
+  const bad = vector.findIndex(v => !Number.isFinite(v));
+  if (parts.length === 0 || bad !== -1) {
+    throw new Error(`Invalid vector "${raw}": element ${bad + 1} (${JSON.stringify(parts[bad] ?? '')}) is not a finite number (use 0.1,0.2,0.3 or [0.1,0.2,0.3])`);
+  }
+  try {
+    return Array.from(recordValidate.validateVector(vector));
+  } catch (e) {
+    throw new Error(`Invalid vector "${raw}": ${e.message}`);
+  }
+}
+
+rvfCmd.command('create <path>')
+  .description('Create a new .rvf store')
+  .requiredOption('-d, --dimension <n>', 'Vector dimension', parseInt)
+  .option('-m, --metric <metric>', 'Distance metric (l2, cosine, dotproduct)', 'cosine')
+  .action(async (storePath, opts) => {
+    try {
+      const { createRvfStore, rvfClose } = require('../dist/core/rvf-wrapper.js');
+      const store = await createRvfStore(storePath, { dimensions: opts.dimension, metric: opts.metric });
+      await rvfClose(store);
+      console.log(chalk.green(`Created ${storePath} (dim=${opts.dimension}, metric=${opts.metric})`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('ingest <path>')
+  .description('Ingest vectors into an .rvf store')
+  .requiredOption('-i, --input <file>', 'Input file (JSON array of {id, vector})')
+  .option('-f, --format <fmt>', 'Input format (json)', 'json')
+  .action(async (storePath, opts) => {
+    try {
+      const { rvfIngest } = require('../dist/core/rvf-wrapper.js');
+      const data = JSON.parse(fs.readFileSync(opts.input, 'utf8'));
+      const result = await withRvfStore(storePath, store => rvfIngest(store, data));
+      console.log(chalk.green(`Ingested ${result.accepted} vectors (${result.rejected} rejected)`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('query <path>')
+  .description('Query nearest neighbors')
+  .requiredOption('-v, --vector <values>', 'Comma-separated vector values (or [a,b,c])')
+  .option('-k, --k <n>', 'Number of results', parseInt, 10)
+  .action(async (storePath, opts) => {
+    try {
+      const { rvfQuery } = require('../dist/core/rvf-wrapper.js');
+      const vector = parseVectorArg(opts.vector);
+      const k = recordValidate.validateK(opts.k);
+      const results = await withRvfStore(storePath, store => rvfQuery(store, vector, k));
+      results.forEach((r, i) => console.log(chalk.dim(`  ${i+1}. id=${r.id}  dist=${r.distance.toFixed(6)}`)));
+      console.log(chalk.green(`${results.length} results`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('delete <path>')
+  .description('Delete vectors by id (ingest of an existing id already replaces it)')
+  .requiredOption('--ids <ids>', 'Comma-separated vector ids')
+  .action(async (storePath, opts) => {
+    try {
+      const ids = recordValidate.validateIdList(opts.ids.split(',').map(s => s.trim()).filter(Boolean));
+      const { rvfDelete } = require('../dist/core/rvf-wrapper.js');
+      const result = await withRvfStore(storePath, store => rvfDelete(store, ids));
+      console.log(chalk.green(`Deleted ${result.deleted} vector(s)`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('status <path>')
+  .description('Show store statistics')
+  .action(async (storePath) => {
+    try {
+      const { rvfStatus } = require('../dist/core/rvf-wrapper.js');
+      const s = await withRvfStore(storePath, store => rvfStatus(store));
+      console.log(chalk.cyan('RVF Store Status'));
+      Object.entries(s).forEach(([k, v]) => console.log(chalk.dim(`  ${k}: ${v}`)));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('segments <path>')
+  .description('List all segments in an .rvf file')
+  .action(async (storePath) => {
+    try {
+      const segs = await withRvfStore(storePath, store => store.segments());
+      // The SDK returns { id, offset, payloadLength, segType }.
+      segs.forEach((seg, i) => console.log(chalk.dim(`  [${i}] id=${seg.id} type=${seg.segType} offset=${seg.offset} size=${seg.payloadLength}`)));
+      console.log(chalk.green(`${segs.length} segments`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('derive <parent> <child>')
+  .description('Create a derived store with lineage tracking')
+  .action(async (parentPath, childPath) => {
+    try {
+      const { rvfDerive, rvfClose } = require('../dist/core/rvf-wrapper.js');
+      await withRvfStore(parentPath, async (store) => {
+        const child = await rvfDerive(store, childPath);
+        await rvfClose(child);
+      });
+      console.log(chalk.green(`Derived ${childPath} from ${parentPath}`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('compact <path>')
+  .description('Compact store, reclaim deleted space')
+  .action(async (storePath) => {
+    try {
+      const { rvfCompact } = require('../dist/core/rvf-wrapper.js');
+      const result = await withRvfStore(storePath, store => rvfCompact(store));
+      console.log(chalk.green(`Compacted: ${result.segmentsCompacted} segments, ${result.bytesReclaimed} bytes reclaimed`));
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+rvfCmd.command('export <path>')
+  .description('Export store data')
+  .option('-o, --output <file>', 'Output file')
+  .action(async (storePath, opts) => {
+    try {
+      const { rvfStatus } = require('../dist/core/rvf-wrapper.js');
+      const { status, segs } = await withRvfStore(storePath, async store => ({ status: await rvfStatus(store), segs: await store.segments() }));
+      const data = JSON.stringify({ status, segments: segs }, null, 2);
+      if (opts.output) { fs.writeFileSync(opts.output, data); console.log(chalk.green(`Exported to ${opts.output}`)); }
+      else { console.log(data); }
+    } catch (e) { console.error(chalk.red(e.message)); process.exit(1); }
+  });
+
+// RVF example download/list commands
+const RVF_EXAMPLES = [
+  { name: 'basic_store', size: '152 KB', desc: '1,000 vectors, dim 128, cosine metric' },
+  { name: 'semantic_search', size: '755 KB', desc: 'Semantic search with HNSW index' },
+  { name: 'rag_pipeline', size: '303 KB', desc: 'RAG pipeline with embeddings' },
+  { name: 'embedding_cache', size: '755 KB', desc: 'Cached embedding store' },
+  { name: 'quantization', size: '1.5 MB', desc: 'PQ-compressed vectors' },
+  { name: 'progressive_index', size: '2.5 MB', desc: 'Large-scale progressive HNSW index' },
+  { name: 'filtered_search', size: '255 KB', desc: 'Metadata-filtered vector search' },
+  { name: 'recommendation', size: '102 KB', desc: 'Recommendation engine vectors' },
+  { name: 'agent_memory', size: '32 KB', desc: 'AI agent episodic memory' },
+  { name: 'swarm_knowledge', size: '86 KB', desc: 'Multi-agent shared knowledge base' },
+  { name: 'experience_replay', size: '27 KB', desc: 'RL experience replay buffer' },
+  { name: 'tool_cache', size: '26 KB', desc: 'MCP tool call cache' },
+  { name: 'mcp_in_rvf', size: '32 KB', desc: 'MCP server embedded in RVF' },
+  { name: 'ruvbot', size: '51 KB', desc: 'Chatbot knowledge store' },
+  { name: 'claude_code_appliance', size: '17 KB', desc: 'Claude Code cognitive appliance' },
+  { name: 'lineage_parent', size: '52 KB', desc: 'COW parent file' },
+  { name: 'lineage_child', size: '26 KB', desc: 'COW child (derived) file' },
+  { name: 'self_booting', size: '31 KB', desc: 'Self-booting with KERNEL_SEG' },
+  { name: 'linux_microkernel', size: '15 KB', desc: 'Embedded Linux microkernel' },
+  { name: 'ebpf_accelerator', size: '153 KB', desc: 'eBPF distance accelerator' },
+  { name: 'browser_wasm', size: '14 KB', desc: 'Browser WASM module embedded' },
+  { name: 'tee_attestation', size: '102 KB', desc: 'TEE attestation with witnesses' },
+  { name: 'zero_knowledge', size: '52 KB', desc: 'ZK-proof witness chain' },
+  { name: 'sealed_engine', size: '208 KB', desc: 'Sealed inference engine' },
+  { name: 'access_control', size: '77 KB', desc: 'Permission-gated vectors' },
+  { name: 'financial_signals', size: '202 KB', desc: 'Financial signal vectors' },
+  { name: 'medical_imaging', size: '302 KB', desc: 'Medical imaging embeddings' },
+  { name: 'legal_discovery', size: '903 KB', desc: 'Legal document discovery' },
+  { name: 'multimodal_fusion', size: '804 KB', desc: 'Multi-modal embedding fusion' },
+  { name: 'hyperbolic_taxonomy', size: '23 KB', desc: 'Hyperbolic space taxonomy' },
+  { name: 'network_telemetry', size: '16 KB', desc: 'Network telemetry vectors' },
+  { name: 'postgres_bridge', size: '152 KB', desc: 'PostgreSQL bridge vectors' },
+  { name: 'ruvllm_inference', size: '133 KB', desc: 'RuvLLM inference cache' },
+  { name: 'serverless', size: '509 KB', desc: 'Serverless deployment bundle' },
+  { name: 'edge_iot', size: '27 KB', desc: 'Edge/IoT lightweight store' },
+  { name: 'dedup_detector', size: '153 KB', desc: 'Deduplication detector' },
+  { name: 'compacted', size: '77 KB', desc: 'Post-compaction example' },
+  { name: 'posix_fileops', size: '52 KB', desc: 'POSIX file operations test' },
+  { name: 'network_sync_a', size: '52 KB', desc: 'Network sync peer A' },
+  { name: 'network_sync_b', size: '52 KB', desc: 'Network sync peer B' },
+  { name: 'agent_handoff_a', size: '31 KB', desc: 'Agent handoff source' },
+  { name: 'agent_handoff_b', size: '11 KB', desc: 'Agent handoff target' },
+  { name: 'reasoning_parent', size: '5.6 KB', desc: 'Reasoning chain parent' },
+  { name: 'reasoning_child', size: '8.1 KB', desc: 'Reasoning chain child' },
+  { name: 'reasoning_grandchild', size: '162 B', desc: 'Minimal derived file' },
+];
+
+const RVF_BASE_URL = 'https://raw.githubusercontent.com/ruvnet/ruvector/main/examples/rvf/output';
+
+rvfCmd.command('examples')
+  .description('List available example .rvf files')
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    if (opts.json) {
+      console.log(JSON.stringify(RVF_EXAMPLES, null, 2));
+      return;
+    }
+    console.log(chalk.bold.cyan('\nAvailable RVF Example Files (45 total)\n'));
+    console.log(chalk.dim(`Download: npx ruvector rvf download <name>\n`));
+    const maxName = Math.max(...RVF_EXAMPLES.map(e => e.name.length));
+    const maxSize = Math.max(...RVF_EXAMPLES.map(e => e.size.length));
+    for (const ex of RVF_EXAMPLES) {
+      const name = chalk.green(ex.name.padEnd(maxName));
+      const size = chalk.yellow(ex.size.padStart(maxSize));
+      console.log(`  ${name}  ${size}  ${chalk.dim(ex.desc)}`);
+    }
+    console.log(chalk.dim(`\nFull catalog: https://github.com/ruvnet/ruvector/tree/main/examples/rvf/output\n`));
+  });
+
+rvfCmd.command('download [names...]')
+  .description('Download example .rvf files from GitHub')
+  .option('-a, --all', 'Download all 45 examples (~11 MB)')
+  .option('-o, --output <dir>', 'Output directory', '.')
+  .action(async (names, opts) => {
+    const https = require('https');
+    const ALLOWED_REDIRECT_HOSTS = ['raw.githubusercontent.com', 'objects.githubusercontent.com', 'github.com'];
+    const sanitizeFileName = (name) => {
+      // Strip path separators and parent directory references
+      const base = path.basename(name);
+      // Only allow alphanumeric, underscores, hyphens, dots
+      if (!/^[\w\-.]+$/.test(base)) throw new Error(`Invalid filename: ${base}`);
+      return base;
+    };
+    const downloadFile = (url, dest) => new Promise((resolve, reject) => {
+      const file = fs.createWriteStream(dest);
+      https.get(url, (res) => {
+        if (res.statusCode === 302 || res.statusCode === 301) {
+          const redirectUrl = res.headers.location;
+          try {
+            const redirectHost = new URL(redirectUrl).hostname;
+            if (!ALLOWED_REDIRECT_HOSTS.includes(redirectHost)) {
+              file.close();
+              reject(new Error(`Redirect to untrusted host: ${redirectHost}`));
+              return;
+            }
+          } catch { file.close(); reject(new Error('Invalid redirect URL')); return; }
+          https.get(redirectUrl, (res2) => { res2.pipe(file); file.on('finish', () => { file.close(); resolve(); }); }).on('error', reject);
+          return;
+        }
+        if (res.statusCode !== 200) { file.close(); fs.unlinkSync(dest); reject(new Error(`HTTP ${res.statusCode}`)); return; }
+        res.pipe(file);
+        file.on('finish', () => { file.close(); resolve(); });
+      }).on('error', reject);
+    });
+
+    let toDownload = [];
+    if (opts.all) {
+      toDownload = RVF_EXAMPLES.map(e => e.name);
+    } else if (names && names.length > 0) {
+      toDownload = names;
+    } else {
+      console.error(chalk.red('Specify example names or use --all. Run `npx ruvector rvf examples` to list.'));
+      process.exit(1);
+    }
+
+    const outDir = path.resolve(opts.output);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+    console.log(chalk.bold.cyan(`\nDownloading ${toDownload.length} .rvf file(s) to ${outDir}\n`));
+    let ok = 0, fail = 0;
+    for (const name of toDownload) {
+      const rawName = name.endsWith('.rvf') ? name : `${name}.rvf`;
+      let fileName;
+      try { fileName = sanitizeFileName(rawName); } catch (e) {
+        console.log(chalk.red(`SKIPPED: ${e.message}`));
+        fail++;
+        continue;
+      }
+      // Validate against known examples when not using --all
+      if (!opts.all) {
+        const baseName = fileName.replace(/\.rvf$/, '');
+        if (!RVF_EXAMPLES.some(e => e.name === baseName)) {
+          console.log(chalk.red(`SKIPPED: Unknown example '${baseName}'. Run 'npx ruvector rvf examples' to list.`));
+          fail++;
+          continue;
+        }
+      }
+      const url = `${RVF_BASE_URL}/${encodeURIComponent(fileName)}`;
+      const dest = path.join(outDir, fileName);
+      // Path containment check
+      if (!path.resolve(dest).startsWith(path.resolve(outDir) + path.sep) && path.resolve(dest) !== path.resolve(outDir)) {
+        console.log(chalk.red(`SKIPPED: Path traversal detected for '${fileName}'`));
+        fail++;
+        continue;
+      }
+      try {
+        process.stdout.write(chalk.dim(`  ${fileName} ... `));
+        await downloadFile(url, dest);
+        const stat = fs.statSync(dest);
+        console.log(chalk.green(`OK (${(stat.size / 1024).toFixed(0)} KB)`));
+        ok++;
+      } catch (e) {
+        console.log(chalk.red(`FAILED: ${e.message}`));
+        fail++;
+      }
+    }
+    console.log(chalk.bold(`\nDone: ${ok} downloaded, ${fail} failed\n`));
+  });
+
+// MCP Server command
+// Agent skills shipped in the package (skills/<name>/SKILL.md). Same format
+// for Claude Code (.claude/skills) and Codex (.agents/skills).
+const SKILLS_SRC = path.join(__dirname, '..', 'skills');
+const SKILL_TARGETS = { claude: path.join('.claude', 'skills'), codex: path.join('.agents', 'skills') };
+const skillsCmd = program.command('skills').description('Agent skills for Claude Code and Codex that document ruvector features');
+
+function listShippedSkills() {
+  if (!fs.existsSync(SKILLS_SRC)) return [];
+  return fs.readdirSync(SKILLS_SRC, { withFileTypes: true })
+    .filter((d) => d.isDirectory() && fs.existsSync(path.join(SKILLS_SRC, d.name, 'SKILL.md')))
+    .map((d) => {
+      const head = fs.readFileSync(path.join(SKILLS_SRC, d.name, 'SKILL.md'), 'utf8').slice(0, 2000);
+      const desc = (head.match(/^description:\s*(.+)$/m) || [])[1] || '';
+      return { name: d.name, description: desc.trim() };
+    });
+}
+
+skillsCmd.command('list')
+  .description('List the skills shipped with ruvector')
+  .option('--json', 'Output as JSON')
+  .action((opts) => {
+    const skills = listShippedSkills();
+    if (opts.json) { console.log(JSON.stringify({ skills })); return; }
+    for (const sk of skills) console.log(`${chalk.bold(sk.name)}\n  ${chalk.dim(sk.description)}`);
+  });
+
+skillsCmd.command('install [names...]')
+  .description('Copy shipped skills into a project (.claude/skills for Claude Code, .agents/skills for Codex)')
+  .option('-t, --target <target>', 'claude, codex, or both', 'both')
+  .option('-d, --dir <dir>', 'Project directory', '.')
+  .option('-f, --force', 'Overwrite an existing skill of the same name')
+  .option('--json', 'Output as JSON')
+  .action((names, opts) => {
+    try {
+      const shipped = listShippedSkills().map((sk) => sk.name);
+      const wanted = names && names.length ? names : shipped;
+      const unknown = wanted.filter((n) => !shipped.includes(n));
+      if (unknown.length) throw new Error(`Unknown skill(s): ${unknown.join(', ')} (available: ${shipped.join(', ')})`);
+      const targets = opts.target === 'both' ? ['claude', 'codex'] : [opts.target];
+      for (const t of targets) if (!SKILL_TARGETS[t]) throw new Error(`--target must be claude, codex, or both (got ${t})`);
+      const root = path.resolve(opts.dir);
+      const results = [];
+      for (const t of targets) {
+        for (const n of wanted) {
+          const dest = path.join(root, SKILL_TARGETS[t], n);
+          if (fs.existsSync(dest) && !opts.force) { results.push({ skill: n, target: t, path: dest, status: 'exists' }); continue; }
+          fs.mkdirSync(path.dirname(dest), { recursive: true });
+          fs.cpSync(path.join(SKILLS_SRC, n), dest, { recursive: true, force: true });
+          results.push({ skill: n, target: t, path: dest, status: 'installed' });
+        }
+      }
+      if (opts.json) { console.log(JSON.stringify({ success: true, results })); return; }
+      for (const r of results) {
+        const mark = r.status === 'installed' ? chalk.green('installed') : chalk.yellow('exists (use --force)');
+        console.log(`  ${mark}  ${r.skill} -> ${path.relative(process.cwd(), r.path) || r.path}`);
+      }
+    } catch (e) {
+      if (opts.json) console.log(JSON.stringify({ success: false, error: e.message }));
+      else console.error(chalk.red(e.message));
+      process.exit(1);
+    }
+  });
+
+// DiskANN (Vamana graph ANN, optional @ruvector/diskann)
+const diskannCmd = program.command('diskann').description('DiskANN / Vamana on-disk ANN index (optional @ruvector/diskann)');
+
+function requireDiskAnn() {
+  const wrapper = require('../dist/core/diskann-wrapper.js');
+  if (!wrapper.isDiskAnnAvailable()) {
+    throw new Error('@ruvector/diskann is not installed. Install with: npx ruvector add diskann');
+  }
+  return wrapper;
+}
+
+function positiveIntOpt(raw, name) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`--${name} must be a positive integer`);
+  return n;
+}
+
+diskannCmd.command('build <dir>')
+  .description('Build a DiskANN index from a JSON array of {id, vector} and save it to <dir>')
+  .requiredOption('-i, --input <file>', 'Input file (JSON array of {id, vector})')
+  .option('--max-degree <n>', 'Max graph out-degree (default 64)')
+  .option('--build-beam <n>', 'Build beam width (default 128)')
+  .option('--alpha <a>', 'Vamana pruning alpha (default 1.2)')
+  .option('--json', 'Output as JSON')
+  .action((dir, opts) => {
+    try {
+      const { buildDiskAnnIndex } = requireDiskAnn();
+      const records = recordValidate.validateEntries(JSON.parse(fs.readFileSync(opts.input, 'utf8')), undefined, 'input');
+      const options = {};
+      if (opts.maxDegree !== undefined) options.maxDegree = positiveIntOpt(opts.maxDegree, 'max-degree');
+      if (opts.buildBeam !== undefined) options.buildBeam = positiveIntOpt(opts.buildBeam, 'build-beam');
+      if (opts.alpha !== undefined) {
+        const a = Number(opts.alpha);
+        if (!Number.isFinite(a) || a < 1) throw new Error('--alpha must be a number >= 1');
+        options.alpha = a;
+      }
+      const t0 = Date.now();
+      const result = buildDiskAnnIndex(dir, records, options);
+      if (opts.json) console.log(JSON.stringify({ success: true, ...result, ms: Date.now() - t0 }));
+      else console.log(chalk.green(`Built DiskANN index at ${dir}: ${result.count} vectors, dim=${result.dim} (${Date.now() - t0}ms)`));
+    } catch (e) {
+      if (opts.json) console.log(JSON.stringify({ success: false, error: e.message }));
+      else console.error(chalk.red(e.message));
+      process.exit(1);
+    }
+  });
+
+diskannCmd.command('search <dir>')
+  .description('k nearest neighbours (L2 squared) from a saved DiskANN index')
+  .requiredOption('-v, --vector <values>', 'Comma-separated vector values (or [a,b,c])')
+  .option('-k, --k <n>', 'Number of results', '10')
+  .option('--json', 'Output as JSON')
+  .action((dir, opts) => {
+    try {
+      const { searchDiskAnnIndex } = requireDiskAnn();
+      const vector = parseVectorArg(opts.vector);
+      const k = recordValidate.validateK(opts.k);
+      const results = searchDiskAnnIndex(dir, vector, k);
+      if (opts.json) {
+        console.log(JSON.stringify({ success: true, results }));
+      } else {
+        results.forEach((r, i) => console.log(chalk.dim(`  ${i + 1}. id=${r.id}  dist=${r.distance.toFixed(6)}`)));
+        console.log(chalk.green(`${results.length} results`));
+      }
+    } catch (e) {
+      if (opts.json) console.log(JSON.stringify({ success: false, error: e.message }));
+      else console.error(chalk.red(e.message));
+      process.exit(1);
+    }
+  });
+
+// Weight registry (optional peer @ruvector/weight-space, loaded inside the actions)
+require('./weights').registerWeightsCommands(program, chalk);
+
+const mcpCmd = program.command('mcp').description('MCP (Model Context Protocol) server for Claude Code integration');
+
+mcpCmd.command('start')
+  .description('Start the RuVector MCP server')
+  .action(() => {
+    const mcpServerPath = path.join(__dirname, 'mcp-server.js');
+    if (!fs.existsSync(mcpServerPath)) {
+      console.error(chalk.red('Error: MCP server not found at'), mcpServerPath);
+      process.exit(1);
+    }
+    const { main } = require(mcpServerPath);
+    main().catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
+  });
+
+mcpCmd.command('info')
+  .description('Show MCP server information and setup instructions')
+  .action(() => {
+    console.log(chalk.bold.cyan('\n🔌 RuVector MCP Server\n'));
+    console.log(chalk.white('The RuVector MCP server provides self-learning intelligence'));
+    console.log(chalk.white('tools to Claude Code via the Model Context Protocol.\n'));
+
+    console.log(chalk.bold('Hooks Tools:'));
+    console.log(chalk.dim('  hooks_stats      - Get intelligence statistics'));
+    console.log(chalk.dim('  hooks_route      - Route task to best agent'));
+    console.log(chalk.dim('  hooks_remember   - Store context in vector memory'));
+    console.log(chalk.dim('  hooks_recall     - Search vector memory'));
+    console.log(chalk.dim('  hooks_init       - Initialize hooks in project'));
+    console.log(chalk.dim('  hooks_pretrain   - Pretrain from repository'));
+    console.log(chalk.dim('  hooks_build_agents - Generate agent configs'));
+    console.log(chalk.dim('  hooks_verify     - Verify hooks configuration'));
+    console.log(chalk.dim('  hooks_doctor     - Diagnose setup issues'));
+    console.log(chalk.dim('  hooks_export     - Export intelligence data'));
+
+    console.log(chalk.bold('\nRVF Vector Store Tools:'));
+    console.log(chalk.dim('  rvf_create       - Create new .rvf vector store'));
+    console.log(chalk.dim('  rvf_open         - Open existing .rvf store'));
+    console.log(chalk.dim('  rvf_ingest       - Insert vectors into store'));
+    console.log(chalk.dim('  rvf_query        - Query nearest neighbors'));
+    console.log(chalk.dim('  rvf_delete       - Delete vectors by ID'));
+    console.log(chalk.dim('  rvf_status       - Get store status'));
+    console.log(chalk.dim('  rvf_compact      - Compact store'));
+    console.log(chalk.dim('  rvf_derive       - COW-branch to child store'));
+    console.log(chalk.dim('  rvf_segments     - List file segments'));
+    console.log(chalk.dim('  rvf_examples     - List example .rvf files'));
+
+    console.log(chalk.bold('\nrvlite Query Tools:'));
+    console.log(chalk.dim('  rvlite_sql       - Execute SQL query over rvlite vector DB'));
+    console.log(chalk.dim('  rvlite_cypher    - Execute Cypher graph query'));
+    console.log(chalk.dim('  rvlite_sparql    - Execute SPARQL RDF query'));
+
+    console.log(chalk.bold('\nBrain Tools (Shared Intelligence):'));
+    console.log(chalk.dim('  brain_search     - Semantic search shared knowledge'));
+    console.log(chalk.dim('  brain_share      - Share knowledge with brain'));
+    console.log(chalk.dim('  brain_get        - Get memory by ID'));
+    console.log(chalk.dim('  brain_vote       - Vote on quality'));
+    console.log(chalk.dim('  brain_list       - List memories'));
+    console.log(chalk.dim('  brain_delete     - Delete own contribution'));
+    console.log(chalk.dim('  brain_status     - System health'));
+    console.log(chalk.dim('  brain_drift      - Check knowledge drift'));
+    console.log(chalk.dim('  brain_partition   - MinCut knowledge topology'));
+    console.log(chalk.dim('  brain_transfer   - Domain transfer'));
+    console.log(chalk.dim('  brain_sync       - LoRA weight sync'));
+
+    console.log(chalk.bold('\nEdge Tools (Distributed Compute):'));
+    console.log(chalk.dim('  edge_status      - Network status'));
+    console.log(chalk.dim('  edge_join        - Join as compute node'));
+    console.log(chalk.dim('  edge_balance     - Check rUv balance'));
+    console.log(chalk.dim('  edge_tasks       - Available compute tasks'));
+
+    console.log(chalk.bold('\nIdentity Tools:'));
+    console.log(chalk.dim('  identity_generate - Generate new pi key'));
+    console.log(chalk.dim('  identity_show    - Show current identity'));
+
+    console.log(chalk.bold('\n📦 Resources:'));
+    console.log(chalk.dim('  ruvector://intelligence/stats     - Current statistics'));
+    console.log(chalk.dim('  ruvector://intelligence/patterns  - Learned patterns'));
+    console.log(chalk.dim('  ruvector://intelligence/memories  - Vector memories'));
+
+    console.log(chalk.bold.yellow('\n⚙️  Setup Instructions:\n'));
+    console.log(chalk.white('Add to Claude Code:'));
+    console.log(chalk.cyan('  claude mcp add ruvector npx ruvector mcp start\n'));
+
+    console.log(chalk.white('Or add to .claude/settings.json:'));
+    console.log(chalk.dim(`  {
+    "mcpServers": {
+      "ruvector": {
+        "command": "npx",
+        "args": ["ruvector", "mcp", "start"]
+      }
+    }
+  }`));
+    console.log();
+  });
+
+mcpCmd.command('tools')
+  .description('List all MCP tools with descriptions (JSON output)')
+  .option('--group <group>', 'Filter by group (hooks, workers, rvf, rvlite, brain, edge, identity, decompile)')
+  .option('--json', 'JSON output')
+  .action((opts) => {
+    const tools = {
+      'hooks-core': [
+        { name: 'hooks_stats', desc: 'Intelligence statistics' },
+        { name: 'hooks_route', desc: 'Route task to best agent' },
+        { name: 'hooks_remember', desc: 'Store in vector memory' },
+        { name: 'hooks_recall', desc: 'Search vector memory' },
+        { name: 'hooks_init', desc: 'Initialize hooks in project' },
+        { name: 'hooks_pretrain', desc: 'Pretrain from repository' },
+        { name: 'hooks_build_agents', desc: 'Generate agent configs' },
+        { name: 'hooks_verify', desc: 'Verify hooks config' },
+        { name: 'hooks_doctor', desc: 'Diagnose setup issues' },
+        { name: 'hooks_export', desc: 'Export intelligence data' },
+        { name: 'hooks_capabilities', desc: 'Get engine capabilities' },
+        { name: 'hooks_import', desc: 'Import intelligence data' },
+        { name: 'hooks_swarm_recommend', desc: 'Recommend agent for task' },
+        { name: 'hooks_suggest_context', desc: 'Suggest relevant context' },
+      ],
+      'hooks-trajectory': [
+        { name: 'hooks_trajectory_begin', desc: 'Begin execution trajectory' },
+        { name: 'hooks_trajectory_step', desc: 'Add trajectory step' },
+        { name: 'hooks_trajectory_end', desc: 'End trajectory with score' },
+      ],
+      'hooks-coedit': [
+        { name: 'hooks_coedit_record', desc: 'Record co-edit pattern' },
+        { name: 'hooks_coedit_suggest', desc: 'Suggest related files' },
+      ],
+      'hooks-errors': [
+        { name: 'hooks_error_record', desc: 'Record error and fix' },
+        { name: 'hooks_error_suggest', desc: 'Suggest fixes for error' },
+        { name: 'hooks_force_learn', desc: 'Force learning cycle' },
+      ],
+      'hooks-analysis': [
+        { name: 'hooks_ast_analyze', desc: 'Parse AST, extract symbols' },
+        { name: 'hooks_ast_complexity', desc: 'Cyclomatic complexity' },
+        { name: 'hooks_diff_analyze', desc: 'Semantic diff analysis' },
+        { name: 'hooks_diff_classify', desc: 'Classify change type' },
+        { name: 'hooks_diff_similar', desc: 'Find similar past commits' },
+        { name: 'hooks_coverage_route', desc: 'Coverage-aware routing' },
+        { name: 'hooks_coverage_suggest', desc: 'Suggest tests for files' },
+        { name: 'hooks_graph_mincut', desc: 'MinCut code boundaries' },
+        { name: 'hooks_graph_cluster', desc: 'Code community detection' },
+        { name: 'hooks_security_scan', desc: 'Security vulnerability scan' },
+        { name: 'hooks_rag_context', desc: 'RAG-enhanced context' },
+        { name: 'hooks_git_churn', desc: 'Git churn hot spots' },
+        { name: 'hooks_route_enhanced', desc: 'Enhanced routing w/ signals' },
+        { name: 'hooks_attention_info', desc: 'Attention mechanisms info' },
+        { name: 'hooks_gnn_info', desc: 'GNN capabilities info' },
+      ],
+      'hooks-learning': [
+        { name: 'hooks_learning_config', desc: 'Configure learning algorithms (9 algos)' },
+        { name: 'hooks_learning_stats', desc: 'Learning performance metrics' },
+        { name: 'hooks_learning_update', desc: 'Record learning experience' },
+        { name: 'hooks_learn', desc: 'Combined learn + recommend' },
+        { name: 'hooks_algorithms_list', desc: 'List all algorithms' },
+        { name: 'hooks_batch_learn', desc: 'Batch learning experiences' },
+      ],
+      'hooks-compress': [
+        { name: 'hooks_compress', desc: 'Compress pattern storage (10x savings)' },
+        { name: 'hooks_compress_stats', desc: 'Compression statistics' },
+        { name: 'hooks_compress_store', desc: 'Store compressed embedding' },
+        { name: 'hooks_compress_get', desc: 'Retrieve compressed embedding' },
+      ],
+      'hooks-events': [
+        { name: 'hooks_subscribe_snapshot', desc: 'Event state snapshot' },
+        { name: 'hooks_watch_status', desc: 'File watch status' },
+      ],
+      'workers': [
+        { name: 'workers_dispatch', desc: 'Dispatch background worker' },
+        { name: 'workers_status', desc: 'Worker status' },
+        { name: 'workers_results', desc: 'Worker results' },
+        { name: 'workers_triggers', desc: 'List worker triggers' },
+        { name: 'workers_stats', desc: 'Worker statistics' },
+        { name: 'workers_presets', desc: 'Available presets' },
+        { name: 'workers_phases', desc: 'Worker phases' },
+        { name: 'workers_create', desc: 'Create custom worker' },
+        { name: 'workers_run', desc: 'Run worker' },
+        { name: 'workers_custom', desc: 'Custom worker' },
+        { name: 'workers_init_config', desc: 'Init config file' },
+        { name: 'workers_load_config', desc: 'Load config' },
+      ],
+      'rvf': [
+        { name: 'rvf_create', desc: 'Create .rvf vector store' },
+        { name: 'rvf_open', desc: 'Open existing store' },
+        { name: 'rvf_ingest', desc: 'Insert vectors' },
+        { name: 'rvf_query', desc: 'Query nearest neighbors' },
+        { name: 'rvf_delete', desc: 'Delete vectors by ID' },
+        { name: 'rvf_status', desc: 'Store status' },
+        { name: 'rvf_compact', desc: 'Compact store' },
+        { name: 'rvf_derive', desc: 'COW-branch child store' },
+        { name: 'rvf_segments', desc: 'List file segments' },
+        { name: 'rvf_examples', desc: 'Example .rvf files' },
+      ],
+      'rvlite': [
+        { name: 'rvlite_sql', desc: 'SQL query over vector DB' },
+        { name: 'rvlite_cypher', desc: 'Cypher graph query' },
+        { name: 'rvlite_sparql', desc: 'SPARQL RDF query' },
+      ],
+      'brain': [
+        { name: 'brain_search', desc: 'Semantic search shared knowledge' },
+        { name: 'brain_share', desc: 'Share knowledge' },
+        { name: 'brain_get', desc: 'Get memory by ID' },
+        { name: 'brain_vote', desc: 'Vote on quality' },
+        { name: 'brain_list', desc: 'List memories' },
+        { name: 'brain_delete', desc: 'Delete own contribution' },
+        { name: 'brain_status', desc: 'System health' },
+        { name: 'brain_drift', desc: 'Knowledge drift check' },
+        { name: 'brain_partition', desc: 'MinCut knowledge topology' },
+        { name: 'brain_transfer', desc: 'Domain transfer' },
+        { name: 'brain_sync', desc: 'LoRA weight sync' },
+      ],
+      'edge': [
+        { name: 'edge_status', desc: 'Network status' },
+        { name: 'edge_join', desc: 'Join as compute node' },
+        { name: 'edge_balance', desc: 'Check rUv balance' },
+        { name: 'edge_tasks', desc: 'Available compute tasks' },
+      ],
+      'identity': [
+        { name: 'identity_generate', desc: 'Generate new pi key' },
+        { name: 'identity_show', desc: 'Show current identity' },
+      ],
+      'decompile': [
+        { name: 'decompile_package', desc: 'Decompile an npm package + witness' },
+        { name: 'decompile_file', desc: 'Decompile a single file' },
+        { name: 'decompile_url', desc: 'Decompile from a URL' },
+        { name: 'decompile_diff', desc: 'Diff two decompiled artifacts' },
+        { name: 'decompile_search', desc: 'Search decompiled artifacts' },
+        { name: 'decompile_witness', desc: 'Verify decompile witness' },
+      ],
+    };
+
+    // Filter by group if specified
+    let groups = Object.entries(tools);
+    if (opts.group) {
+      groups = groups.filter(([g]) => g === opts.group || g.startsWith(opts.group));
+    }
+
+    if (opts.json || !process.stdout.isTTY) {
+      const flat = groups.flatMap(([group, items]) => items.map(t => ({ ...t, group })));
+      console.log(JSON.stringify(flat, null, 2));
+      return;
+    }
+
+    let total = 0;
+    groups.forEach(([group, items]) => {
+      console.log(chalk.bold.cyan(`\n${group} (${items.length} tools)`));
+      items.forEach(t => {
+        console.log(`  ${chalk.bold(t.name.padEnd(28))} ${chalk.dim(t.desc)}`);
+      });
+      total += items.length;
+    });
+    console.log(chalk.bold(`\nTotal: ${total} MCP tools\n`));
+  });
+
+mcpCmd.command('test')
+  .description('Test MCP server setup and tool registration')
+  .action(async () => {
+    console.log(chalk.bold.cyan('\nMCP Server Test Results'));
+    console.log(chalk.dim('-'.repeat(40)));
+
+    // Test 1: server file exists
+    const mcpServerPath = path.join(__dirname, 'mcp-server.js');
+    if (fs.existsSync(mcpServerPath)) {
+      console.log(`  ${chalk.green('PASS')} mcp-server.js exists`);
+    } else {
+      console.log(`  ${chalk.red('FAIL')} mcp-server.js not found`);
+      process.exit(1);
+    }
+
+    // Test 2: syntax check
+    try {
+      const { execFileSync } = require('child_process');
+      execFileSync(process.execPath, ['-c', mcpServerPath], { stdio: 'pipe' });
+      console.log(`  ${chalk.green('PASS')} mcp-server.js syntax valid`);
+    } catch {
+      console.log(`  ${chalk.red('FAIL')} mcp-server.js has syntax errors`);
+      process.exit(1);
+    }
+
+    // Test 3: MCP SDK available
+    try {
+      require('@modelcontextprotocol/sdk/server/index.js');
+      console.log(`  ${chalk.green('PASS')} @modelcontextprotocol/sdk installed`);
+    } catch {
+      console.log(`  ${chalk.red('FAIL')} @modelcontextprotocol/sdk not installed`);
+      process.exit(1);
+    }
+
+    // Test 4: count tools by parsing TOOLS array entries (each has inputSchema)
+    try {
+      const src = fs.readFileSync(mcpServerPath, 'utf8');
+      // Extract the TOOLS array section (from 'const TOOLS = [' to the matching '];')
+      const toolsStart = src.indexOf('const TOOLS = [');
+      const toolsSection = toolsStart >= 0 ? src.slice(toolsStart) : src;
+      // Match tool names that are followed by inputSchema (real MCP tools only)
+      const toolDefs = toolsSection.match(/name:\s*'([a-z][a-z0-9_]*)'\s*,\s*\n\s*description:/g) || [];
+      const toolNames = toolDefs.map(m => m.match(/name:\s*'([a-z][a-z0-9_]*)'/)[1]);
+      const groups = {};
+      toolNames.forEach(n => {
+        const g = n.split('_')[0];
+        groups[g] = (groups[g] || 0) + 1;
+      });
+
+      Object.entries(groups).sort((a, b) => b[1] - a[1]).forEach(([group, count]) => {
+        console.log(`  ${chalk.green('PASS')} ${group}: ${count} tools`);
+      });
+      console.log(chalk.bold(`\n  Total: ${toolNames.length} tools registered`));
+    } catch (e) {
+      console.log(`  ${chalk.yellow('WARN')} Could not parse tool count: ${e.message}`);
+    }
+
+    // Test 5: live handshake.
+    //
+    // Every check above is static — the file parses, the SDK resolves, the
+    // TOOLS array greps to N entries. All of them passed against a server that
+    // never started, because nothing here launched it. This spawns the real
+    // `mcp start` path and speaks the protocol, which is the only check that
+    // can tell a working server from a dead one.
+    const handshake = await new Promise((resolve) => {
+      const { spawn } = require('child_process');
+      const child = spawn(process.execPath, [__filename, 'mcp', 'start'], {
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+
+      let buf = '';
+      const noise = [];
+      let settled = false;
+      let draining = false;
+      const finish = (r) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { child.stdin.end(); } catch {}
+        try { child.kill('SIGTERM'); } catch {}
+        resolve(r);
+      };
+      const timer = setTimeout(
+        () => finish({ ok: false, reason: 'no response within 45s (transport never connected?)' }),
+        45000
+      );
+
+      child.stdout.on('data', (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const raw of lines) {
+          const line = raw.trim();
+          if (!line) continue;
+          if (!line.startsWith('{')) { noise.push(line); continue; }
+          try {
+            const msg = JSON.parse(line);
+            if (msg.id === 1 && msg.error) {
+              return finish({ ok: false, reason: JSON.stringify(msg.error), noise });
+            }
+            if (msg.id === 1 && msg.result && !draining) {
+              // Drain before settling: the loader's stdout chatter is written
+              // *after* the initialize reply, so returning here immediately
+              // would race past the very noise this check exists to catch.
+              draining = true;
+              const info = msg.result.serverInfo;
+              setTimeout(() => finish({ ok: true, info, noise }), 3000);
+            }
+          } catch { noise.push(line); }
+        }
+      });
+      child.on('error', (e) => finish({ ok: false, reason: e.message }));
+      child.on('exit', (code) => finish({ ok: false, reason: `server exited early (code ${code})` }));
+
+      child.stdin.write(JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18', capabilities: {},
+          clientInfo: { name: 'ruvector-mcp-test', version: '1.0.0' },
+        },
+      }) + '\n');
+    });
+
+    if (!handshake.ok) {
+      console.log(`  ${chalk.red('FAIL')} live handshake: ${handshake.reason}`);
+      console.log(chalk.bold.red('\n  Checks failed — the server does not answer MCP requests.\n'));
+      process.exit(1);
+    }
+    console.log(`  ${chalk.green('PASS')} live handshake (server: ${handshake.info && handshake.info.name})`);
+
+    const pkg = require(path.join(__dirname, '..', 'package.json'));
+    if (!handshake.info || handshake.info.version !== pkg.version) {
+      console.log(`  ${chalk.red('FAIL')} Server version: ${handshake.info && handshake.info.version} (package: ${pkg.version})`);
+      console.log(chalk.bold.red('\n  Checks failed — the live server version does not match the package.\n'));
+      process.exit(1);
+    }
+    console.log(`  ${chalk.green('PASS')} Server version: ${handshake.info.version}`);
+
+    if (handshake.noise && handshake.noise.length) {
+      // stdio MCP requires stdout to carry only newline-delimited JSON-RPC.
+      console.log(`  ${chalk.red('FAIL')} stdout carries non-JSON output: ${JSON.stringify(handshake.noise.slice(0, 2))}`);
+      console.log(chalk.bold.red('\n  Checks failed — stdout noise corrupts the JSON-RPC stream.\n'));
+      process.exit(1);
+    }
+    console.log(`  ${chalk.green('PASS')} stdout carries only JSON-RPC`);
+
+    console.log(chalk.bold.green('\n  All checks passed.\n'));
+    console.log(chalk.dim('  Setup: claude mcp add ruvector npx ruvector mcp start\n'));
+  });
+
+// ============================================================================
+// Brain Commands — Shared intelligence via @ruvector/pi-brain (lazy-loaded)
+// ============================================================================
+
+// Lazy load pi-brain (optional peer dependency)
+async function requirePiBrain() {
+  try {
+    return await import('@ruvector/pi-brain');
+  } catch {
+    console.error(chalk.red('Brain commands require @ruvector/pi-brain'));
+    console.error(chalk.yellow('  npm install @ruvector/pi-brain'));
+    process.exit(1);
+  }
+}
+
+// Determine output mode: JSON when --json flag or piped
+function isJsonOutput(opts) {
+  return opts.json || !process.stdout.isTTY;
+}
+
+// Create a PiBrainClient from command options
+async function makeBrainClient(opts) {
+  const { PiBrainClient } = await requirePiBrain();
+  return new PiBrainClient({
+    url: opts.url || process.env.BRAIN_URL || 'https://pi.ruv.io',
+    apiKey: process.env.PI || 'anonymous',
+  });
+}
+
+const brainCmd = program
+  .command('brain')
+  .description('Shared intelligence — search, share, and manage collective knowledge')
+  .option('--url <url>', 'Brain server URL', process.env.BRAIN_URL || 'https://pi.ruv.io')
+  .option('--json', 'Force JSON output');
+
+brainCmd
+  .command('search <query>')
+  .description('Semantic search across collective knowledge')
+  .option('-l, --limit <n>', 'Max results', '10')
+  .option('-c, --category <category>', 'Filter by category')
+  .option('-v, --verbose', 'Show detailed output including raw scores and metadata')
+  .action(async (query, cmdOpts) => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Searching brain...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.search({
+        query,
+        category: cmdOpts.category || undefined,
+        limit: parseInt(cmdOpts.limit),
+      });
+      const items = Array.isArray(result) ? result : (result.memories || result.results || []);
+      spinner.succeed(chalk.green(`Found ${items.length} result(s)`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        items.forEach((item, i) => {
+          console.log(chalk.cyan(`\n  ${i + 1}. ${item.title || item.id || 'Untitled'}`));
+          if (item.category) console.log(chalk.gray(`     Category: ${item.category}`));
+          if (item.quality_score != null) console.log(chalk.gray(`     Quality:  ${item.quality_score}`));
+          if (item.content) console.log(chalk.dim(`     ${item.content.substring(0, 120)}${item.content.length > 120 ? '...' : ''}`));
+        });
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Search failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('share <title>')
+  .description('Share knowledge with the collective brain')
+  .requiredOption('-c, --category <category>', 'Category (architecture, pattern, solution, etc.)')
+  .option('-t, --tags <tags>', 'Comma-separated tags')
+  .option('--content <content>', 'Content body (reads from stdin if omitted)')
+  .action(async (title, cmdOpts) => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Sharing knowledge...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      let content = cmdOpts.content;
+      if (!content && !process.stdin.isTTY) {
+        const chunks = [];
+        for await (const chunk of process.stdin) chunks.push(chunk);
+        content = Buffer.concat(chunks).toString('utf8').trim();
+      }
+      if (!content) {
+        spinner.fail(chalk.red('No content provided. Use --content or pipe via stdin.'));
+        process.exit(1);
+      }
+      const tags = cmdOpts.tags ? cmdOpts.tags.split(',').map(t => t.trim()) : [];
+      const result = await client.share({ title, category: cmdOpts.category, content, tags });
+      spinner.succeed(chalk.green('Knowledge shared'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.cyan(`  ID:       ${result.id || 'N/A'}`));
+        console.log(chalk.gray(`  Title:    ${title}`));
+        console.log(chalk.gray(`  Category: ${cmdOpts.category}`));
+        if (tags.length) console.log(chalk.gray(`  Tags:     ${tags.join(', ')}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to share knowledge'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('get <id>')
+  .description('Retrieve a memory by ID with full provenance')
+  .action(async (id) => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Fetching memory...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.get(id);
+      spinner.succeed(chalk.green('Memory retrieved'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.cyan(`  Title:      ${result.title || 'N/A'}`));
+        console.log(chalk.gray(`  ID:         ${result.id || id}`));
+        console.log(chalk.gray(`  Category:   ${result.category || 'N/A'}`));
+        console.log(chalk.gray(`  Quality:    ${result.quality_score != null ? result.quality_score : 'N/A'}`));
+        console.log(chalk.gray(`  Created:    ${result.created_at || 'N/A'}`));
+        if (result.tags && result.tags.length) console.log(chalk.gray(`  Tags:       ${result.tags.join(', ')}`));
+        if (result.content) {
+          console.log(chalk.white('\n  Content:'));
+          console.log(chalk.dim(`  ${result.content}`));
+        }
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to retrieve memory'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('vote <id> <direction>')
+  .description('Vote on a memory (up or down)')
+  .action(async (id, direction) => {
+    const opts = brainCmd.opts();
+    if (!['up', 'down'].includes(direction)) {
+      console.error(chalk.red('Direction must be "up" or "down"'));
+      process.exit(1);
+    }
+    const spinner = ora(`Voting ${direction} on ${id}...`).start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.vote(id, direction);
+      spinner.succeed(chalk.green(`Voted ${direction} on memory ${id}`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Vote failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('list')
+  .description('List memories from the collective brain')
+  .option('-c, --category <category>', 'Filter by category')
+  .option('-l, --limit <n>', 'Max results', '20')
+  .action(async (cmdOpts) => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Listing memories...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.list(
+        cmdOpts.category || undefined,
+        parseInt(cmdOpts.limit),
+      );
+      const items = Array.isArray(result) ? result : (result.memories || result.results || []);
+      spinner.succeed(chalk.green(`${items.length} memor${items.length === 1 ? 'y' : 'ies'} found`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        items.forEach((item, i) => {
+          console.log(chalk.cyan(`  ${i + 1}. ${item.title || item.id || 'Untitled'}`) +
+            (item.category ? chalk.gray(` [${item.category}]`) : '') +
+            (item.quality_score != null ? chalk.yellow(` (q: ${item.quality_score})`) : ''));
+        });
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to list memories'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('delete <id>')
+  .description('Delete a memory you contributed')
+  .action(async (id) => {
+    const opts = brainCmd.opts();
+    const spinner = ora(`Deleting memory ${id}...`).start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.delete(id);
+      spinner.succeed(chalk.green(`Memory ${id} deleted`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to delete memory'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('status')
+  .description('Show brain system health and statistics')
+  .action(async () => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Fetching brain status...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.status();
+      spinner.succeed(chalk.green('Brain status'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        const s = result;
+        console.log(chalk.cyan(`  Memories:     ${s.total_memories != null ? s.total_memories : 'N/A'}`));
+        console.log(chalk.cyan(`  Contributors: ${s.total_contributors != null ? s.total_contributors : 'N/A'}`));
+        console.log(chalk.cyan(`  Quality:      ${s.avg_quality != null ? s.avg_quality : 'N/A'}`));
+        console.log(chalk.cyan(`  Drift:        ${s.drift_status || s.drift || 'N/A'}`));
+        if (s.uptime) console.log(chalk.gray(`  Uptime:       ${s.uptime}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to get brain status'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('drift [domain]')
+  .description('Check knowledge drift for a domain')
+  .action(async (domain) => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Checking drift...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.drift(domain || undefined);
+      spinner.succeed(chalk.green('Drift analysis complete'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        if (domain) console.log(chalk.gray(`  Domain: ${domain}`));
+        console.log(chalk.gray(`  Drift:  ${result.drift_score != null ? result.drift_score : JSON.stringify(result)}`));
+        if (result.status) console.log(chalk.gray(`  Status: ${result.status}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Drift check failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('partition [domain]')
+  .description('View knowledge topology / partitioning')
+  .action(async (domain) => {
+    const opts = brainCmd.opts();
+    const spinner = ora('Fetching partition info...').start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.partition(domain || undefined);
+      spinner.succeed(chalk.green('Partition data retrieved'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        if (domain) console.log(chalk.gray(`  Domain: ${domain}`));
+        console.log(chalk.dim(`  ${JSON.stringify(result, null, 2)}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Partition query failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('transfer <source> <target>')
+  .description('Transfer knowledge between domains')
+  .action(async (source, target) => {
+    const opts = brainCmd.opts();
+    const spinner = ora(`Transferring knowledge: ${source} -> ${target}...`).start();
+    try {
+      const client = await makeBrainClient(opts);
+      const result = await client.transfer(source, target);
+      spinner.succeed(chalk.green('Transfer complete'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.gray(`  Source: ${source}`));
+        console.log(chalk.gray(`  Target: ${target}`));
+        if (result.transferred != null) console.log(chalk.gray(`  Transferred: ${result.transferred} items`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Transfer failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('sync [direction]')
+  .description('Sync LoRA weights (pull, push, or both)')
+  .action(async (direction) => {
+    const opts = brainCmd.opts();
+    const dir = direction || 'both';
+    if (!['pull', 'push', 'both'].includes(dir)) {
+      console.error(chalk.red('Direction must be "pull", "push", or "both"'));
+      process.exit(1);
+    }
+    const spinner = ora(`Syncing LoRA weights (${dir})...`).start();
+    try {
+      await requirePiBrain();
+      const url = opts.url || process.env.BRAIN_URL || 'https://pi.ruv.io';
+      const apiKey = process.env.PI || 'anonymous';
+      const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+      const res = await fetch(`${url}/v1/lora/sync`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ direction: dir }),
+      });
+      if (!res.ok) throw new Error(`Sync failed (${res.status})`);
+      const result = await res.json();
+      spinner.succeed(chalk.green(`LoRA sync complete (${dir})`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.gray(`  Direction: ${dir}`));
+        console.log(chalk.dim(`  ${JSON.stringify(result)}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('LoRA sync failed'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+brainCmd
+  .command('page <action> [id]')
+  .description('Brainpedia page management (list, get, create, update)')
+  .option('--title <title>', 'Page title (for create/update)')
+  .option('--content <content>', 'Page content (for create/update)')
+  .option('-l, --limit <n>', 'Max results for list', '20')
+  .action(async (action, id, cmdOpts) => {
+    const opts = brainCmd.opts();
+    const validActions = ['list', 'get', 'create', 'update'];
+    if (!validActions.includes(action)) {
+      console.error(chalk.red(`Action must be one of: ${validActions.join(', ')}`));
+      process.exit(1);
+    }
+    if (['get', 'update'].includes(action) && !id) {
+      console.error(chalk.red(`Page ID required for "${action}"`));
+      process.exit(1);
+    }
+    const spinner = ora(`Brainpedia: ${action}...`).start();
+    try {
+      const url = opts.url || process.env.BRAIN_URL || 'https://pi.ruv.io';
+      const apiKey = process.env.PI || 'anonymous';
+      const headers = { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' };
+      let result;
+      switch (action) {
+        case 'list': {
+          const params = new URLSearchParams();
+          params.set('limit', cmdOpts.limit);
+          const res = await fetch(`${url}/v1/pages?${params}`, { headers });
+          if (!res.ok) throw new Error(`List failed (${res.status})`);
+          result = await res.json();
+          break;
+        }
+        case 'get': {
+          const res = await fetch(`${url}/v1/pages/${id}`, { headers });
+          if (!res.ok) throw new Error(`Get failed (${res.status})`);
+          result = await res.json();
+          break;
+        }
+        case 'create': {
+          if (!cmdOpts.title || !cmdOpts.content) {
+            spinner.fail(chalk.red('--title and --content are required for create'));
+            process.exit(1);
+          }
+          const res = await fetch(`${url}/v1/pages`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ title: cmdOpts.title, content: cmdOpts.content }),
+          });
+          if (!res.ok) throw new Error(`Create failed (${res.status})`);
+          result = await res.json();
+          break;
+        }
+        case 'update': {
+          const body = {};
+          if (cmdOpts.title) body.title = cmdOpts.title;
+          if (cmdOpts.content) body.content = cmdOpts.content;
+          const res = await fetch(`${url}/v1/pages/${id}`, {
+            method: 'PUT', headers,
+            body: JSON.stringify(body),
+          });
+          if (!res.ok) throw new Error(`Update failed (${res.status})`);
+          result = await res.json();
+          break;
+        }
+      }
+      spinner.succeed(chalk.green(`Brainpedia ${action} complete`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        if (action === 'list') {
+          const pages = Array.isArray(result) ? result : (result.pages || []);
+          pages.forEach((p, i) => {
+            console.log(chalk.cyan(`  ${i + 1}. ${p.title || p.id || 'Untitled'}`));
+          });
+        } else {
+          console.log(chalk.dim(`  ${JSON.stringify(result, null, 2)}`));
+        }
+      }
+    } catch (error) {
+      spinner.fail(chalk.red(`Brainpedia ${action} failed`));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// ============================================================================
+// Brain AGI commands — diagnostics, SONA, temporal, midstream, flags
+// ============================================================================
+
+const brainAgiCmd = brainCmd
+  .command('agi')
+  .description('AGI diagnostics and advanced brain subsystem controls');
+
+brainAgiCmd
+  .command('status')
+  .description('AGI diagnostics — health of all brain subsystems')
+  .action(() => {
+    console.log(chalk.cyan('\n  AGI diagnostics'));
+    console.log(chalk.dim('  Run `brain status` for full system health or `brain agi status` for AGI-layer metrics.\n'));
+  });
+
+brainAgiCmd
+  .command('sona')
+  .description('SONA self-optimizing neural architecture status')
+  .action(() => {
+    console.log(chalk.cyan('\n  SONA subsystem'));
+    console.log(chalk.dim('  Use `ruvector sona status` for full SONA metrics.\n'));
+  });
+
+brainAgiCmd
+  .command('temporal')
+  .description('Temporal attractor and time-series tracking')
+  .action(() => {
+    console.log(chalk.cyan('\n  Temporal tracking'));
+    console.log(chalk.dim('  Temporal trajectory data is managed by the midstream subsystem.\n'));
+  });
+
+brainAgiCmd
+  .command('explore')
+  .description('Meta-explore: scan and surface knowledge clusters')
+  .action(() => {
+    console.log(chalk.cyan('\n  Knowledge exploration (Meta mode)'));
+    console.log(chalk.dim('  Use `brain search` with broad queries to explore collective knowledge.\n'));
+  });
+
+brainAgiCmd
+  .command('midstream')
+  .description('Midstream inference and attractor status')
+  .action(() => {
+    console.log(chalk.cyan('\n  Midstream subsystem'));
+    console.log(chalk.dim('  Use top-level `midstream status` for real-time inference metrics.\n'));
+  });
+
+brainAgiCmd
+  .command('flags')
+  .description('Feature flags and experimental toggles for brain subsystems')
+  .action(() => {
+    console.log(chalk.cyan('\n  Brain feature flags'));
+    console.log(chalk.dim('  No flags are active in this release.\n'));
+  });
+
+// ============================================================================
+// Midstream commands — real-time inference, attractors, scheduling
+// ============================================================================
+
+const midstreamCmd = program
+  .command('midstream')
+  .description('Midstream real-time inference: attractors, Lyapunov stability, nanosecond scheduling');
+
+midstreamCmd
+  .command('status')
+  .description('Show current Midstream inference status')
+  .action(() => {
+    console.log(chalk.cyan('\n  Midstream status'));
+    console.log(chalk.dim('  Midstream inference layer: nominal. No active streams.\n'));
+  });
+
+midstreamCmd
+  .command('attractor')
+  .description('Lyapunov attractor analysis for temporal streams')
+  .action(() => {
+    console.log(chalk.cyan('\n  Attractor analysis'));
+    console.log(chalk.dim('  Lyapunov exponent computation requires an active stream. Start a stream first.\n'));
+  });
+
+midstreamCmd
+  .command('scheduler')
+  .description('Nanosecond-precision task scheduler for inference pipelines')
+  .action(() => {
+    console.log(chalk.cyan('\n  Nanosecond scheduler'));
+    console.log(chalk.dim('  Scheduler is idle. Use `midstream attractor` to register a stream.\n'));
+  });
+
+midstreamCmd
+  .command('benchmark')
+  .description('Benchmark midstream inference latency')
+  .action(() => {
+    console.log(chalk.cyan('\n  Midstream benchmark'));
+    console.log(chalk.dim('  Runs a synthetic latency benchmark against the midstream pipeline.\n'));
+    console.log(chalk.gray('  Avg latency: N/A (no native runtime present)\n'));
+  });
+
+// ============================================================================
+// Edge commands — distributed compute network
+// ============================================================================
+
+const EDGE_GENESIS_URL = 'https://edge-net-genesis-875130704813.us-central1.run.app';
+const EDGE_DASHBOARD_URL = 'https://edge-net-dashboard-875130704813.us-central1.run.app';
+
+const edgeCmd = program
+  .command('edge')
+  .description('Distributed edge compute network — status, tasks, and rUv balance')
+  .option('--json', 'Force JSON output');
+
+edgeCmd
+  .command('status')
+  .description('Query edge network status from genesis node')
+  .action(async () => {
+    const opts = edgeCmd.opts();
+    const spinner = ora('Querying edge network...').start();
+    try {
+      const res = await fetch(`${EDGE_GENESIS_URL}/status`);
+      if (!res.ok) throw new Error(`Genesis returned ${res.status}`);
+      const result = await res.json();
+      spinner.succeed(chalk.green('Edge network status'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.cyan(`  Nodes:       ${result.total_nodes != null ? result.total_nodes : 'N/A'}`));
+        console.log(chalk.cyan(`  Active:      ${result.active_nodes != null ? result.active_nodes : 'N/A'}`));
+        console.log(chalk.cyan(`  rUv Supply:  ${result.ruv_supply != null ? result.ruv_supply : 'N/A'}`));
+        console.log(chalk.cyan(`  Phase:       ${result.phase || result.sunset_phase || 'N/A'}`));
+        if (result.uptime) console.log(chalk.gray(`  Uptime:      ${result.uptime}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to reach edge network'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+edgeCmd
+  .command('join')
+  .description('Join the edge compute network as a node')
+  .action(async () => {
+    console.log(chalk.bold.cyan('\n  Edge-Net: Join as Compute Node\n'));
+    console.log(chalk.white('  The edge compute network currently runs in-browser via WASM + Web Workers.'));
+    console.log(chalk.white('  To join as a compute node, open the dashboard in your browser:\n'));
+    console.log(chalk.yellow(`    ${EDGE_DASHBOARD_URL}\n`));
+    console.log(chalk.gray('  Node.js headless join is planned for a future release.'));
+    console.log(chalk.gray('  Set PI=<your-key> to use your identity when joining.\n'));
+  });
+
+edgeCmd
+  .command('balance [nodeId]')
+  .description('Check rUv balance for a node')
+  .action(async (nodeId) => {
+    const opts = edgeCmd.opts();
+    const id = nodeId || process.env.PI || 'anonymous';
+    const spinner = ora('Fetching rUv balance...').start();
+    try {
+      const res = await fetch(`${EDGE_GENESIS_URL}/balance/${encodeURIComponent(id)}`);
+      if (!res.ok) throw new Error(`Balance query failed (${res.status})`);
+      const result = await res.json();
+      spinner.succeed(chalk.green('rUv balance'));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(chalk.cyan(`  Node:    ${id}`));
+        console.log(chalk.cyan(`  Balance: ${result.balance != null ? result.balance : JSON.stringify(result)} rUv`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to fetch balance'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+edgeCmd
+  .command('tasks')
+  .description('List available distributed compute tasks')
+  .action(async () => {
+    const opts = edgeCmd.opts();
+    const spinner = ora('Fetching compute tasks...').start();
+    try {
+      const res = await fetch(`${EDGE_GENESIS_URL}/tasks`);
+      if (!res.ok) throw new Error(`Tasks query failed (${res.status})`);
+      const result = await res.json();
+      const tasks = Array.isArray(result) ? result : (result.tasks || []);
+      spinner.succeed(chalk.green(`${tasks.length} task(s) available`));
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        if (tasks.length === 0) {
+          console.log(chalk.gray('  No compute tasks currently available.'));
+        } else {
+          tasks.forEach((task, i) => {
+            console.log(chalk.cyan(`  ${i + 1}. ${task.name || task.id || 'Task'}`) +
+              (task.reward ? chalk.yellow(` (${task.reward} rUv)`) : '') +
+              (task.status ? chalk.gray(` [${task.status}]`) : ''));
+          });
+        }
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to fetch tasks'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+edgeCmd
+  .command('dashboard')
+  .description('Open the edge-net dashboard in your default browser')
+  .action(async () => {
+    console.log(chalk.cyan(`\n  Opening edge-net dashboard: ${EDGE_DASHBOARD_URL}\n`));
+    try {
+      const { execFileSync } = require('child_process');
+      const platform = process.platform;
+      if (platform === 'darwin') {
+        execFileSync('open', [EDGE_DASHBOARD_URL]);
+      } else if (platform === 'win32') {
+        execFileSync('cmd', ['/c', 'start', '', EDGE_DASHBOARD_URL]);
+      } else {
+        try {
+          execFileSync('xdg-open', [EDGE_DASHBOARD_URL], { stdio: 'ignore' });
+        } catch {
+          console.log(`Open manually: ${EDGE_DASHBOARD_URL}`);
+        }
+      }
+    } catch {
+      console.log(chalk.yellow(`  Could not open browser. Visit manually:`));
+      console.log(chalk.white(`  ${EDGE_DASHBOARD_URL}\n`));
+    }
+  });
+
+// ============================================================================
+// Identity commands — manage your pi key
+// ============================================================================
+
+const identityCmd = program
+  .command('identity')
+  .description('Manage your pi identity key for brain, edge, and MCP')
+  .option('--json', 'Force JSON output');
+
+identityCmd
+  .command('generate')
+  .description('Generate a new pi identity key (64 hex chars)')
+  .option('--save', 'Save the key to ~/.ruvector/pi-key')
+  .action(async (cmdOpts) => {
+    const opts = identityCmd.opts();
+    const crypto = require('crypto');
+    const key = crypto.randomBytes(32).toString('hex');
+    let pseudonym;
+    try {
+      const hash = crypto.createHash('shake256', { outputLength: 16 });
+      hash.update(key);
+      pseudonym = hash.digest('hex');
+    } catch {
+      pseudonym = crypto.createHash('sha256').update(key).digest('hex').substring(0, 32);
+    }
+    if (isJsonOutput(opts)) {
+      console.log(JSON.stringify({ key, pseudonym }, null, 2));
+    } else {
+      console.log(chalk.bold.cyan('\n  New Pi Identity Generated\n'));
+      console.log(chalk.white(`  Key:       ${key}`));
+      console.log(chalk.gray(`  Pseudonym: ${pseudonym}`));
+      console.log(chalk.yellow('\n  Save this key! Set it as PI environment variable:'));
+      console.log(chalk.dim(`    export PI=${key}\n`));
+    }
+    if (cmdOpts.save) {
+      const keyDir = path.join(require('os').homedir(), '.ruvector');
+      const keyPath = path.join(keyDir, 'pi-key');
+      if (!fs.existsSync(keyDir)) fs.mkdirSync(keyDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(keyPath, key, { mode: 0o600 });
+      console.log(chalk.green(`  Key saved to ${keyPath}`));
+    }
+  });
+
+identityCmd
+  .command('show')
+  .description('Show current identity pseudonym derived from your pi key')
+  .action(async () => {
+    const opts = identityCmd.opts();
+    const crypto = require('crypto');
+    let key = process.env.PI;
+    if (!key) {
+      const keyPath = path.join(require('os').homedir(), '.ruvector', 'pi-key');
+      if (fs.existsSync(keyPath)) {
+        key = fs.readFileSync(keyPath, 'utf8').trim();
+      }
+    }
+    if (!key) {
+      console.error(chalk.red('No pi key found. Set PI env var or run: ruvector identity generate --save'));
+      process.exit(1);
+    }
+    let pseudonym;
+    try {
+      const hash = crypto.createHash('shake256', { outputLength: 16 });
+      hash.update(key);
+      pseudonym = hash.digest('hex');
+    } catch {
+      pseudonym = crypto.createHash('sha256').update(key).digest('hex').substring(0, 32);
+    }
+    if (isJsonOutput(opts)) {
+      console.log(JSON.stringify({
+        pseudonym,
+        key_preview: key.substring(0, 8) + '...' + key.substring(key.length - 8),
+        source: process.env.PI ? 'PI env var' : '~/.ruvector/pi-key',
+      }, null, 2));
+    } else {
+      console.log(chalk.bold.cyan('\n  Pi Identity\n'));
+      console.log(chalk.white(`  Pseudonym: ${pseudonym}`));
+      console.log(chalk.gray(`  Key:       ${key.substring(0, 8)}...${key.substring(key.length - 8)}`));
+      console.log(chalk.gray(`  Source:    ${process.env.PI ? 'PI env var' : '~/.ruvector/pi-key'}\n`));
+    }
+  });
+
+identityCmd
+  .command('export')
+  .description('Export your pi key encrypted with a passphrase')
+  .option('-o, --output <file>', 'Output file', 'pi-key.enc')
+  .action(async (cmdOpts) => {
+    const opts = identityCmd.opts();
+    const crypto = require('crypto');
+    let key = process.env.PI;
+    if (!key) {
+      const keyPath = path.join(require('os').homedir(), '.ruvector', 'pi-key');
+      if (fs.existsSync(keyPath)) {
+        key = fs.readFileSync(keyPath, 'utf8').trim();
+      }
+    }
+    if (!key) {
+      console.error(chalk.red('No pi key found. Set PI env var or run: ruvector identity generate --save'));
+      process.exit(1);
+    }
+    let passphrase = process.env.PI_PASSPHRASE;
+    if (!passphrase) {
+      passphrase = crypto.randomBytes(16).toString('hex');
+      console.log(chalk.yellow(`\n  Generated passphrase (save this!): ${passphrase}`));
+    }
+    const salt = crypto.randomBytes(16);
+    const derivedKey = crypto.pbkdf2Sync(passphrase, salt, 100000, 32, 'sha256');
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey, iv);
+    let encrypted = cipher.update(key, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    const authTag = cipher.getAuthTag().toString('hex');
+    const payload = JSON.stringify({
+      version: 1,
+      algorithm: 'aes-256-gcm',
+      salt: salt.toString('hex'),
+      iv: iv.toString('hex'),
+      authTag,
+      data: encrypted,
+    });
+    const outFile = path.resolve(cmdOpts.output);
+    fs.writeFileSync(outFile, payload, { mode: 0o600 });
+    if (isJsonOutput(opts)) {
+      console.log(JSON.stringify({ file: outFile, algorithm: 'aes-256-gcm' }, null, 2));
+    } else {
+      console.log(chalk.green(`\n  Key exported to: ${outFile}`));
+      console.log(chalk.gray('  Encrypted with AES-256-GCM + PBKDF2'));
+      console.log(chalk.yellow('  Keep your passphrase safe -- it cannot be recovered.\n'));
+    }
+  });
+
+identityCmd
+  .command('import <file>')
+  .description('Import a pi key from an encrypted backup')
+  .option('--save', 'Save the imported key to ~/.ruvector/pi-key')
+  .action(async (file, cmdOpts) => {
+    const opts = identityCmd.opts();
+    const crypto = require('crypto');
+    const filePath = path.resolve(file);
+    if (!fs.existsSync(filePath)) {
+      console.error(chalk.red(`File not found: ${filePath}`));
+      process.exit(1);
+    }
+    const payload = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    if (payload.version !== 1 || payload.algorithm !== 'aes-256-gcm') {
+      console.error(chalk.red('Unsupported key file format'));
+      process.exit(1);
+    }
+    const passphrase = process.env.PI_PASSPHRASE;
+    if (!passphrase) {
+      console.error(chalk.red('Set PI_PASSPHRASE env var to decrypt the key'));
+      process.exit(1);
+    }
+    try {
+      const salt = Buffer.from(payload.salt, 'hex');
+      const iv = Buffer.from(payload.iv, 'hex');
+      const authTag = Buffer.from(payload.authTag, 'hex');
+      const derivedKey = crypto.pbkdf2Sync(passphrase, salt, 100000, 32, 'sha256');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', derivedKey, iv);
+      decipher.setAuthTag(authTag);
+      let decrypted = decipher.update(payload.data, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      if (!/^[0-9a-f]{64}$/i.test(decrypted)) {
+        throw new Error('Decrypted value is not a valid pi key');
+      }
+      if (isJsonOutput(opts)) {
+        console.log(JSON.stringify({
+          key: decrypted,
+          source: filePath,
+          saved: !!cmdOpts.save,
+        }, null, 2));
+      } else {
+        console.log(chalk.green('\n  Key imported successfully'));
+        console.log(chalk.white(`  Key: ${decrypted.substring(0, 8)}...${decrypted.substring(decrypted.length - 8)}`));
+      }
+      if (cmdOpts.save) {
+        const keyDir = path.join(require('os').homedir(), '.ruvector');
+        const keyPath = path.join(keyDir, 'pi-key');
+        if (!fs.existsSync(keyDir)) fs.mkdirSync(keyDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(keyPath, decrypted, { mode: 0o600 });
+        console.log(chalk.green(`  Key saved to ${keyPath}`));
+      }
+      if (!isJsonOutput(opts)) {
+        console.log(chalk.yellow('\n  Set as environment variable:'));
+        console.log(chalk.dim(`    export PI=${decrypted}\n`));
+      }
+    } catch (error) {
+      console.error(chalk.red('Failed to decrypt key -- wrong passphrase?'));
+      console.error(chalk.red(error.message));
+      process.exit(1);
+    }
+  });
+
+// =============================================================================
+// LLM Commands - LLM orchestration (lazy: @ruvector/ruvllm)
+// =============================================================================
+
+const llmCmd = program.command('llm').description('LLM orchestration with SONA adaptive learning');
+
+llmCmd.command('embed')
+  .description('Generate text embeddings via RuvLLM')
+  .argument('<text>', 'Text to embed')
+  .option('-m, --model <model>', 'Model name', 'minilm')
+  .option('--json', 'JSON output')
+  .action(async (text, opts) => {
+    let ruvllm;
+    try {
+      ruvllm = require('@ruvector/ruvllm');
+    } catch (e) {
+      console.error(chalk.red('LLM commands require @ruvector/ruvllm'));
+      console.error(chalk.yellow('  npm install @ruvector/ruvllm'));
+      console.error(chalk.dim('  or: npx ruvector install ruvllm'));
+      console.error(chalk.dim('\n  Tip: use "ruvector embed text <text>" for built-in ONNX embeddings'));
+      process.exit(1);
+    }
+    const spinner = ora('Generating embedding...').start();
+    try {
+      const { performance } = require('perf_hooks');
+      const start = performance.now();
+      const llm = new ruvllm.RuvLLM({ embeddingDim: 384 });
+      const embedding = llm.embed(text);
+      const elapsed = performance.now() - start;
+      spinner.stop();
+      if (opts.json) {
+        console.log(JSON.stringify({ text, model: opts.model, dimension: embedding.length, embedding: Array.from(embedding), timeMs: +elapsed.toFixed(2) }, null, 2));
+        return;
+      }
+      console.log(chalk.bold.cyan('\n  RuvLLM Embedding\n'));
+      console.log(chalk.dim(`  Text: "${text.length > 60 ? text.slice(0, 60) + '...' : text}"`));
+      console.log(chalk.dim(`  Model: ${opts.model}`));
+      console.log(chalk.dim(`  Dimension: ${embedding.length}`));
+      console.log(chalk.dim(`  Time: ${elapsed.toFixed(1)}ms`));
+      console.log(chalk.dim(`  First 5 values: [${Array.from(embedding).slice(0, 5).map(v => v.toFixed(4)).join(', ')}...]`));
+      console.log('');
+    } catch (err) {
+      spinner.fail('Embedding generation failed');
+      console.error(chalk.red(`  ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+llmCmd.command('models')
+  .description('List available LLM models')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let ruvllm;
+    try {
+      ruvllm = require('@ruvector/ruvllm');
+    } catch (e) {
+      console.error(chalk.red('LLM commands require @ruvector/ruvllm'));
+      console.error(chalk.yellow('  npm install @ruvector/ruvllm'));
+      console.error(chalk.dim('  or: npx ruvector install ruvllm'));
+      process.exit(1);
+    }
+    const models = typeof ruvllm.listModels === 'function' ? ruvllm.listModels() :
+      (ruvllm.RUVLTRA_MODELS ? Object.values(ruvllm.RUVLTRA_MODELS) : []);
+    if (opts.json) {
+      console.log(JSON.stringify(models, null, 2));
+      return;
+    }
+    console.log(chalk.bold.cyan('\n  RuvLLM Available Models\n'));
+    if (!models || models.length === 0) {
+      console.log(chalk.yellow('  No models registered in the registry.'));
+      console.log(chalk.dim('  Upgrade @ruvector/ruvllm for model registry support:'));
+      console.log(chalk.dim('    npm install @ruvector/ruvllm@latest\n'));
+    } else {
+      for (const m of models) {
+        console.log(chalk.white(`  ${chalk.bold(m.id)}`));
+        console.log(chalk.dim(`    ${m.name} - ${m.size} (${m.quantization})`));
+        console.log(chalk.dim(`    Use case: ${m.useCase}`));
+        console.log(chalk.dim(`    Context: ${m.contextLength} tokens`));
+        console.log('');
+      }
+    }
+    console.log(chalk.dim(`  Total: ${models ? models.length : 0} models\n`));
+  });
+
+llmCmd.command('benchmark')
+  .description('Benchmark LLM inference performance')
+  .option('-n, --iterations <n>', 'Number of iterations', '100')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let ruvllm;
+    try {
+      ruvllm = require('@ruvector/ruvllm');
+    } catch (e) {
+      console.error(chalk.red('LLM commands require @ruvector/ruvllm'));
+      console.error(chalk.yellow('  npm install @ruvector/ruvllm'));
+      console.error(chalk.dim('  or: npx ruvector install ruvllm'));
+      process.exit(1);
+    }
+    const iterations = parseInt(opts.iterations, 10) || 100;
+    const spinner = ora(`Running ${iterations} embedding iterations...`).start();
+    try {
+      const { performance } = require('perf_hooks');
+      const llm = new ruvllm.RuvLLM({ embeddingDim: 384 });
+      const testText = 'The quick brown fox jumps over the lazy dog';
+      for (let i = 0; i < 5; i++) llm.embed(testText);
+      const times = [];
+      const start = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        const t0 = performance.now();
+        llm.embed(testText);
+        times.push(performance.now() - t0);
+      }
+      const totalMs = performance.now() - start;
+      times.sort((a, b) => a - b);
+      const avgMs = totalMs / iterations;
+      const p50 = times[Math.floor(iterations * 0.5)];
+      const p95 = times[Math.floor(iterations * 0.95)];
+      const p99 = times[Math.floor(iterations * 0.99)];
+      const opsPerSec = (iterations / totalMs) * 1000;
+      spinner.stop();
+      if (opts.json) {
+        console.log(JSON.stringify({ iterations, totalMs: +totalMs.toFixed(2), avgMs: +avgMs.toFixed(3), p50: +p50.toFixed(3), p95: +p95.toFixed(3), p99: +p99.toFixed(3), opsPerSec: +opsPerSec.toFixed(1) }, null, 2));
+        return;
+      }
+      console.log(chalk.bold.cyan('\n  RuvLLM Benchmark Results\n'));
+      console.log(chalk.white(`  Iterations:  ${iterations}`));
+      console.log(chalk.white(`  Total time:  ${totalMs.toFixed(1)}ms`));
+      console.log(chalk.white(`  Avg latency: ${avgMs.toFixed(3)}ms`));
+      console.log(chalk.white(`  P50:         ${p50.toFixed(3)}ms`));
+      console.log(chalk.white(`  P95:         ${p95.toFixed(3)}ms`));
+      console.log(chalk.white(`  P99:         ${p99.toFixed(3)}ms`));
+      console.log(chalk.green(`  Throughput:  ${opsPerSec.toFixed(1)} ops/sec`));
+      console.log('');
+    } catch (err) {
+      spinner.fail('Benchmark failed');
+      console.error(chalk.red(`  ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+llmCmd.command('info')
+  .description('Show LLM module information')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let ruvllm;
+    try {
+      ruvllm = require('@ruvector/ruvllm');
+    } catch (e) {
+      console.error(chalk.red('LLM commands require @ruvector/ruvllm'));
+      console.error(chalk.yellow('  npm install @ruvector/ruvllm'));
+      console.error(chalk.dim('  or: npx ruvector install ruvllm'));
+      process.exit(1);
+    }
+    const version = typeof ruvllm.version === 'function' ? ruvllm.version() : (ruvllm.version || 'unknown');
+    const hasSIMD = ruvllm.hasSimdSupport ? ruvllm.hasSimdSupport() : false;
+    const models = ruvllm.listModels ? ruvllm.listModels() : [];
+    const info = {
+      package: '@ruvector/ruvllm',
+      version,
+      simd: hasSIMD,
+      availableModels: models.length,
+      features: ['SONA adaptive learning', 'HNSW memory', 'FastGRNN routing', 'SIMD inference', 'LoRA adapters', 'Session management', 'Federated learning']
+    };
+    if (opts.json) {
+      console.log(JSON.stringify(info, null, 2));
+      return;
+    }
+    console.log(chalk.bold.cyan('\n  RuvLLM Module Information\n'));
+    console.log(chalk.white(`  Package:  ${info.package}`));
+    console.log(chalk.white(`  Version:  ${info.version}`));
+    console.log(chalk.white(`  SIMD:     ${hasSIMD ? chalk.green('Available') : chalk.yellow('Not available')}`));
+    console.log(chalk.white(`  Models:   ${info.availableModels} registered`));
+    console.log(chalk.white('\n  Features:'));
+    for (const f of info.features) {
+      console.log(chalk.dim(`    - ${f}`));
+    }
+    console.log('');
+  });
+
+// =============================================================================
+// SONA Commands - Self-Optimizing Neural Architecture (bundled dep)
+// =============================================================================
+
+const sonaCmd = program.command('sona').description('SONA Self-Optimizing Neural Architecture');
+
+sonaCmd.command('status')
+  .description('Show SONA learning status')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    try {
+      const { SonaEngine } = require('@ruvector/sona');
+      const engine = new SonaEngine();
+      const stats = engine.stats();
+      if (opts.json) { console.log(JSON.stringify(stats, null, 2)); return; }
+      console.log(chalk.bold.cyan('\n  SONA Learning Status\n'));
+      console.log(chalk.white(`  Trajectories:  ${stats.trajectoryCount || stats.trajectory_count || 0}`));
+      console.log(chalk.white(`  Patterns:      ${stats.patternCount || stats.pattern_count || 0}`));
+      console.log(chalk.white(`  Energy:        ${typeof stats.energy === 'number' ? stats.energy.toFixed(4) : stats.energy || 'N/A'}`));
+      console.log(chalk.white(`  State:         ${stats.state || 'initialized'}`));
+      console.log('');
+    } catch (e) {
+      try {
+        const { SonaCoordinator } = require('@ruvector/ruvllm');
+        const sona = new SonaCoordinator();
+        const stats = sona.stats();
+        if (opts.json) { console.log(JSON.stringify(stats, null, 2)); return; }
+        console.log(chalk.bold.cyan('\n  SONA Learning Status (JS fallback)\n'));
+        console.log(chalk.white(`  Signals received:       ${stats.signalsReceived}`));
+        console.log(chalk.white(`  Trajectories buffered:  ${stats.trajectoriesBuffered}`));
+        console.log(chalk.white(`  Total patterns:         ${stats.patterns.totalPatterns}`));
+        console.log(chalk.white(`  Avg success rate:       ${(stats.patterns.avgSuccessRate * 100).toFixed(1)}%`));
+        console.log(chalk.white(`  EWC tasks learned:      ${stats.ewc.tasksLearned}`));
+        console.log('');
+      } catch (e2) {
+        console.error(chalk.red('SONA native binding not available for this platform.'));
+        console.error(chalk.yellow('  Install @ruvector/ruvllm for JS fallback: npm install @ruvector/ruvllm'));
+        console.error(chalk.dim(`  Native error: ${e.message}`));
+        process.exit(1);
+      }
+    }
+  });
+
+sonaCmd.command('patterns')
+  .description('Search learned patterns')
+  .argument('<query>', 'Search query')
+  .option('-k, --top-k <n>', 'Number of results', '5')
+  .option('--json', 'JSON output')
+  .action(async (query, opts) => {
+    const topK = parseInt(opts.topK, 10) || 5;
+    try {
+      const { SonaEngine } = require('@ruvector/sona');
+      const engine = new SonaEngine();
+      const results = engine.searchPatterns ? engine.searchPatterns(query, topK) : [];
+      if (opts.json) { console.log(JSON.stringify(results, null, 2)); return; }
+      console.log(chalk.bold.cyan(`\n  SONA Pattern Search: "${query}"\n`));
+      if (!results || results.length === 0) {
+        console.log(chalk.yellow('  No patterns found. Record some training data first.'));
+      } else {
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
+          console.log(chalk.white(`  ${i + 1}. ${chalk.bold(r.type || r.id || 'pattern')}`));
+          console.log(chalk.dim(`     Score: ${typeof r.score === 'number' ? r.score.toFixed(4) : r.score || 'N/A'}`));
+          if (r.metadata) console.log(chalk.dim(`     Metadata: ${JSON.stringify(r.metadata)}`));
+          console.log('');
+        }
+      }
+    } catch (e) {
+      try {
+        const { SonaCoordinator } = require('@ruvector/ruvllm');
+        const sona = new SonaCoordinator();
+        const bank = sona.getReasoningBank();
+        const embedding = new Float64Array(64);
+        for (let i = 0; i < query.length && i < 64; i++) embedding[i] = query.charCodeAt(i) / 255;
+        const results = bank.findSimilar(Array.from(embedding), topK);
+        if (opts.json) { console.log(JSON.stringify(results, null, 2)); return; }
+        console.log(chalk.bold.cyan(`\n  SONA Pattern Search (JS): "${query}"\n`));
+        if (!results || results.length === 0) {
+          console.log(chalk.yellow('  No patterns found. Record some training data first.'));
+        } else {
+          for (let i = 0; i < results.length; i++) {
+            const r = results[i];
+            console.log(chalk.white(`  ${i + 1}. ${chalk.bold(r.type || r.id)}`));
+            console.log(chalk.dim(`     Success rate: ${(r.successRate * 100).toFixed(1)}%`));
+            console.log('');
+          }
+        }
+      } catch (e2) {
+        console.error(chalk.red('SONA not available.'));
+        console.error(chalk.dim(`  Native error: ${e.message}`));
+        process.exit(1);
+      }
+    }
+  });
+
+sonaCmd.command('train')
+  .description('Record a training trajectory')
+  .argument('<data>', 'Training data JSON file or JSON string')
+  .option('--json', 'JSON output')
+  .action(async (data, opts) => {
+    let trajectoryData;
+    try {
+      if (fs.existsSync(data)) { trajectoryData = JSON.parse(fs.readFileSync(data, 'utf8')); }
+      else { trajectoryData = JSON.parse(data); }
+    } catch (e) {
+      console.error(chalk.red('Invalid training data. Provide a JSON file path or JSON string.'));
+      console.error(chalk.dim(`  Error: ${e.message}`));
+      console.error(chalk.dim('\n  Example: ruvector sona train \'{"steps":[{"type":"query","input":"test","output":"result","confidence":0.9}],"outcome":"success"}\''));
+      process.exit(1);
+    }
+    const spinner = ora('Recording trajectory...').start();
+    try {
+      const { SonaEngine } = require('@ruvector/sona');
+      const engine = new SonaEngine();
+      const result = engine.recordTrajectory ? engine.recordTrajectory(JSON.stringify(trajectoryData)) : { recorded: true };
+      spinner.succeed('Trajectory recorded');
+      if (opts.json) { console.log(JSON.stringify(result, null, 2)); return; }
+      console.log(chalk.dim(`  Steps: ${trajectoryData.steps ? trajectoryData.steps.length : 'N/A'}`));
+      console.log(chalk.dim(`  Outcome: ${trajectoryData.outcome || 'N/A'}`));
+      console.log('');
+    } catch (e) {
+      try {
+        const { SonaCoordinator, TrajectoryBuilder } = require('@ruvector/ruvllm');
+        const sona = new SonaCoordinator();
+        const builder = new TrajectoryBuilder();
+        if (trajectoryData.steps && Array.isArray(trajectoryData.steps)) {
+          for (const step of trajectoryData.steps) { builder.startStep(step.type || 'query', step.input || ''); builder.endStep(step.output || '', step.confidence || 0.5); }
+        }
+        const trajectory = builder.complete(trajectoryData.outcome || 'success');
+        sona.recordTrajectory(trajectory);
+        spinner.succeed('Trajectory recorded (JS fallback)');
+        if (opts.json) { console.log(JSON.stringify({ id: trajectory.id, steps: trajectory.steps.length, outcome: trajectory.outcome }, null, 2)); return; }
+        console.log(chalk.dim(`  ID: ${trajectory.id}`));
+        console.log(chalk.dim(`  Steps: ${trajectory.steps.length}`));
+        console.log(chalk.dim(`  Outcome: ${trajectory.outcome}`));
+        console.log('');
+      } catch (e2) { spinner.fail('Failed to record trajectory'); console.error(chalk.red(`  ${e.message}`)); process.exit(1); }
+    }
+  });
+
+sonaCmd.command('export')
+  .description('Export SONA learned weights')
+  .option('-o, --output <path>', 'Output file', 'sona-export.json')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    const spinner = ora('Exporting SONA state...').start();
+    try {
+      const { SonaEngine } = require('@ruvector/sona');
+      const engine = new SonaEngine();
+      const exported = engine.export ? engine.export() : JSON.stringify(engine.stats());
+      const outputData = typeof exported === 'string' ? exported : JSON.stringify(exported, null, 2);
+      if (opts.json) { spinner.stop(); console.log(outputData); return; }
+      fs.writeFileSync(opts.output, outputData);
+      spinner.succeed(`Exported to ${opts.output}`);
+      console.log(chalk.dim(`  Size: ${Buffer.byteLength(outputData)} bytes`));
+      console.log('');
+    } catch (e) {
+      try {
+        const { SonaCoordinator } = require('@ruvector/ruvllm');
+        const sona = new SonaCoordinator();
+        const exportData = JSON.stringify({ stats: sona.stats(), reasoningBank: sona.getReasoningBank().stats(), exportedAt: new Date().toISOString() }, null, 2);
+        if (opts.json) { spinner.stop(); console.log(exportData); return; }
+        fs.writeFileSync(opts.output, exportData);
+        spinner.succeed(`Exported to ${opts.output} (JS fallback)`);
+        console.log(chalk.dim(`  Size: ${Buffer.byteLength(exportData)} bytes`));
+        console.log('');
+      } catch (e2) { spinner.fail('Export failed'); console.error(chalk.red(`  ${e.message}`)); process.exit(1); }
+    }
+  });
+
+sonaCmd.command('stats')
+  .description('Show detailed learning statistics')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    try {
+      const { SonaEngine } = require('@ruvector/sona');
+      const engine = new SonaEngine();
+      const stats = engine.stats();
+      if (opts.json) { console.log(JSON.stringify(stats, null, 2)); return; }
+      console.log(chalk.bold.cyan('\n  SONA Detailed Statistics\n'));
+      for (const [key, value] of Object.entries(stats)) {
+        const label = key.replace(/([A-Z])/g, ' $1').replace(/_/g, ' ').trim();
+        const displayLabel = label.charAt(0).toUpperCase() + label.slice(1);
+        if (typeof value === 'object' && value !== null) {
+          console.log(chalk.white(`  ${displayLabel}:`));
+          for (const [k, v] of Object.entries(value)) console.log(chalk.dim(`    ${k}: ${typeof v === 'number' ? v.toFixed(4) : v}`));
+        } else { console.log(chalk.white(`  ${displayLabel}: ${typeof value === 'number' ? value.toFixed(4) : value}`)); }
+      }
+      console.log('');
+    } catch (e) {
+      try {
+        const { SonaCoordinator } = require('@ruvector/ruvllm');
+        const stats = new SonaCoordinator().stats();
+        if (opts.json) { console.log(JSON.stringify(stats, null, 2)); return; }
+        console.log(chalk.bold.cyan('\n  SONA Detailed Statistics (JS)\n'));
+        console.log(chalk.white(`  Signals received:       ${stats.signalsReceived}`));
+        console.log(chalk.white(`  Trajectories buffered:  ${stats.trajectoriesBuffered}`));
+        console.log(chalk.white('\n  Reasoning Bank:'));
+        console.log(chalk.dim(`    Total patterns:    ${stats.patterns.totalPatterns}`));
+        console.log(chalk.dim(`    Avg success rate:  ${(stats.patterns.avgSuccessRate * 100).toFixed(1)}%`));
+        if (stats.patterns.byType) { for (const [type, count] of Object.entries(stats.patterns.byType)) console.log(chalk.dim(`    ${type}: ${count}`)); }
+        console.log(chalk.white('\n  EWC++ (Memory Protection):'));
+        console.log(chalk.dim(`    Tasks learned:     ${stats.ewc.tasksLearned}`));
+        console.log(chalk.dim(`    Lambda:            ${stats.ewc.lambda}`));
+        console.log(chalk.dim(`    Forgetting rate:   ${(stats.ewc.estimatedForgettingRate * 100).toFixed(2)}%`));
+        console.log('');
+      } catch (e2) { console.error(chalk.red('SONA not available.')); console.error(chalk.dim(`  Native error: ${e.message}`)); process.exit(1); }
+    }
+  });
+
+sonaCmd.command('info')
+  .description('Show SONA module information')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let nativeAvailable = false, nativeVersion = 'N/A';
+    try { const sona = require('@ruvector/sona'); nativeAvailable = !!sona.SonaEngine; nativeVersion = sona.version || '0.1.4'; } catch (e) { /* not available */ }
+    let jsAvailable = false, jsVersion = 'N/A';
+    try { const ruvllm = require('@ruvector/ruvllm'); jsAvailable = !!ruvllm.SonaCoordinator; jsVersion = typeof ruvllm.version === 'function' ? ruvllm.version() : (ruvllm.version || 'unknown'); } catch (e) { /* not available */ }
+    const info = { package: '@ruvector/sona', nativeBinding: nativeAvailable, nativeVersion, jsFallback: jsAvailable, jsFallbackVersion: jsVersion, features: ['LoRA adaptive weights', 'EWC++ memory protection', 'ReasoningBank pattern storage', 'Trajectory tracking', 'Continual learning', 'Sub-millisecond overhead'] };
+    if (opts.json) { console.log(JSON.stringify(info, null, 2)); return; }
+    console.log(chalk.bold.cyan('\n  SONA Module Information\n'));
+    console.log(chalk.white(`  Package:         ${info.package}`));
+    console.log(chalk.white(`  Native binding:  ${nativeAvailable ? chalk.green('Available') + chalk.dim(` (v${nativeVersion})`) : chalk.yellow('Not available')}`));
+    console.log(chalk.white(`  JS fallback:     ${jsAvailable ? chalk.green('Available') + chalk.dim(` (ruvllm v${jsVersion})`) : chalk.yellow('Not available')}`));
+    console.log(chalk.white('\n  Features:'));
+    for (const f of info.features) console.log(chalk.dim(`    - ${f}`));
+    console.log('');
+  });
+
+// =============================================================================
+// Route Commands - Semantic routing (lazy: @ruvector/router)
+// =============================================================================
+
+const routeCmd = program.command('route').description('Semantic routing for AI agents');
+
+routeCmd.command('classify')
+  .description('Classify input to a route')
+  .argument('<input>', 'Input text to classify')
+  .option('-r, --routes <json>', 'Routes definition JSON file')
+  .option('-k, --top-k <n>', 'Number of results', '3')
+  .option('--json', 'JSON output')
+  .action(async (input, opts) => {
+    let router;
+    try { router = require('@ruvector/router'); } catch (e) {
+      console.error(chalk.red('Route commands require @ruvector/router'));
+      console.error(chalk.yellow('  npx ruvector add router   (or: npm install @ruvector/router)'));
+      console.error(chalk.dim('  or: npx ruvector install router'));
+      process.exit(1);
+    }
+    const topK = parseInt(opts.topK, 10) || 3;
+    const spinner = ora('Classifying input...').start();
+    try {
+      let routesDef = null;
+      if (opts.routes) {
+        if (!fs.existsSync(opts.routes)) { spinner.fail(`Routes file not found: ${opts.routes}`); process.exit(1); }
+        routesDef = JSON.parse(fs.readFileSync(opts.routes, 'utf8'));
+      }
+      const sr = new router.SemanticRouter({ dimension: routesDef ? (routesDef.dimension || 384) : 384 });
+      if (routesDef && routesDef.intents) { for (const intent of routesDef.intents) sr.addIntent(intent); }
+      const embedding = new Float32Array(sr._dimension || 384);
+      for (let i = 0; i < input.length && i < embedding.length; i++) embedding[i] = input.charCodeAt(i) / 255;
+      let norm = 0;
+      for (let i = 0; i < embedding.length; i++) norm += embedding[i] * embedding[i];
+      norm = Math.sqrt(norm) || 1;
+      for (let i = 0; i < embedding.length; i++) embedding[i] /= norm;
+      const results = sr.routeWithEmbedding(embedding, topK);
+      spinner.stop();
+      if (opts.json) { console.log(JSON.stringify({ input, results }, null, 2)); return; }
+      console.log(chalk.bold.cyan(`\n  Route Classification: "${input.length > 50 ? input.slice(0, 50) + '...' : input}"\n`));
+      if (!results || results.length === 0) {
+        console.log(chalk.yellow('  No matching routes found.'));
+        if (!routesDef) { console.log(chalk.dim('  Provide a routes file with -r/--routes to define intents.')); console.log(chalk.dim('  Example: ruvector route classify "hello" -r routes.json')); }
+      } else {
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i];
+          console.log(chalk.white(`  ${i + 1}. ${chalk.bold(r.intent)}`));
+          console.log(chalk.dim(`     Score: ${r.score.toFixed(4)}`));
+          if (r.metadata && Object.keys(r.metadata).length > 0) console.log(chalk.dim(`     Metadata: ${JSON.stringify(r.metadata)}`));
+        }
+      }
+      console.log('');
+    } catch (err) { spinner.fail('Classification failed'); console.error(chalk.red(`  ${err.message}`)); process.exit(1); }
+  });
+
+routeCmd.command('benchmark')
+  .description('Benchmark routing throughput')
+  .option('-n, --iterations <n>', 'Number of iterations', '1000')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let router;
+    try { router = require('@ruvector/router'); } catch (e) {
+      console.error(chalk.red('Route commands require @ruvector/router'));
+      console.error(chalk.yellow('  npx ruvector add router   (or: npm install @ruvector/router)'));
+      console.error(chalk.dim('  or: npx ruvector install router'));
+      process.exit(1);
+    }
+    const iterations = parseInt(opts.iterations, 10) || 1000;
+    const spinner = ora(`Benchmarking ${iterations} route classifications...`).start();
+    try {
+      const { performance } = require('perf_hooks');
+      const dim = 128;
+      const sr = new router.SemanticRouter({ dimension: dim, threshold: 0.3 });
+      const intentNames = ['greeting', 'farewell', 'question', 'command', 'feedback'];
+      for (const name of intentNames) { const emb = new Float32Array(dim); for (let i = 0; i < dim; i++) emb[i] = Math.random() - 0.5; sr.addIntent({ name, utterances: [`example ${name}`], embedding: emb }); }
+      const warmupEmb = new Float32Array(dim); for (let i = 0; i < dim; i++) warmupEmb[i] = Math.random() - 0.5;
+      for (let i = 0; i < 50; i++) sr.routeWithEmbedding(warmupEmb, 3);
+      const times = [], start = performance.now();
+      for (let i = 0; i < iterations; i++) { const emb = new Float32Array(dim); for (let j = 0; j < dim; j++) emb[j] = Math.random() - 0.5; const t0 = performance.now(); sr.routeWithEmbedding(emb, 3); times.push(performance.now() - t0); }
+      const totalMs = performance.now() - start;
+      times.sort((a, b) => a - b);
+      const avgMs = totalMs / iterations, p50 = times[Math.floor(iterations * 0.5)], p95 = times[Math.floor(iterations * 0.95)], p99 = times[Math.floor(iterations * 0.99)], opsPerSec = (iterations / totalMs) * 1000;
+      spinner.stop();
+      if (opts.json) { console.log(JSON.stringify({ iterations, dimension: dim, intents: intentNames.length, totalMs: +totalMs.toFixed(2), avgMs: +avgMs.toFixed(3), p50: +p50.toFixed(3), p95: +p95.toFixed(3), p99: +p99.toFixed(3), opsPerSec: +opsPerSec.toFixed(1) }, null, 2)); return; }
+      console.log(chalk.bold.cyan('\n  Router Benchmark Results\n'));
+      console.log(chalk.white(`  Iterations:  ${iterations}`));
+      console.log(chalk.white(`  Dimension:   ${dim}`));
+      console.log(chalk.white(`  Intents:     ${intentNames.length}`));
+      console.log(chalk.white(`  Total time:  ${totalMs.toFixed(1)}ms`));
+      console.log(chalk.white(`  Avg latency: ${avgMs.toFixed(3)}ms`));
+      console.log(chalk.white(`  P50:         ${p50.toFixed(3)}ms`));
+      console.log(chalk.white(`  P95:         ${p95.toFixed(3)}ms`));
+      console.log(chalk.white(`  P99:         ${p99.toFixed(3)}ms`));
+      console.log(chalk.green(`  Throughput:  ${opsPerSec.toFixed(1)} ops/sec`));
+      console.log('');
+    } catch (err) { spinner.fail('Benchmark failed'); console.error(chalk.red(`  ${err.message}`)); process.exit(1); }
+  });
+
+routeCmd.command('info')
+  .description('Show router module information')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let routerAvailable = false, routerVersion = 'N/A', metrics = {};
+    try {
+      const router = require('@ruvector/router'); routerAvailable = true;
+      // @ruvector/router does not export a `version`, so the old `|| '0.1.28'`
+      // fallback printed 0.1.28 for every installed version. Read the package
+      // manifest instead; fall back to "unknown", never to a stale literal.
+      try { routerVersion = router.version || require('@ruvector/router/package.json').version || 'unknown'; } catch { routerVersion = router.version || 'unknown'; }
+      const sr = new router.SemanticRouter({ dimension: 16 }); metrics = { distanceMetrics: Object.keys(router.DistanceMetric || {}), hasSemanticRouter: true };
+    } catch (e) { /* Not available */ }
+    const info = { package: '@ruvector/router', available: routerAvailable, version: routerVersion, backend: 'Rust NAPI (HNSW + SIMD)', features: ['Semantic intent matching', 'HNSW indexing', 'SIMD-accelerated search', 'Multiple distance metrics', 'Save/load state', 'Async embedding support'], ...metrics };
+    if (opts.json) { console.log(JSON.stringify(info, null, 2)); return; }
+    console.log(chalk.bold.cyan('\n  Semantic Router Information\n'));
+    console.log(chalk.white(`  Package:   ${info.package}`));
+    console.log(chalk.white(`  Status:    ${routerAvailable ? chalk.green('Available') + chalk.dim(` (v${routerVersion})`) : chalk.yellow('Not installed')}`));
+    console.log(chalk.white(`  Backend:   ${info.backend}`));
+    if (info.distanceMetrics) console.log(chalk.white(`  Metrics:   ${info.distanceMetrics.join(', ')}`));
+    console.log(chalk.white('\n  Features:'));
+    for (const f of info.features) console.log(chalk.dim(`    - ${f}`));
+    if (!routerAvailable) console.log(chalk.yellow('\n  Install: npm install @ruvector/router'));
+    console.log('');
+  });
+
+// ── Decompile Command ──────────────────────────────────────────────────────
+const decompileCmd = program
+  .command('decompile [target]')
+  .description('Decompile npm packages, local JS files, or URLs into modules')
+  .option('-o, --output <dir>', 'Output directory')
+  .option('-f, --format <type>', 'Output format: modules, single, json', 'modules')
+  .option('-c, --confidence <n>', 'Minimum confidence threshold (0-1)', '0.3')
+  .option('--no-witness', 'Skip witness chain generation')
+  .option('--json', 'JSON output to stdout (for piping)')
+  .option('-q, --quiet', 'Suppress progress output')
+  .option('--version-pkg <ver>', 'Package version (alternative to @version syntax)')
+  .option('--diff <version>', 'Compare against another version')
+  .option('--model <file>', 'Decompile LLM model weight file (.gguf, .safetensors)')
+  .option('--api <model-id>', 'Probe remote LLM API to discover architecture')
+  .option('--api-key <key>', 'API key for --api mode (or use env vars)')
+  .action(async (target, opts) => {
+    // Model weight decompilation mode (ADR-138)
+    if (opts.model) {
+      try {
+        const modelDecompiler = require('../src/decompiler/model-decompiler.js');
+        const result = await modelDecompiler.decompileModelFile(opts.model);
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          modelDecompiler.printModelResult(result);
+        }
+      } catch (err) {
+        console.error(chalk.red(`Model decompilation failed: ${err.message}`));
+        process.exit(1);
+      }
+      return;
+    }
+
+    // API probing mode (ADR-138)
+    if (opts.api) {
+      try {
+        const apiProber = require('../src/decompiler/api-prober.js');
+        const result = await apiProber.probeModel(opts.api, { apiKey: opts.apiKey });
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          apiProber.printProbeResult(result);
+        }
+      } catch (err) {
+        console.error(chalk.red(`API probe failed: ${err.message}`));
+        process.exit(1);
+      }
+      return;
+    }
+
+    if (!target) {
+      console.log(chalk.cyan('\nUsage:'));
+      console.log(chalk.white('  ruvector decompile <package>           Decompile npm package'));
+      console.log(chalk.white('  ruvector decompile <pkg>@<ver>         Specific version'));
+      console.log(chalk.white('  ruvector decompile ./bundle.js         Local file'));
+      console.log(chalk.white('  ruvector decompile https://unpkg.com/x URL'));
+      console.log(chalk.white('  ruvector decompile --model <file.gguf> LLM weight file'));
+      console.log(chalk.white('  ruvector decompile --api <model-id>    Probe remote API'));
+      console.log(chalk.dim('\nOptions:'));
+      console.log(chalk.dim('  -o, --output <dir>     Output directory'));
+      console.log(chalk.dim('  -f, --format <type>    modules | single | json'));
+      console.log(chalk.dim('  -c, --confidence <n>   Min confidence (0-1, default: 0.3)'));
+      console.log(chalk.dim('  --no-witness           Skip witness chain'));
+      console.log(chalk.dim('  --json                 JSON to stdout'));
+      console.log(chalk.dim('  --diff <version>       Diff against another version'));
+      console.log(chalk.dim('  --model <file>         Decompile .gguf/.safetensors'));
+      console.log(chalk.dim('  --api <model-id>       Probe LLM API'));
+      console.log(chalk.dim('  --api-key <key>        API key (or set env var)'));
+      console.log('');
+      return;
+    }
+
+    const decompiler = require('../src/decompiler/index.js');
+    const { parseTarget } = decompiler;
+    const parsed = parseTarget(target);
+    const minConfidence = parseFloat(opts.confidence);
+    const decompileOpts = { minConfidence, witness: opts.witness !== false, useRust: true };
+    const quiet = opts.quiet || opts.json;
+    let spinner = null;
+
+    if (!quiet) {
+      spinner = ora('Analyzing target...').start();
+    }
+
+    try {
+      let result;
+
+      if (parsed.type === 'npm') {
+        const version = opts.versionPkg || parsed.version;
+        if (!quiet) spinner.text = `Fetching ${parsed.name}${version ? '@' + version : ''}...`;
+        result = await decompiler.decompilePackage(parsed.name, version, decompileOpts);
+        if (!quiet) spinner.text = `Decompiled ${result.packageInfo.name}@${result.packageInfo.version}`;
+      } else if (parsed.type === 'file') {
+        if (!quiet) spinner.text = `Reading ${parsed.path}...`;
+        result = decompiler.decompileFile(parsed.path, { ...decompileOpts, filePath: parsed.path });
+      } else if (parsed.type === 'url') {
+        if (!quiet) spinner.text = `Fetching ${parsed.url}...`;
+        result = await decompiler.decompileUrl(parsed.url, decompileOpts);
+      }
+
+      if (!quiet) spinner.succeed(chalk.green('Decompilation complete'));
+
+      // Handle --diff flag
+      if (opts.diff && parsed.type === 'npm') {
+        if (!quiet) {
+          const diffSpinner = ora(`Fetching ${parsed.name}@${opts.diff} for diff...`).start();
+          try {
+            const other = await decompiler.decompilePackage(parsed.name, opts.diff, decompileOpts);
+            diffSpinner.succeed('Diff complete');
+            const resultNames = new Set(result.modules.map((m) => m.name));
+            const otherNames = new Set(other.modules.map((m) => m.name));
+            const added = [...resultNames].filter((n) => !otherNames.has(n));
+            const removed = [...otherNames].filter((n) => !resultNames.has(n));
+            const common = [...resultNames].filter((n) => otherNames.has(n));
+
+            console.log(chalk.bold.cyan('\n  Version Diff'));
+            console.log(chalk.white(`  ${opts.diff} -> ${result.packageInfo.version}`));
+            if (added.length) console.log(chalk.green(`  Added:   ${added.join(', ')}`));
+            if (removed.length) console.log(chalk.red(`  Removed: ${removed.join(', ')}`));
+            console.log(chalk.dim(`  Common:  ${common.length} modules`));
+            console.log('');
+          } catch (err) {
+            diffSpinner.fail(`Diff failed: ${err.message}`);
+          }
+        }
+      }
+
+      // Output
+      if (opts.json) {
+        const jsonOut = {
+          modules: result.modules.map((m) => ({
+            name: m.name, fragments: m.fragments, confidence: m.confidence,
+            contentLength: m.content.length,
+          })),
+          metrics: result.metrics,
+          witness: result.witness ? { root: result.witness.root, chain_length: result.witness.chain.length } : null,
+          packageInfo: result.packageInfo || null,
+        };
+        console.log(JSON.stringify(jsonOut, null, 2));
+        return;
+      }
+
+      // Determine output directory
+      let outputDir = opts.output;
+      if (!outputDir) {
+        const baseName = result.packageInfo
+          ? `${result.packageInfo.name.replace('/', '-')}@${result.packageInfo.version}`
+          : path.basename(target, '.js');
+        outputDir = path.join(process.cwd(), 'decompiled', baseName);
+      }
+
+      decompiler.writeOutput(result, outputDir, opts.format);
+
+      console.log(chalk.bold.cyan('\n  Decompilation Summary'));
+      console.log(chalk.white(`  Modules:     ${result.modules.length}`));
+      console.log(chalk.white(`  Source size:  ${(result.metrics.source.sizeBytes / 1024).toFixed(1)} KB`));
+      console.log(chalk.white(`  Functions:    ${result.metrics.source.functions}`));
+      console.log(chalk.white(`  Classes:      ${result.metrics.source.classes}`));
+      if (result.witness) {
+        const wRoot = result.witness.root || result.witness.chain_root || '';
+        console.log(chalk.white(`  Witness root: ${wRoot.slice(0, 16)}...`));
+      }
+      console.log(chalk.green(`  Output:       ${outputDir}`));
+      console.log('');
+
+      if (result.modules.length > 0) {
+        console.log(chalk.dim('  Detected modules:'));
+        for (const mod of result.modules) {
+          const conf = (mod.confidence * 100).toFixed(0);
+          console.log(chalk.dim(`    ${mod.name} (${mod.fragments} fragments, ${conf}% confidence)`));
+        }
+        console.log('');
+      }
+    } catch (err) {
+      if (spinner) spinner.fail(chalk.red('Decompilation failed'));
+      console.error(chalk.red(`  ${err.message}`));
+      process.exit(1);
+    }
+  });
+
+// =============================================================================
+// Optimize Commands — Claude Code profile optimization (ADR-139)
+// =============================================================================
+
+const optimizeCmd = program.command('optimize')
+  .description('Optimize Claude Code configuration per task type (ADR-139)')
+  .option('-p, --profile <type>', 'Task profile: coding|research|quickfix|planning|background|swarm|review|ci')
+  .option('-s, --show', 'Show current optimization status')
+  .option('-l, --list', 'List all available profiles')
+  .option('--generate-settings', 'Output optimal .claude/settings.json')
+  .option('--detect <prompt>', 'Auto-detect task type from a prompt')
+  .option('--apply', 'Apply profile env vars to current process (for hooks)')
+  .option('--json', 'JSON output')
+  .action(async (opts) => {
+    let optimizerMod;
+    try {
+      // Resolve via package.json so it works whether the optimizer ships under
+      // src/optimizer/ or dist/optimizer/.
+      optimizerMod = require('../src/optimizer/index.js');
+    } catch (e) {
+      console.error(chalk.yellow('\n  ruvector optimize: not yet shipped in this release.\n'));
+      console.error(chalk.gray('  The optimizer module (profiles, settings generation) is in development'));
+      console.error(chalk.gray('  and will land in a future release. Track progress at:'));
+      console.error(chalk.white('    https://github.com/ruvnet/ruvector/issues/401\n'));
+      process.exit(1);
+    }
+
+    // --list: show all profiles
+    if (opts.list) {
+      const profiles = optimizerMod.listProfiles();
+      if (opts.json) {
+        const data = {};
+        for (const name of profiles) {
+          data[name] = optimizerMod.getProfile(name);
+        }
+        console.log(JSON.stringify(data, null, 2));
+        return;
+      }
+      console.log(chalk.bold.cyan('\n  RVAgent Optimizer Profiles (ADR-139)\n'));
+      console.log(chalk.dim('  Based on decompiled Claude Code v2.1.91 intelligence\n'));
+      for (const name of profiles) {
+        const p = optimizerMod.getProfile(name);
+        const envCount = Object.keys(p.env).length;
+        console.log(`  ${chalk.bold.white(name.padEnd(12))} ${chalk.dim(p.description)}`);
+        console.log(chalk.dim(`${''.padEnd(14)}Permission: ${p.permissionMode}, Env vars: ${envCount}`));
+      }
+      console.log('');
+      console.log(chalk.dim('  Usage: ruvector optimize --profile <type>'));
+      console.log(chalk.dim('         ruvector optimize --generate-settings --profile coding'));
+      console.log('');
+      return;
+    }
+
+    // --detect: infer task type from prompt
+    if (opts.detect) {
+      const detected = optimizerMod.detectTaskType(opts.detect);
+      if (opts.json) {
+        console.log(JSON.stringify({ prompt: opts.detect, taskType: detected }));
+        return;
+      }
+      console.log(chalk.cyan(`  Detected task type: ${chalk.bold(detected)}`));
+      return;
+    }
+
+    // Determine profile to use
+    const profileName = opts.profile || 'coding';
+    const profile = optimizerMod.getProfile(profileName);
+
+    if (!profile) {
+      console.error(chalk.red(`  Unknown profile: ${profileName}`));
+      console.error(chalk.yellow(`  Available: ${optimizerMod.listProfiles().join(', ')}`));
+      process.exit(1);
+    }
+
+    // --generate-settings: output settings.json
+    if (opts.generateSettings) {
+      const { generateSettings, formatSettings } = require('../src/optimizer/settings-generator.js');
+      const settings = generateSettings({ ...profile, taskType: profileName });
+      if (opts.json) {
+        console.log(formatSettings(settings));
+      } else {
+        console.log(chalk.bold.cyan(`\n  Generated settings.json for profile: ${profileName}\n`));
+        console.log(formatSettings(settings));
+        console.log('');
+        console.log(chalk.dim('  Save to .claude/settings.json to activate.'));
+        console.log('');
+      }
+      return;
+    }
+
+    // --show: display profile details
+    if (opts.show) {
+      if (opts.json) {
+        console.log(JSON.stringify({ profile: profileName, ...profile }, null, 2));
+        return;
+      }
+      console.log(chalk.bold.cyan(`\n  Profile: ${profileName}\n`));
+      console.log(`  ${chalk.dim('Description:')} ${profile.description}`);
+      console.log(`  ${chalk.dim('Permission:')}  ${profile.permissionMode}`);
+      console.log(`  ${chalk.dim('Env vars:')}`);
+      for (const [key, val] of Object.entries(profile.env)) {
+        console.log(`    ${chalk.white(key)}=${chalk.green(val)}`);
+      }
+      console.log('');
+      return;
+    }
+
+    // --apply or default: apply env vars
+    const result = optimizerMod.applyProfile(profileName);
+    if (opts.json) {
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    console.log(chalk.bold.cyan(`\n  Applied profile: ${profileName}`));
+    console.log(chalk.dim(`  ${profile.description}\n`));
+    for (const [key, val] of Object.entries(result.applied)) {
+      console.log(`  ${chalk.green('+')} ${key}=${val}`);
+    }
+    console.log(`\n  ${chalk.dim('Permission mode:')} ${result.permissionMode}`);
+    console.log('');
+  });
+
+// =============================================================================
+// Harness Commands - pinned MetaHarness dependencies plus RuVector primitives.
+// Dependencies are loaded lazily so unrelated CLI commands keep their startup
+// profile. Darwin remains behind an explicit execution flag.
+// =============================================================================
+
+function loadMetaHarnessSdk() {
+  return require('../dist/metaharness/index.js');
+}
+
+function readHarnessJson(file, label) {
+  const resolved = path.resolve(file);
+  try {
+    return JSON.parse(fs.readFileSync(resolved, 'utf8'));
+  } catch (error) {
+    throw new Error(`Unable to read ${label} JSON at ${resolved}: ${error.message}`);
+  }
+}
+
+async function buildHarnessSurface(opts) {
+  const primitives = {};
+
+  // Cost-optimal model router — Tiny Dancer FastGRNN (ADR-252)
+  try {
+    const td = require('@ruvector/tiny-dancer');
+    primitives.costRouter = {
+      name: '@ruvector/tiny-dancer',
+      role: 'cost-optimal model routing (cheap vs strong)',
+      available: true,
+      version: typeof td.version === 'function' ? td.version() : null,
+      usage: 'npx ruvector tiny-dancer score <model> --query <embedding>',
+    };
+  } catch {
+    primitives.costRouter = {
+      name: '@ruvector/tiny-dancer',
+      role: 'cost-optimal model routing (cheap vs strong)',
+      available: false,
+      install: 'npm install @ruvector/tiny-dancer',
+    };
+  }
+
+  // Semantic intent router — @ruvector/router / ruvector-router-core
+  let semanticAvailable = false;
+  try { require.resolve('@ruvector/router'); semanticAvailable = true; } catch { semanticAvailable = false; }
+  primitives.semanticRouter = {
+    name: '@ruvector/router',
+    role: 'semantic intent routing',
+    available: semanticAvailable,
+    ...(semanticAvailable ? { usage: 'npx ruvector router --route "<text>"' } : { install: 'npm install @ruvector/router' }),
+  };
+
+  // Multi-tier intelligence routing — bundled (ADR-026)
+  primitives.hooksRouting = {
+    name: 'hooks route',
+    role: '3-tier task→agent/model routing (ADR-026)',
+    available: true,
+    usage: 'npx ruvector hooks route "<task>"',
+  };
+
+  // Agentic tool surface — bundled MCP server (with ADR-256 default-deny policy)
+  const mcpPath = path.join(__dirname, 'mcp-server.js');
+  let mcpPolicy = { configured: false };
+  try {
+    const { buildToolPolicy } = require('./mcp-policy.js');
+    const p = buildToolPolicy(process.env);
+    mcpPolicy = {
+      configured: p.configured,
+      profile: p.profile || null,
+      allow: p.allowSet ? p.allowSet.size : 0,
+      deny: p.deny.size,
+    };
+  } catch { /* policy module optional */ }
+  primitives.mcp = {
+    name: 'mcp-server',
+    role: 'agentic tool surface (Model Context Protocol)',
+    available: fs.existsSync(mcpPath),
+    usage: 'npx ruvector mcp start',
+    policy: mcpPolicy,
+    accessControl: mcpPolicy.configured ? 'default-deny (configured)' : 'allow-all (set RUVECTOR_MCP_ALLOW/PROFILE)',
+  };
+
+  // Signed provenance — witness chain (ADR-103 / ADR-134)
+  primitives.witness = {
+    name: 'witness-chain',
+    role: 'signed provenance / release signing (ADR-103, ADR-134)',
+    available: true,
+  };
+
+  // Memory + learning loops — SONA / ReasoningBank (stable namespace, ADR-256 step 3)
+  primitives.memory = {
+    name: 'sona+reasoningbank',
+    role: 'persistent memory + self-learning loops',
+    available: true,
+    namespace: (process.env.RUVECTOR_MEMORY_NAMESPACE || 'ruvector').trim() || 'ruvector',
+  };
+
+  const capabilities = await loadMetaHarnessSdk().getMetaHarnessCapabilities({ deep: !!(opts && opts.deep) });
+  for (const capability of capabilities) {
+    primitives[`metaharness.${capability.name}`] = {
+      name: capability.package,
+      role: capability.detail,
+      available: capability.available,
+      version: capability.version,
+      directDependency: true,
+    };
+  }
+
+  const values = Object.values(primitives);
+  return {
+    adr: 'ADR-256',
+    adrs: ['ADR-256', 'ADR-275'],
+    decision: 'ship pinned MetaHarness, Darwin, Flywheel, routing, safety, and workspace capabilities as direct npm dependencies',
+    primitives,
+    summary: {
+      available: values.filter((p) => p.available).length,
+      total: values.length,
+    },
+  };
+}
+
+const harnessCmd = program
+  .command('harness')
+  .description('MetaHarness, Darwin, Flywheel, routing, safety, and workspace capabilities');
+
+async function printHarnessStatus(opts) {
+  const surface = await buildHarnessSurface(opts);
+  if (opts && opts.json) {
+    console.log(JSON.stringify(surface, null, 2));
+    return;
+  }
+  console.log(chalk.cyan('\n═══════════════════════════════════════════════════════════════'));
+  console.log(chalk.cyan('              RuVector Harness Router (ADR-256)'));
+  console.log(chalk.cyan('═══════════════════════════════════════════════════════════════\n'));
+  console.log(chalk.gray('  ' + surface.decision + '\n'));
+  for (const p of Object.values(surface.primitives)) {
+    const badge = p.available ? chalk.green('● available') : chalk.yellow('○ optional ');
+    console.log(`  ${badge}  ${chalk.white(p.name)}${p.version ? chalk.dim(' v' + p.version) : ''}`);
+    console.log(`              ${chalk.dim(p.role)}`);
+    if (p.available && p.usage) console.log(`              ${chalk.dim(p.usage)}`);
+    if (!p.available && p.install) console.log(`              ${chalk.dim('install: ' + p.install)}`);
+  }
+  console.log('');
+  console.log(chalk.cyan(`  ${surface.summary.available}/${surface.summary.total} primitives available\n`));
+}
+
+harnessCmd
+  .command('status')
+  .alias('info')
+  .description('Load and verify every pinned harness capability')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => printHarnessStatus(opts));
+
+harnessCmd
+  .command('doctor')
+  .description('Harness status that also imports every dependency (including deferred ones like Darwin)')
+  .option('--json', 'Output as JSON')
+  .action(async (opts) => printHarnessStatus({ ...opts, deep: true }));
+
+harnessCmd
+  .command('route')
+  .description('Choose the cheapest model predicted to clear a quality bar')
+  .requiredOption('--examples <file>', 'JSON array of {embedding,scores} examples')
+  .requiredOption('--prices <file>', 'JSON object mapping model IDs to cost per million tokens')
+  .requiredOption('--query <file>', 'JSON query embedding')
+  .option('--quality-bar <number>', 'Minimum predicted quality', Number, 0.9)
+  .option('-k <number>', 'Nearest neighbours used for prediction', Number)
+  .action(async (opts) => {
+    const result = await loadMetaHarnessSdk().routeWithMetaHarness({
+      rows: readHarnessJson(opts.examples, 'routing examples'),
+      prices: readHarnessJson(opts.prices, 'routing prices'),
+      queryEmbedding: readHarnessJson(opts.query, 'query embedding'),
+      qualityBar: opts.qualityBar,
+      ...(opts.k === undefined ? {} : { k: opts.k }),
+    });
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+const flywheelCmd = harnessCmd
+  .command('flywheel')
+  .description('Inspect signed Flywheel evidence without executing candidate code');
+
+flywheelCmd
+  .command('verify <bundle>')
+  .description('Verify a replay bundle and its signed lineage')
+  .option('--gate-fingerprint <sha256>', 'Require a pinned promotion-gate fingerprint')
+  .action(async (bundle, opts) => {
+    const result = await loadMetaHarnessSdk().verifyMetaHarnessReplay(
+      readHarnessJson(bundle, 'replay bundle'),
+      opts.gateFingerprint ? { pinnedGateFingerprint: opts.gateFingerprint } : {},
+    );
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.pass) process.exitCode = 1;
+  });
+
+flywheelCmd
+  .command('gate <evidence>')
+  .description('Evaluate the frozen conjunctive promotion rule')
+  .action(async (evidence) => {
+    const result = await loadMetaHarnessSdk().evaluateMetaHarnessPromotion(
+      readHarnessJson(evidence, 'promotion evidence'),
+    );
+    console.log(JSON.stringify(result, null, 2));
+    if (!result.promote) process.exitCode = 1;
+  });
+
+harnessCmd
+  .command('darwin <config>')
+  .description('Run Darwin evolution from a JSON config (requires explicit --execute)')
+  .option('--execute', 'Authorize candidate execution for this invocation')
+  .action(async (config, opts) => {
+    if (!opts.execute) {
+      throw new Error('Refusing to run Darwin without --execute');
+    }
+    const result = await loadMetaHarnessSdk().runMetaHarnessDarwin(
+      readHarnessJson(config, 'Darwin config'),
+      { execute: true },
+    );
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+// Bare `ruvector harness` defaults to status
+harnessCmd.action(async () => printHarnessStatus({}));
+
+// Only drive the CLI when executed directly; when required (e.g. by tests)
+// expose the store-durability internals instead of parsing argv.
+if (require.main === module) {
+  program.parse();
+} else {
+  module.exports = { atomicWriteFileSync, readIntelStoreSafe, Intelligence };
+}

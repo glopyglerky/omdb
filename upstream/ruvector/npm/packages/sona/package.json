@@ -1,0 +1,79 @@
+{
+  "name": "@ruvector/sona",
+  "version": "0.1.13",
+  "description": "SONA self-learning runtime: adaptive LoRA, EWC++ and ReasoningBank for LLM routing and AI systems, for Node.js and WASM.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "binaryName": "sona",
+    "targets": [
+      "x86_64-unknown-linux-gnu",
+      "x86_64-unknown-linux-musl",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-apple-darwin",
+      "aarch64-apple-darwin",
+      "x86_64-pc-windows-msvc",
+      "aarch64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release -p ruvector-sona --cargo-cwd ../../../crates/sona --features napi",
+    "build:debug": "napi build --platform -p ruvector-sona --cargo-cwd ../../../crates/sona --features napi",
+    "prepublishOnly": "node -e \"const fs=require('fs');const missing=['index.js','index.d.ts'].filter(f=>!fs.existsSync(f));if(missing.length){console.error('ERROR: cannot publish @ruvector/sona: missing build output: '+missing.join(', ')+'. Run npm run build first (napi build against crates/sona, requires cargo + @napi-rs/cli). npm silently skips missing files entries, which is how the broken 0.1.6 tarball shipped.');process.exit(1)}if(!fs.readdirSync('.').some(f=>f.endsWith('.node'))){console.warn('WARNING: no local .node binary found; installs will rely solely on @ruvector/sona-* optionalDependencies.')}\"",
+    "test": "node --test",
+    "universal": "napi universal",
+    "version": "napi version"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "keywords": [
+    "self-learning",
+    "lora",
+    "llm-routing",
+    "machine-learning",
+    "napi",
+    "ruvector",
+    "sona",
+    "ruvnet",
+    "ai",
+    "nodejs",
+    "llm",
+    "wasm",
+    "neural-network"
+  ],
+  "author": "rUv Team <team@ruv.io>",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git",
+    "directory": "npm/packages/sona"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "engines": {
+    "node": ">= 16"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "*.node"
+  ],
+  "optionalDependencies": {
+    "@ruvector/sona-linux-x64-gnu": "0.1.11",
+    "@ruvector/sona-linux-x64-musl": "0.1.11",
+    "@ruvector/sona-linux-arm64-gnu": "0.1.11",
+    "@ruvector/sona-darwin-x64": "0.1.11",
+    "@ruvector/sona-darwin-arm64": "0.1.11",
+    "@ruvector/sona-win32-x64-msvc": "0.1.11",
+    "@ruvector/sona-win32-arm64-msvc": "0.1.11"
+  }
+}

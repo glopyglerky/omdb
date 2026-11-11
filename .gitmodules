@@ -1,0 +1,9 @@
+[submodule "upstream/ruvector/examples/vectorvroom"]
+	path = upstream/ruvector/examples/vectorvroom
+	url = https://github.com/shaal/VectorVroom.git
+[submodule "upstream/ruvector/external/ruqu"]
+	path = upstream/ruvector/external/ruqu
+	url = https://github.com/ruvnet/ruqu.git
+[submodule "upstream/ruvector/external/rvdna"]
+	path = upstream/ruvector/external/rvdna
+	url = https://github.com/ruvnet/rvdna.git

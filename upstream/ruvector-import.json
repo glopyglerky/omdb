@@ -1,0 +1,25 @@
+{
+  "repository": "https://github.com/ruvnet/RuVector.git",
+  "commit": "39a104e50388d41837f86e4001096a01927e1728",
+  "tree": "4553930c20e6ec1a36c021873c8f86f1ccea2be0",
+  "path": "upstream/ruvector",
+  "tracked_blobs": 13884,
+  "tracked_blob_bytes": 389693247,
+  "submodules": [
+    {
+      "path": "examples/vectorvroom",
+      "repository": "https://github.com/shaal/VectorVroom.git",
+      "commit": "4c2527b4526ccb8960cd13e3d9e1802d958dca60"
+    },
+    {
+      "path": "external/ruqu",
+      "repository": "https://github.com/ruvnet/ruqu.git",
+      "commit": "d7f572890a766584d9eed188fa8af5d65c96cca4"
+    },
+    {
+      "path": "external/rvdna",
+      "repository": "https://github.com/ruvnet/rvdna.git",
+      "commit": "333bc4c40b81adf604452e3b9289f406460b5be1"
+    }
+  ]
+}

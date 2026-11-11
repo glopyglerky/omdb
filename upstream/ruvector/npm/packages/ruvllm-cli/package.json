@@ -1,0 +1,69 @@
+{
+  "name": "@ruvector/ruvllm-cli",
+  "version": "0.1.2",
+  "description": "CLI for LLM inference, benchmarking, and model management - run local LLMs with Metal/CUDA acceleration",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "ruvllm": "./bin/ruvllm.js"
+  },
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "test": "node --test test/*.test.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.30",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "cli",
+    "llm",
+    "benchmark",
+    "inference",
+    "local-llm",
+    "ai",
+    "ruvector",
+    "ruvllm",
+    "ruvnet",
+    "cuda",
+    "machine-learning"
+  ],
+  "author": "rUv Team <team@ruv.io>",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "directory": "npm/packages/ruvllm-cli",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ]
+}

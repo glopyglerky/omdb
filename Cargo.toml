@@ -21,6 +21,7 @@ exclude = [
     "justfile",
     "rustfmt.toml",
     "scripts/",
+    "upstream/",
 ]
 edition.workspace = true
 rust-version.workspace = true
@@ -32,6 +33,7 @@ authors.workspace = true
 [workspace]
 members = [".", "crates/redb-bench", "crates/redb-bench-compare", "crates/redb-derive", "crates/redb-derive-rename-test", "crates/redb-python"]
 default-members = [".", "crates/redb-derive", "crates/redb-derive-rename-test", "crates/redb-python"]
+exclude = ["upstream/ruvector"]
 
 [workspace.package]
 edition = "2024"

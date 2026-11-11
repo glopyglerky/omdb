@@ -1,0 +1,57 @@
+{
+  "name": "@ruvector/core",
+  "version": "0.1.38",
+  "description": "Vector database core with HNSW indexing, built in Rust with native Node.js bindings, for similarity search, semantic search and RAG.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "author": "ruv.io Team <info@ruv.io> (https://ruv.io)",
+  "homepage": "https://ruv.io",
+  "repository": {
+    "directory": "npm/packages/core",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build:napi": "napi build --platform --release --cargo-cwd ../../../crates/ruvector-node",
+    "test": "node test.js && node test-retrieval.js",
+    "publish:platforms": "node scripts/publish-platforms.js"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "optionalDependencies": {
+    "ruvector-core-linux-x64-gnu": "0.1.35",
+    "ruvector-core-linux-arm64-gnu": "0.1.35",
+    "ruvector-core-darwin-x64": "0.1.35",
+    "ruvector-core-darwin-arm64": "0.1.35",
+    "ruvector-core-win32-x64-msvc": "0.1.35"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "vector-database",
+    "vector-search",
+    "hnsw",
+    "embeddings",
+    "rust",
+    "napi",
+    "ruvector",
+    "ruvnet",
+    "semantic-search",
+    "rag",
+    "simd"
+  ]
+}

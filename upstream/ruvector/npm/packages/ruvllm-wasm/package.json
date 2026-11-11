@@ -1,0 +1,63 @@
+{
+  "name": "@ruvector/ruvllm-wasm",
+  "version": "2.0.5",
+  "description": "WASM bindings for RuvLLM - browser-compatible LLM inference runtime with WebGPU acceleration",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "node scripts/guard-publish.mjs && npm run build",
+    "test": "node --test test/*.test.js",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.30",
+    "@webgpu/types": "^0.1.69",
+    "typescript": "^5.9.3"
+  },
+  "keywords": [
+    "wasm",
+    "llm",
+    "inference",
+    "webgpu",
+    "local-llm",
+    "ruvector",
+    "ruvllm",
+    "ruvnet"
+  ],
+  "author": "rUv Team <team@ruv.io>",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git",
+    "directory": "npm/packages/ruvllm-wasm"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
+}

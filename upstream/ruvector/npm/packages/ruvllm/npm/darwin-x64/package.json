@@ -1,0 +1,31 @@
+{
+  "name": "@ruvector/ruvllm-darwin-x64",
+  "version": "2.5.6",
+  "description": "RuvLLM native bindings for macOS x64 (Intel)",
+  "homepage": "https://ruv.io",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "ruvllm.darwin-x64.node",
+  "files": [
+    "ruvllm.darwin-x64.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/RuVector.git",
+    "directory": "npm/packages/ruvllm/npm/darwin-x64"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/RuVector/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">= 16"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

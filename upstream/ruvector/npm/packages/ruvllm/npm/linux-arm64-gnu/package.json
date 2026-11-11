@@ -1,0 +1,34 @@
+{
+  "name": "@ruvector/ruvllm-linux-arm64-gnu",
+  "version": "2.0.0",
+  "description": "RuvLLM native bindings for Linux ARM64 (glibc)",
+  "homepage": "https://ruv.io",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "ruvllm.linux-arm64-gnu.node",
+  "files": [
+    "ruvllm.linux-arm64-gnu.node"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/RuVector.git",
+    "directory": "npm/packages/ruvllm/npm/linux-arm64-gnu"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/RuVector/issues"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">= 16"
+  },
+  "libc": [
+    "glibc"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

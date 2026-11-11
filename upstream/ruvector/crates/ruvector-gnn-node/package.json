@@ -1,0 +1,76 @@
+{
+  "name": "@ruvector/gnn",
+  "version": "0.1.28",
+  "description": "Graph neural network (GNN) layers for RuVector: native Node.js bindings for message passing and graph-aware vector search.",
+  "homepage": "https://ruv.io",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "napi": {
+    "name": "ruvector-gnn",
+    "triples": {
+      "defaults": false,
+      "additional": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-unknown-linux-musl",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc"
+      ]
+    }
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepublishOnly": "node -e \"const fs=require('fs');const missing=['index.js','index.d.ts'].filter(f=>!fs.existsSync(f));if(missing.length){console.error('ERROR: cannot publish @ruvector/gnn: missing '+missing.join(', ')+'. They are committed; restore them or regenerate with npm run build (napi CLI v2). npm silently skips missing files entries.');process.exit(1)}\"",
+    "test": "node --test test/*.test.js",
+    "version": "napi version"
+  },
+  "keywords": [
+    "gnn",
+    "machine-learning",
+    "vector-database",
+    "napi",
+    "rust",
+    "ruvector",
+    "ruvnet",
+    "hnsw",
+    "nodejs",
+    "graph",
+    "neural-network"
+  ],
+  "author": "Ruvector Team",
+  "license": "MIT",
+  "repository": {
+    "directory": "crates/ruvector-gnn-node",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.16.0"
+  },
+  "engines": {
+    "node": ">= 10"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "optionalDependencies": {
+    "@ruvector/gnn-linux-x64-gnu": "0.1.28",
+    "@ruvector/gnn-linux-x64-musl": "0.1.28",
+    "@ruvector/gnn-linux-arm64-gnu": "0.1.28",
+    "@ruvector/gnn-darwin-x64": "0.1.28",
+    "@ruvector/gnn-darwin-arm64": "0.1.28",
+    "@ruvector/gnn-win32-x64-msvc": "0.1.28"
+  }
+}
