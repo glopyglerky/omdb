@@ -1,0 +1,457 @@
+//! WebAssembly bindings for RuVector Graph Database
+//!
+//! This module provides high-performance browser bindings for a Neo4j-inspired graph database
+//! built on RuVector's hypergraph infrastructure.
+//!
+//! Features:
+//! - Node and edge CRUD operations
+//! - Hyperedge support for n-ary relationships
+//! - Basic Cypher query support
+//! - Web Workers support for parallel operations
+//! - Async query execution with streaming results
+//! - IndexedDB persistence (planned)
+
+use js_sys::{Array, Object, Promise, Reflect};
+use parking_lot::Mutex;
+use ruvector_core::advanced::hypergraph::{
+    Hyperedge as CoreHyperedge, HypergraphIndex, TemporalGranularity, TemporalHyperedge,
+};
+use ruvector_core::types::DistanceMetric;
+use serde_wasm_bindgen::{from_value, to_value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use uuid::Uuid;
+use wasm_bindgen::prelude::*;
+use web_sys::console;
+
+pub mod async_ops;
+mod cypher_exec;
+mod delete;
+mod export;
+pub mod types;
+
+use cypher_exec::Store;
+use types::{
+    js_object_to_hashmap, Edge, EdgeId, GraphError, Hyperedge, HyperedgeId, JsEdge, JsHyperedge,
+    JsNode, Node, NodeId, QueryResult,
+};
+
+/// Initialize panic hook for better error messages
+#[wasm_bindgen(start)]
+pub fn init() {
+    console_error_panic_hook::set_once();
+    tracing_wasm::set_as_global_default();
+}
+
+/// Main GraphDB class for browser usage
+#[wasm_bindgen]
+pub struct GraphDB {
+    nodes: Arc<Mutex<HashMap<NodeId, Node>>>,
+    edges: Arc<Mutex<HashMap<EdgeId, Edge>>>,
+    hypergraph: Arc<Mutex<HypergraphIndex>>,
+    hyperedges: Arc<Mutex<HashMap<HyperedgeId, Hyperedge>>>,
+    // Index structures for efficient queries
+    labels_index: Arc<Mutex<HashMap<String, Vec<NodeId>>>>,
+    edge_types_index: Arc<Mutex<HashMap<String, Vec<EdgeId>>>>,
+    node_edges_out: Arc<Mutex<HashMap<NodeId, Vec<EdgeId>>>>,
+    node_edges_in: Arc<Mutex<HashMap<NodeId, Vec<EdgeId>>>>,
+    distance_metric: DistanceMetric,
+}
+
+#[wasm_bindgen]
+impl GraphDB {
+    /// Create a new GraphDB instance
+    ///
+    /// # Arguments
+    /// * `metric` - Distance metric for hypergraph embeddings ("euclidean", "cosine", "dotproduct", "manhattan")
+    #[wasm_bindgen(constructor)]
+    pub fn new(metric: Option<String>) -> Result<GraphDB, JsValue> {
+        let distance_metric = match metric.as_deref() {
+            Some("euclidean") => DistanceMetric::Euclidean,
+            Some("cosine") => DistanceMetric::Cosine,
+            Some("dotproduct") => DistanceMetric::DotProduct,
+            Some("manhattan") => DistanceMetric::Manhattan,
+            None => DistanceMetric::Cosine,
+            Some(other) => return Err(JsValue::from_str(&format!("Unknown metric: {}", other))),
+        };
+
+        Ok(GraphDB {
+            nodes: Arc::new(Mutex::new(HashMap::new())),
+            edges: Arc::new(Mutex::new(HashMap::new())),
+            hypergraph: Arc::new(Mutex::new(HypergraphIndex::new(distance_metric))),
+            hyperedges: Arc::new(Mutex::new(HashMap::new())),
+            labels_index: Arc::new(Mutex::new(HashMap::new())),
+            edge_types_index: Arc::new(Mutex::new(HashMap::new())),
+            node_edges_out: Arc::new(Mutex::new(HashMap::new())),
+            node_edges_in: Arc::new(Mutex::new(HashMap::new())),
+            distance_metric,
+        })
+    }
+
+    /// Execute a Cypher query
+    ///
+    /// Supports MATCH (with WHERE and OPTIONAL MATCH), CREATE (including
+    /// relationships between nodes bound by an earlier MATCH), RETURN with
+    /// DISTINCT, count/sum/avg/min/max/collect, ORDER BY, SKIP and LIMIT.
+    /// WITH, MERGE, SET, REMOVE, DELETE, variable-length paths and regex
+    /// operators are rejected with an error.
+    ///
+    /// # Arguments
+    /// * `cypher` - Cypher query string
+    ///
+    /// # Returns
+    /// Promise<QueryResult>. Rows are in `data`. Bare node and edge values are also
+    /// listed in `nodes` and `edges`.
+    #[wasm_bindgen]
+    pub async fn query(&self, cypher: String) -> Result<QueryResult, JsValue> {
+        let result = self
+            .execute_cypher(&cypher)
+            .map_err(|e| JsValue::from(GraphError::from(e)))?;
+
+        Ok(result)
+    }
+
+    /// Create a new node
+    ///
+    /// # Arguments
+    /// * `labels` - Array of label strings
+    /// * `properties` - JavaScript object with node properties
+    ///
+    /// # Returns
+    /// Node ID
+    #[wasm_bindgen(js_name = createNode)]
+    pub fn create_node(&self, labels: Vec<String>, properties: JsValue) -> Result<String, JsValue> {
+        let props = js_object_to_hashmap(properties).map_err(|e| JsValue::from_str(&e))?;
+        Ok(self.lock_store().insert_node(labels, props))
+    }
+
+    /// Create a new edge (relationship)
+    ///
+    /// # Arguments
+    /// * `from` - Source node ID
+    /// * `to` - Target node ID
+    /// * `edge_type` - Relationship type
+    /// * `properties` - JavaScript object with edge properties
+    ///
+    /// # Returns
+    /// Edge ID
+    #[wasm_bindgen(js_name = createEdge)]
+    pub fn create_edge(
+        &self,
+        from: String,
+        to: String,
+        edge_type: String,
+        properties: JsValue,
+    ) -> Result<String, JsValue> {
+        let props = js_object_to_hashmap(properties).map_err(|e| JsValue::from_str(&e))?;
+        self.lock_store()
+            .insert_edge(from, to, edge_type, props)
+            .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Create a hyperedge (n-ary relationship)
+    ///
+    /// # Arguments
+    /// * `nodes` - Array of node IDs
+    /// * `description` - Natural language description of the relationship
+    /// * `embedding` - Optional embedding vector (auto-generated if not provided)
+    /// * `confidence` - Optional confidence score (0.0-1.0, defaults to 1.0)
+    ///
+    /// # Returns
+    /// Hyperedge ID
+    #[wasm_bindgen(js_name = createHyperedge)]
+    pub fn create_hyperedge(
+        &self,
+        nodes: Vec<String>,
+        description: String,
+        embedding: Option<Vec<f32>>,
+        confidence: Option<f32>,
+    ) -> Result<String, JsValue> {
+        // Verify all nodes exist
+        let nodes_map = self.nodes.lock();
+        for node_id in &nodes {
+            if !nodes_map.contains_key(node_id) {
+                return Err(JsValue::from_str(&format!("Node {} not found", node_id)));
+            }
+        }
+        drop(nodes_map);
+
+        let id = Uuid::new_v4().to_string();
+
+        // Generate embedding if not provided (use average of node embeddings)
+        let emb = if let Some(e) = embedding {
+            e
+        } else {
+            self.generate_hyperedge_embedding(&nodes)
+                .map_err(|e| JsValue::from_str(&e))?
+        };
+
+        let conf = confidence.unwrap_or(1.0).clamp(0.0, 1.0);
+
+        let hyperedge = Hyperedge {
+            id: id.clone(),
+            nodes: nodes.clone(),
+            description: description.clone(),
+            embedding: emb.clone(),
+            confidence: conf,
+            properties: HashMap::new(),
+        };
+
+        // Create core hyperedge
+        let core_hyperedge = CoreHyperedge {
+            id: id.clone(),
+            nodes: nodes.clone(),
+            description,
+            embedding: emb,
+            confidence: conf,
+            metadata: HashMap::new(),
+        };
+
+        // Add to hypergraph index
+        self.hypergraph
+            .lock()
+            .add_hyperedge(core_hyperedge)
+            .map_err(|e| JsValue::from_str(&format!("Failed to add hyperedge: {}", e)))?;
+
+        // Store hyperedge
+        self.hyperedges.lock().insert(id.clone(), hyperedge);
+
+        Ok(id)
+    }
+
+    /// Get a node by ID
+    ///
+    /// # Arguments
+    /// * `id` - Node ID
+    ///
+    /// # Returns
+    /// JsNode or null if not found
+    #[wasm_bindgen(js_name = getNode)]
+    pub fn get_node(&self, id: String) -> Option<JsNode> {
+        self.nodes.lock().get(&id).map(|n| n.to_js())
+    }
+
+    /// Get an edge by ID
+    #[wasm_bindgen(js_name = getEdge)]
+    pub fn get_edge(&self, id: String) -> Option<JsEdge> {
+        self.edges.lock().get(&id).map(|e| e.to_js())
+    }
+
+    /// Get a hyperedge by ID
+    #[wasm_bindgen(js_name = getHyperedge)]
+    pub fn get_hyperedge(&self, id: String) -> Option<JsHyperedge> {
+        self.hyperedges.lock().get(&id).map(|h| h.to_js())
+    }
+
+    /// Delete a node by ID
+    ///
+    /// # Arguments
+    /// * `id` - Node ID
+    ///
+    /// # Returns
+    /// True if deleted, false if not found
+    #[wasm_bindgen(js_name = deleteNode)]
+    pub fn delete_node(&self, id: String) -> bool {
+        // Also removes the node's edges and every hyperedge that contains it.
+        self.lock_store().remove_node(&id)
+    }
+
+    /// Delete an edge by ID
+    #[wasm_bindgen(js_name = deleteEdge)]
+    pub fn delete_edge(&self, id: String) -> bool {
+        self.lock_store().remove_edge(&id)
+    }
+
+    /// Import Cypher statements
+    ///
+    /// # Arguments
+    /// * `statements` - Array of Cypher CREATE statements
+    ///
+    /// # Returns
+    /// Number of statements executed
+    #[wasm_bindgen(js_name = importCypher)]
+    pub async fn import_cypher(&self, statements: Vec<String>) -> Result<usize, JsValue> {
+        let mut count = 0;
+        for statement in statements {
+            self.execute_cypher(&statement)
+                .map_err(|e| JsValue::from_str(&e))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Export nodes and edges as one Cypher CREATE statement on a single line
+    ///
+    /// # Returns
+    /// A statement that `query` or `importCypher` loads back with the same nodes,
+    /// edges, labels and properties (IDs are regenerated). Hyperedges are not
+    /// exported. Empty string for an empty graph.
+    #[wasm_bindgen(js_name = exportCypher)]
+    pub fn export_cypher(&self) -> String {
+        export::export_cypher(&self.lock_store())
+    }
+
+    /// Get database statistics
+    #[wasm_bindgen]
+    pub fn stats(&self) -> JsValue {
+        let node_count = self.nodes.lock().len();
+        let edge_count = self.edges.lock().len();
+        let hyperedge_count = self.hyperedges.lock().len();
+        let hypergraph_stats = self.hypergraph.lock().stats();
+
+        let obj = Object::new();
+        Reflect::set(&obj, &"nodeCount".into(), &JsValue::from(node_count)).unwrap();
+        Reflect::set(&obj, &"edgeCount".into(), &JsValue::from(edge_count)).unwrap();
+        Reflect::set(
+            &obj,
+            &"hyperedgeCount".into(),
+            &JsValue::from(hyperedge_count),
+        )
+        .unwrap();
+        Reflect::set(
+            &obj,
+            &"hypergraphEntities".into(),
+            &JsValue::from(hypergraph_stats.total_entities),
+        )
+        .unwrap();
+        Reflect::set(
+            &obj,
+            &"hypergraphEdges".into(),
+            &JsValue::from(hypergraph_stats.total_hyperedges),
+        )
+        .unwrap();
+        Reflect::set(
+            &obj,
+            &"avgEntityDegree".into(),
+            &JsValue::from(hypergraph_stats.avg_entity_degree),
+        )
+        .unwrap();
+
+        obj.into()
+    }
+}
+
+// Internal helper methods
+impl GraphDB {
+    /// Locks every graph map in one fixed order and returns a view over them.
+    fn lock_store(&self) -> Store<'_> {
+        Store {
+            nodes: self.nodes.lock(),
+            edges: self.edges.lock(),
+            labels_index: self.labels_index.lock(),
+            edge_types_index: self.edge_types_index.lock(),
+            node_edges_out: self.node_edges_out.lock(),
+            node_edges_in: self.node_edges_in.lock(),
+            hypergraph: self.hypergraph.lock(),
+            hyperedges: self.hyperedges.lock(),
+        }
+    }
+
+    fn execute_cypher(&self, cypher: &str) -> Result<QueryResult, String> {
+        let mut store = self.lock_store();
+        let output = cypher_exec::execute(&mut store, cypher.trim())?;
+
+        let nodes = output
+            .node_ids
+            .iter()
+            .filter_map(|id| store.nodes.get(id).map(Node::to_js))
+            .collect();
+        let edges = output
+            .edge_ids
+            .iter()
+            .filter_map(|id| store.edges.get(id).map(Edge::to_js))
+            .collect();
+        let data = output
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().collect::<HashMap<_, _>>())
+            .collect();
+
+        Ok(QueryResult {
+            nodes,
+            edges,
+            hyperedges: Vec::new(),
+            data,
+        })
+    }
+
+    fn generate_hyperedge_embedding(&self, node_ids: &[String]) -> Result<Vec<f32>, String> {
+        let nodes = self.nodes.lock();
+        let embeddings: Vec<Vec<f32>> = node_ids
+            .iter()
+            .filter_map(|id| nodes.get(id).and_then(|n| n.embedding.clone()))
+            .collect();
+
+        if embeddings.is_empty() {
+            return Err("No embeddings found for nodes".to_string());
+        }
+
+        let dim = embeddings[0].len();
+        if embeddings.iter().any(|e| e.len() != dim) {
+            return Err(format!(
+                "Node embeddings differ in dimension; pass an explicit {}-dimension embedding",
+                dim
+            ));
+        }
+        let mut avg_embedding = vec![0.0; dim];
+
+        for emb in &embeddings {
+            for (i, val) in emb.iter().enumerate() {
+                avg_embedding[i] += val;
+            }
+        }
+
+        for val in &mut avg_embedding {
+            *val /= embeddings.len() as f32;
+        }
+
+        Ok(avg_embedding)
+    }
+}
+
+/// Get version information
+#[wasm_bindgen]
+pub fn version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasm_bindgen_test::*;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    fn test_version() {
+        assert!(!version().is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    fn test_graph_creation() {
+        let db = GraphDB::new(Some("cosine".to_string())).unwrap();
+        assert!(true); // Basic smoke test
+    }
+
+    #[test]
+    fn hyperedge_embedding_rejects_mismatched_dimensions() {
+        // Indexing past the first embedding's length panicked, and a panic in wasm
+        // leaves every graph lock held, so the instance never answered again.
+        let db = GraphDB::new(None).unwrap();
+        let emb = |v: serde_json::Value| [("embedding".to_string(), v)].into();
+        let a = db
+            .lock_store()
+            .insert_node(vec![], emb(serde_json::json!([1.0, 2.0])));
+        let b = db
+            .lock_store()
+            .insert_node(vec![], emb(serde_json::json!([1.0, 2.0, 3.0])));
+        let err = db
+            .generate_hyperedge_embedding(&[a.clone(), b])
+            .unwrap_err();
+        assert!(err.contains("dimension"), "{}", err);
+        assert_eq!(
+            db.generate_hyperedge_embedding(&[a]).unwrap(),
+            vec![1.0, 2.0]
+        );
+    }
+}

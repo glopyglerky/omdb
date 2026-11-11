@@ -1,0 +1,453 @@
+name: Build Attention Native Modules
+# Trigger build for v0.1.30 release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/ruvector-attention/**'
+      - 'crates/ruvector-attention-node/**'
+      - 'crates/ruvector-attention-wasm/**'
+      - '.github/workflows/build-attention.yml'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/build-attention.yml'
+      - 'crates/ruvector-attention/**'
+      - 'crates/ruvector-attention-node/**'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - host: ubuntu-24.04
+            container: ubuntu:22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64-gnu
+          - host: ubuntu-24.04
+            container: ubuntu:22.04
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64-gnu
+          - host: macos-15
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+          - host: macos-15
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+          - host: windows-2022
+            target: x86_64-pc-windows-msvc
+            platform: win32-x64-msvc
+
+    name: Build ${{ matrix.settings.platform }}
+    runs-on: ${{ matrix.settings.host }}
+    container: ${{ matrix.settings.container }}
+
+    steps:
+      - name: Bootstrap ubuntu:22.04 build container (keeps the glibc floor)
+        if: ${{ matrix.settings.container != '' }}
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            sudo git curl wget ca-certificates build-essential pkg-config xz-utils unzip zip python3 jq file \
+            libssl-dev cmake clang libclang-dev
+          git config --global --add safe.directory '*'
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          targets: ${{ matrix.settings.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: attention-${{ matrix.settings.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.settings.platform == 'linux-arm64-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install NAPI-RS CLI
+        run: npm install -g @napi-rs/cli
+
+      - name: Install dependencies
+        working-directory: crates/ruvector-attention-node
+        run: npm install
+
+      - name: Build native module
+        working-directory: crates/ruvector-attention-node
+        run: napi build --platform --release --target ${{ matrix.settings.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: List built files
+        shell: bash
+        run: |
+          echo "=== Built .node files ==="
+          find crates/ruvector-attention-node -name "*.node" -type f
+          ls -la crates/ruvector-attention-node/*.node 2>/dev/null || true
+
+      - name: Copy to platform package
+        shell: bash
+        run: |
+          # napi --platform writes exactly attention.<platform>.node at the crate
+          # root. Do NOT `find` for it: `npm install` above pulls the host's
+          # previously published @ruvector/attention-<host> binary into
+          # node_modules, and a find | head -1 picked that stale host-arch file
+          # (linux-arm64-gnu shipped an x86-64 binary, darwin-x64 an arm64 one).
+          NODE_FILE="crates/ruvector-attention-node/attention.${{ matrix.settings.platform }}.node"
+
+          if [ ! -f "$NODE_FILE" ]; then
+            echo "ERROR: expected napi output $NODE_FILE not found"
+            ls -la crates/ruvector-attention-node/*.node || true
+            exit 1
+          fi
+
+          echo "Found: $NODE_FILE"
+
+          # Determine destination based on platform
+          case "${{ matrix.settings.platform }}" in
+            linux-x64-gnu)
+              DEST_DIR="crates/ruvector-attention-node/npm/linux-x64-gnu"
+              DEST_FILE="attention.linux-x64-gnu.node"
+              ;;
+            linux-arm64-gnu)
+              DEST_DIR="crates/ruvector-attention-node/npm/linux-arm64-gnu"
+              DEST_FILE="attention.linux-arm64-gnu.node"
+              ;;
+            darwin-x64)
+              DEST_DIR="crates/ruvector-attention-node/npm/darwin-x64"
+              DEST_FILE="attention.darwin-x64.node"
+              ;;
+            darwin-arm64)
+              DEST_DIR="crates/ruvector-attention-node/npm/darwin-arm64"
+              DEST_FILE="attention.darwin-arm64.node"
+              ;;
+            win32-x64-msvc)
+              DEST_DIR="crates/ruvector-attention-node/npm/win32-x64-msvc"
+              DEST_FILE="attention.win32-x64-msvc.node"
+              ;;
+          esac
+
+          mkdir -p "$DEST_DIR"
+          cp -v "$NODE_FILE" "$DEST_DIR/$DEST_FILE"
+          ls -la "$DEST_DIR/"
+
+      - name: Test native module
+        if: |
+          (matrix.settings.platform == 'linux-x64-gnu' && runner.os == 'Linux') ||
+          (matrix.settings.platform == 'darwin-x64' && runner.os == 'macOS' && runner.arch == 'X64') ||
+          (matrix.settings.platform == 'darwin-arm64' && runner.os == 'macOS' && runner.arch == 'ARM64') ||
+          (matrix.settings.platform == 'win32-x64-msvc' && runner.os == 'Windows')
+        continue-on-error: true
+        shell: bash
+        run: |
+          NODE_FILE="crates/ruvector-attention-node/attention.${{ matrix.settings.platform }}.node"
+          echo "Testing: $NODE_FILE"
+          node -e "
+            const native = require('./$NODE_FILE');
+            console.log('Exports:', Object.keys(native));
+            console.log('✅ Native module loaded successfully');
+          "
+
+      - name: Node tests against the committed loader and typings
+        if: matrix.settings.platform == 'linux-x64-gnu'
+        shell: bash
+        working-directory: crates/ruvector-attention-node
+        run: |
+          set -euo pipefail
+          # napi build regenerates index.js/index.d.ts with whatever CLI
+          # version CI installed; test the committed files that publish-all
+          # actually ships (every native export must be typed).
+          git checkout -- index.js index.d.ts
+          node --test test/*.test.js
+
+      - name: Assert binary architecture matches the platform
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          F="crates/ruvector-attention-node/npm/${{ matrix.settings.platform }}/attention.${{ matrix.settings.platform }}.node"
+          desc=$(file -b "$F"); echo "$F: $desc"
+          case "${{ matrix.settings.platform }}" in
+            linux-x64-gnu)   want='ELF 64-bit.*x86-64' ;;
+            linux-arm64-gnu) want='ELF 64-bit.*(ARM aarch64|aarch64)' ;;
+            darwin-x64)      want='Mach-O 64-bit.*x86_64' ;;
+            darwin-arm64)    want='Mach-O 64-bit.*arm64' ;;
+          esac
+          echo "$desc" | grep -Eq "$want" || { echo "::error::$F is not a ${{ matrix.settings.platform }} binary: $desc"; exit 1; }
+
+      - name: Gate linux-arm64 binary (no LDAPR, GLIBC <= 2.34)
+        if: matrix.settings.platform == 'linux-arm64-gnu'
+        shell: bash
+        run: bash scripts/ci/check-arm64-node-binary.sh crates/ruvector-attention-node/npm/linux-arm64-gnu/attention.linux-arm64-gnu.node
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: attention-${{ matrix.settings.platform }}
+          path: crates/ruvector-attention-node/npm/${{ matrix.settings.platform }}/*.node
+          if-no-files-found: error
+
+  build-wasm:
+    name: Build WASM
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          key: attention-wasm
+
+      - name: Build WASM
+        working-directory: crates/ruvector-attention-wasm
+        run: wasm-pack build --target nodejs --release
+
+      - name: List built files
+        run: ls -la crates/ruvector-attention-wasm/pkg/
+
+      - name: Upload WASM artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: attention-wasm
+          path: crates/ruvector-attention-wasm/pkg/
+          if-no-files-found: error
+
+  commit-binaries:
+    name: Commit Built Binaries
+    runs-on: ubuntu-24.04
+    needs: [build, build-wasm]
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: artifacts
+
+      - name: Copy binaries to platform packages
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find artifacts -name "*.node" -o -name "*.wasm"
+
+          # Copy native binaries
+          for platform in linux-x64-gnu linux-arm64-gnu darwin-x64 darwin-arm64 win32-x64-msvc; do
+            if [ -d "artifacts/attention-${platform}" ]; then
+              mkdir -p "crates/ruvector-attention-node/npm/${platform}"
+              cp -v artifacts/attention-${platform}/*.node "crates/ruvector-attention-node/npm/${platform}/" || true
+            fi
+          done
+
+          # Copy WASM
+          if [ -d "artifacts/attention-wasm" ]; then
+            mkdir -p crates/ruvector-attention-wasm/pkg
+            cp -rv artifacts/attention-wasm/* crates/ruvector-attention-wasm/pkg/
+          fi
+
+      - name: Show binary sizes
+        run: |
+          echo "=== Built Binaries ==="
+          find crates/ruvector-attention-node/npm -name "*.node" -exec ls -lh {} \;
+          find crates/ruvector-attention-wasm/pkg -name "*.wasm" -exec ls -lh {} \;
+
+      - name: Commit and push binaries
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f crates/ruvector-attention-node/npm/ crates/ruvector-attention-wasm/pkg/
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: Update attention NAPI-RS binaries for all platforms
+
+            Built from commit ${{ github.sha }}
+
+            Platforms updated:
+            - linux-x64-gnu
+            - linux-arm64-gnu
+            - darwin-x64
+            - darwin-arm64
+            - win32-x64-msvc
+            - wasm
+
+            🤖 Generated by GitHub Actions"
+            git push
+          fi
+
+  publish:
+    name: Publish Attention Platform Packages
+    runs-on: ubuntu-24.04
+    needs: [build, build-wasm]
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: artifacts
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find artifacts -name "*.node" -o -name "*.wasm" | head -50
+
+      - name: Publish platform packages to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "require('./crates/ruvector-attention-node/package.json').version")
+          echo "Publishing version: $VERSION"
+
+          # Publish each platform package
+          for dir in artifacts/attention-*/; do
+            platform=$(basename "$dir" | sed 's/attention-//')
+
+            # Skip wasm - handled separately
+            if [ "$platform" = "wasm" ]; then
+              continue
+            fi
+
+            NODE_FILE=$(find "$dir" -name "*.node" | head -1)
+
+            if [ -z "$NODE_FILE" ]; then
+              echo "No .node file found in $dir"
+              continue
+            fi
+
+            echo "=== Publishing @ruvector/attention-${platform}@${VERSION} ==="
+
+            # Create package directory
+            PKG_DIR="npm-pkg/attention-${platform}"
+            mkdir -p "$PKG_DIR"
+
+            # Determine OS, CPU, and libc based on platform
+            case "$platform" in
+              linux-x64-gnu)
+                OS="linux"; CPU="x64"; LIBC='"libc": ["glibc"],'
+                NODE_NAME="attention.linux-x64-gnu.node"
+                ;;
+              linux-arm64-gnu)
+                OS="linux"; CPU="arm64"; LIBC='"libc": ["glibc"],'
+                NODE_NAME="attention.linux-arm64-gnu.node"
+                ;;
+              darwin-x64)
+                OS="darwin"; CPU="x64"; LIBC=""
+                NODE_NAME="attention.darwin-x64.node"
+                ;;
+              darwin-arm64)
+                OS="darwin"; CPU="arm64"; LIBC=""
+                NODE_NAME="attention.darwin-arm64.node"
+                ;;
+              win32-x64-msvc)
+                OS="win32"; CPU="x64"; LIBC=""
+                NODE_NAME="attention.win32-x64-msvc.node"
+                ;;
+              *)
+                echo "Unknown platform: $platform"
+                continue
+                ;;
+            esac
+
+            # Copy and rename binary
+            cp "$NODE_FILE" "$PKG_DIR/$NODE_NAME"
+
+            # Create package.json
+            cat > "$PKG_DIR/package.json" << EOF
+          {
+            "name": "@ruvector/attention-${platform}",
+            "version": "${VERSION}",
+            "os": ["${OS}"],
+            "cpu": ["${CPU}"],
+            ${LIBC}
+            "main": "${NODE_NAME}",
+            "files": ["${NODE_NAME}"],
+            "description": "High-performance attention mechanisms - ${platform} platform binary",
+            "keywords": ["ruvector", "attention", "transformer", "napi-rs"],
+            "author": "rUv <ruv@ruv.io>",
+            "license": "MIT OR Apache-2.0",
+            "homepage": "https://ruv.io",
+            "repository": {"type": "git", "url": "git+https://github.com/ruvnet/RuVector.git", "directory": "crates/ruvector-attention-node/npm/${platform}"},
+            "bugs": {"url": "https://github.com/ruvnet/RuVector/issues"},
+            "engines": {"node": ">= 10"},
+            "publishConfig": {"registry": "https://registry.npmjs.org/", "access": "public"}
+          }
+          EOF
+
+            # Publish
+            cd "$PKG_DIR"
+            bash "$GITHUB_WORKSPACE/scripts/ci/npm-publish-if-missing.sh" --access public
+            cd ../..
+          done
+
+          echo "=== Platform package publishing complete ==="
+
+      - name: Publish main attention package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        working-directory: crates/ruvector-attention-node
+        run: |
+          set -euo pipefail
+          # Update optionalDependencies to include all ARM64 packages
+          VERSION=$(node -p "require('./package.json').version")
+
+          # Run prepublish to generate artifacts
+          npm run prepublishOnly || true
+
+          # Publish main package
+          bash "$GITHUB_WORKSPACE/scripts/ci/npm-publish-if-missing.sh" --access public
+
+      - name: Generate publish summary
+        run: |
+          echo "## Attention Package Publishing Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Published Platform Packages:" >> $GITHUB_STEP_SUMMARY
+          echo "- @ruvector/attention-linux-x64-gnu" >> $GITHUB_STEP_SUMMARY
+          echo "- @ruvector/attention-linux-arm64-gnu" >> $GITHUB_STEP_SUMMARY
+          echo "- @ruvector/attention-darwin-x64" >> $GITHUB_STEP_SUMMARY
+          echo "- @ruvector/attention-darwin-arm64" >> $GITHUB_STEP_SUMMARY
+          echo "- @ruvector/attention-win32-x64-msvc" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Main Package:" >> $GITHUB_STEP_SUMMARY
+          echo "- @ruvector/attention" >> $GITHUB_STEP_SUMMARY

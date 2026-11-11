@@ -1,0 +1,72 @@
+{
+  "name": "@ruvector/node",
+  "version": "0.1.28",
+  "description": "Unified Ruvector package - High-performance vector database with GNN capabilities for Node.js",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./gnn": {
+      "types": "./dist/gnn.d.ts",
+      "require": "./dist/gnn.js",
+      "import": "./dist/gnn.js",
+      "default": "./dist/gnn.js"
+    }
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "scripts": {
+    "build": "npm run build:cjs",
+    "build:cjs": "tsc --project tsconfig.cjs.json",
+    "prepublishOnly": "npm run build",
+    "test": "node --test",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@ruvector/core": "^0.1.36",
+    "@ruvector/gnn": "^0.1.15"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.25",
+    "typescript": "^5.9.3"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "gnn",
+    "nodejs",
+    "vector-search",
+    "vector-database",
+    "rust",
+    "rag",
+    "ruvector",
+    "ruvnet",
+    "embeddings",
+    "semantic-search",
+    "hnsw",
+    "napi"
+  ],
+  "author": "rUv",
+  "license": "MIT",
+  "repository": {
+    "directory": "npm/packages/node",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

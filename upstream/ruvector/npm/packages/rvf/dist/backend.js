@@ -1,0 +1,1327 @@
+"use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.WasmBackend = exports.NodeBackend = void 0;
+exports.resolveBackend = resolveBackend;
+const errors_1 = require("./errors");
+const metadata_fields_1 = require("./metadata-fields");
+const idmap_journal_1 = require("./idmap-journal");
+/**
+ * The id-map journal is folded into the snapshot once it grows past
+ * max(this floor, current snapshot size): snapshot rewrites stay geometric,
+ * so persisting n single-vector ingests is O(n) total instead of O(n^2).
+ */
+const JOURNAL_COMPACT_MIN_BYTES = 1 << 20;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function pickMethod(target, names) {
+    for (const name of names) {
+        if (target && typeof target[name] === 'function')
+            return target[name].bind(target);
+    }
+    return null;
+}
+// ---------------------------------------------------------------------------
+// NodeBackend — wraps @ruvector/rvf-node (N-API)
+// ---------------------------------------------------------------------------
+/**
+ * Backend that delegates to the `@ruvector/rvf-node` native N-API addon.
+ *
+ * The native addon is loaded lazily on first use so that the SDK package can
+ * be imported in environments where the native build is unavailable (e.g.
+ * browsers) without throwing at import time.
+ */
+class NodeBackend {
+    constructor() {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.native = null;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.handle = null;
+        // String ID <-> Numeric Label mappings (N-API layer requires i64 labels)
+        this.idToLabel = new Map();
+        this.labelToId = new Map();
+        this.nextLabel = 1; // RVF uses 1-based labels
+        this.storePath = '';
+        this.readOnly = false;
+        this.journal = null;
+        /** Metadata field-name registry, persisted in the store's file metadata. */
+        this.fields = new metadata_fields_1.FieldRegistry();
+        /** Byte size of the last snapshot written or loaded. */
+        this.snapshotBytes = 0;
+        this.journalCompactMinBytes = JOURNAL_COMPACT_MIN_BYTES;
+    }
+    async loadNative() {
+        if (this.native)
+            return;
+        try {
+            // Dynamic import so the SDK can be bundled for browsers without
+            // pulling in the native addon at compile time.
+            // The NAPI addon exports a `RvfDatabase` class with factory methods.
+            const mod = await Promise.resolve().then(() => __importStar(require('@ruvector/rvf-node')));
+            this.native = mod.RvfDatabase ?? mod.default?.RvfDatabase ?? mod;
+        }
+        catch {
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'Could not load @ruvector/rvf-node — is it installed?');
+        }
+    }
+    ensureHandle() {
+        if (!this.handle) {
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.StoreClosed);
+        }
+    }
+    /** Release a native handle without persisting mappings after open failed. */
+    discardHandle() {
+        try {
+            this.handle?.close();
+        }
+        catch {
+            // Preserve the original open/sidecar error.
+        }
+        finally {
+            this.handle = null;
+            this.storePath = '';
+            this.idToLabel.clear();
+            this.labelToId.clear();
+            this.nextLabel = 1;
+            this.closeJournal();
+            this.fields = new metadata_fields_1.FieldRegistry();
+        }
+    }
+    async create(path, options) {
+        await this.loadNative();
+        const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+        const sidecarPath = `${path}.idmap.json`;
+        const journalPath = `${sidecarPath}${idmap_journal_1.JOURNAL_SUFFIX}`;
+        // A leftover journal would replay a previous store's ids into this one.
+        const existingPaths = [path, sidecarPath, journalPath].filter((candidate) => fs.existsSync(candidate));
+        const backups = [];
+        try {
+            // Precondition: refuse to clobber an existing file unless asked to.
+            // The native layer surfaces this as a misleading FsyncFailed, so check
+            // here and raise a clear, actionable error. An orphaned sidecar also
+            // blocks creation because silently retaining it can desynchronize IDs.
+            if (existingPaths.length > 0 && !options.overwrite) {
+                throw new errors_1.RvfError(errors_1.RvfErrorCode.FileExists, `${existingPaths.join(', ')} already exists; use RvfDatabase.open() to reuse the store, or pass { overwrite: true } to replace it`);
+            }
+            if (options.overwrite) {
+                const { randomUUID } = await Promise.resolve().then(() => __importStar(require('crypto')));
+                for (const original of existingPaths) {
+                    if (!fs.lstatSync(original).isFile()) {
+                        throw new errors_1.RvfError(errors_1.RvfErrorCode.InvalidArgument, `refusing to overwrite non-file path ${original}`);
+                    }
+                    const backup = `${original}.overwrite-${process.pid}-${randomUUID()}.bak`;
+                    fs.renameSync(original, backup);
+                    backups.push({ original, backup });
+                }
+            }
+            this.handle = await this.native.create(path, mapOptionsToNative(options));
+            this.storePath = path;
+            this.readOnly = false;
+            this.idToLabel.clear();
+            this.labelToId.clear();
+            this.nextLabel = 1;
+            this.snapshotBytes = 0;
+            this.journal = new idmap_journal_1.IdMapJournalWriter(journalPath);
+            for (const { backup } of backups) {
+                try {
+                    fs.rmSync(backup, { force: true });
+                }
+                catch {
+                    // The new store is valid; retain the recoverable backup if cleanup fails.
+                }
+            }
+        }
+        catch (err) {
+            // If replacement fails after moving the old store aside, remove any
+            // partially-created replacement and restore the original files.
+            if (backups.length > 0) {
+                try {
+                    fs.rmSync(path, { force: true });
+                    fs.rmSync(sidecarPath, { force: true });
+                    fs.rmSync(journalPath, { force: true });
+                }
+                catch {
+                    // Continue restoring every backup that can be recovered.
+                }
+                for (const { original, backup } of backups.reverse()) {
+                    try {
+                        if (fs.existsSync(backup))
+                            fs.renameSync(backup, original);
+                    }
+                    catch {
+                        // The backup remains on disk with a unique, discoverable suffix.
+                    }
+                }
+            }
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async open(path) {
+        await this.loadNative();
+        try {
+            this.handle = await this.native.open(path);
+            this.storePath = path;
+            this.readOnly = false;
+            await this.loadMappings();
+        }
+        catch (err) {
+            this.discardHandle();
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async openReadonly(path) {
+        await this.loadNative();
+        try {
+            this.handle = await this.native.openReadonly(path);
+            this.storePath = path;
+            this.readOnly = true;
+            await this.loadMappings();
+        }
+        catch (err) {
+            this.discardHandle();
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async ingestBatch(entries) {
+        this.ensureHandle();
+        try {
+            // NAPI signature: ingestBatch(vectors: Float32Array, ids: i64[]), or
+            // ingestBatchWithMetadata(vectors, ids, records) when entries carry metadata.
+            // Flatten individual vectors into a single contiguous Float32Array.
+            const n = entries.length;
+            if (n === 0)
+                return { accepted: 0, rejected: 0, epoch: 0 };
+            const first = entries[0].vector;
+            const dim = first instanceof Float32Array ? first.length : first.length;
+            const flat = new Float32Array(n * dim);
+            for (let i = 0; i < n; i++) {
+                const v = entries[i].vector;
+                const f32 = v instanceof Float32Array ? v : new Float32Array(v);
+                flat.set(f32, i * dim);
+            }
+            // Map string IDs to numeric labels for the N-API layer.
+            // The native Rust HNSW expects i64 labels — non-numeric strings cause
+            // silent data loss (NaN → dropped).  We maintain a bidirectional
+            // string↔label mapping and persist it as a sidecar JSON file.
+            const prevNext = this.nextLabel;
+            const ids = entries.map((e) => this.resolveLabel(e.id));
+            // Journal newly allocated labels BEFORE the native commit, so a crash
+            // can never leave a committed vector whose label is unrecorded (the
+            // label would be reissued to another id on reopen).
+            this.persistOps(this.newLabelOps(prevNext), prevNext);
+            const records = this.encodeMetadataRecords(entries, ids);
+            let result;
+            if (records) {
+                const withMetaAsync = pickMethod(this.handle, ['ingestBatchWithMetadataAsync']);
+                result = withMetaAsync
+                    ? await withMetaAsync(flat, ids, records)
+                    : this.handle.ingestBatchWithMetadata(flat, ids, records);
+            }
+            else {
+                const ingestAsync = pickMethod(this.handle, ['ingestBatchAsync', 'ingestAsync']);
+                result = ingestAsync ? await ingestAsync(flat, ids) : this.handle.ingestBatch(flat, ids);
+            }
+            await this.maybeCompactJournal();
+            return {
+                accepted: Number(result.accepted),
+                rejected: Number(result.rejected),
+                epoch: result.epoch,
+            };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async query(vector, k, options) {
+        this.ensureHandle();
+        try {
+            const nativeOpts = options ? mapQueryOptionsToNative(options, this.fields) : undefined;
+            const queryAsync = pickMethod(this.handle, ['queryAsync']);
+            const results = queryAsync
+                ? await queryAsync(vector, k, nativeOpts)
+                : this.handle.query(vector, k, nativeOpts);
+            // Map numeric labels back to original string IDs, and native metadata
+            // entries back to the names used at ingest.
+            return results.map((r) => {
+                const hit = {
+                    id: this.labelToId.get(Number(r.id)) ?? String(r.id),
+                    distance: r.distance,
+                };
+                const metadata = this.decodeHitMetadata(r.metadata);
+                if (metadata)
+                    hit.metadata = metadata;
+                return hit;
+            });
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async delete(ids) {
+        this.ensureHandle();
+        try {
+            // Resolve string IDs to numeric labels for the N-API layer.
+            const numIds = ids
+                .map((id) => this.idToLabel.get(id))
+                .filter((label) => label !== undefined);
+            if (numIds.length === 0) {
+                return { deleted: 0, epoch: 0 };
+            }
+            const deleteAsync = pickMethod(this.handle, ['deleteAsync']);
+            const result = deleteAsync ? await deleteAsync(numIds) : this.handle.delete(numIds);
+            // Remove deleted entries from the mapping.
+            const ops = [];
+            for (const id of ids) {
+                const label = this.idToLabel.get(id);
+                if (label !== undefined) {
+                    this.idToLabel.delete(id);
+                    this.labelToId.delete(label);
+                    ops.push({ op: 'del', id });
+                }
+            }
+            this.persistOps(ops);
+            await this.maybeCompactJournal();
+            return { deleted: Number(result.deleted), epoch: result.epoch };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async deleteByFilter(filter) {
+        this.ensureHandle();
+        try {
+            // NAPI takes a JSON string for the filter expression, with typed values.
+            const result = this.handle.deleteByFilter(JSON.stringify(this.fields.filterToNative(filter)));
+            return { deleted: Number(result.deleted), epoch: result.epoch };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async compact() {
+        this.ensureHandle();
+        try {
+            const compactAsync = pickMethod(this.handle, ['compactAsync']);
+            const result = compactAsync ? await compactAsync() : this.handle.compact();
+            // Store compaction is also when the id-map journal is folded in.
+            await this.saveMappings();
+            return {
+                segmentsCompacted: result.segmentsCompacted ?? result.segments_compacted,
+                bytesReclaimed: Number(result.bytesReclaimed ?? result.bytes_reclaimed),
+                epoch: result.epoch,
+            };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async status() {
+        this.ensureHandle();
+        try {
+            const s = this.handle.status();
+            return mapNativeStatus(s);
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async close() {
+        if (!this.handle)
+            return;
+        let failure;
+        try {
+            await this.saveMappings();
+        }
+        catch (err) {
+            failure = err;
+        }
+        try {
+            this.handle.close();
+        }
+        catch (err) {
+            failure ?? (failure = err);
+        }
+        finally {
+            this.handle = null;
+            this.idToLabel.clear();
+            this.labelToId.clear();
+            this.nextLabel = 1;
+            this.storePath = '';
+            this.closeJournal();
+        }
+        if (failure)
+            throw errors_1.RvfError.fromNative(failure);
+    }
+    async fileId() {
+        this.ensureHandle();
+        try {
+            return this.handle.fileId();
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async parentId() {
+        this.ensureHandle();
+        try {
+            return this.handle.parentId();
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async lineageDepth() {
+        this.ensureHandle();
+        try {
+            return this.handle.lineageDepth();
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async derivationType() {
+        this.ensureHandle();
+        if (typeof this.handle.derivationType !== 'function') {
+            return null; // @ruvector/rvf-node < 0.4.7 records no derivation type
+        }
+        try {
+            return this.handle.derivationType();
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async derive(childPath, options, derivationType) {
+        this.ensureHandle();
+        if (derivationType !== undefined && typeof this.handle.derivationType !== 'function') {
+            // An older addon would silently ignore the argument and record 'filter'.
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.InvalidArgument, 'derive(…, derivationType) needs @ruvector/rvf-node >= 0.4.7');
+        }
+        let childHandle = null;
+        try {
+            const nativeOpts = options ? mapOptionsToNative(options) : undefined;
+            childHandle =
+                derivationType === undefined
+                    ? this.handle.derive(childPath, nativeOpts)
+                    : this.handle.derive(childPath, nativeOpts ?? null, derivationType);
+            const child = new NodeBackend();
+            child.native = this.native;
+            child.handle = childHandle;
+            child.storePath = childPath;
+            // Copy parent mappings to child (COW semantics)
+            child.idToLabel = new Map(this.idToLabel);
+            child.labelToId = new Map(this.labelToId);
+            child.nextLabel = this.nextLabel;
+            child.journal = new idmap_journal_1.IdMapJournalWriter(child.mappingsPath() + idmap_journal_1.JOURNAL_SUFFIX);
+            await child.saveMappings();
+            child.loadFieldRegistry();
+            return child;
+        }
+        catch (err) {
+            await this.cleanupFailedChild(childHandle, childPath);
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async branch(childPath) {
+        this.ensureHandle();
+        let childHandle = null;
+        try {
+            childHandle = this.handle.branch(childPath);
+            const child = new NodeBackend();
+            child.native = this.native;
+            child.handle = childHandle;
+            child.storePath = childPath;
+            child.idToLabel = new Map(this.idToLabel);
+            child.labelToId = new Map(this.labelToId);
+            child.nextLabel = this.nextLabel;
+            child.journal = new idmap_journal_1.IdMapJournalWriter(child.mappingsPath() + idmap_journal_1.JOURNAL_SUFFIX);
+            await child.saveMappings();
+            child.loadFieldRegistry();
+            return child;
+        }
+        catch (err) {
+            await this.cleanupFailedChild(childHandle, childPath);
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async freeze() {
+        this.ensureHandle();
+        try {
+            return this.handle.freeze();
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async embedKernel(arch, kernelType, flags, image, apiPort, cmdline) {
+        this.ensureHandle();
+        try {
+            return this.handle.embedKernel(arch, kernelType, flags, Buffer.from(image), apiPort, cmdline);
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async extractKernel() {
+        this.ensureHandle();
+        try {
+            const result = this.handle.extractKernel();
+            if (!result)
+                return null;
+            return {
+                header: new Uint8Array(result.header),
+                image: new Uint8Array(result.image),
+            };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async embedEbpf(programType, attachType, maxDimension, bytecode, btf) {
+        this.ensureHandle();
+        try {
+            return this.handle.embedEbpf(programType, attachType, maxDimension, Buffer.from(bytecode), btf ? Buffer.from(btf) : undefined);
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async extractEbpf() {
+        this.ensureHandle();
+        try {
+            const result = this.handle.extractEbpf();
+            if (!result)
+                return null;
+            return {
+                header: new Uint8Array(result.header),
+                payload: new Uint8Array(result.payload),
+            };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async segments() {
+        this.ensureHandle();
+        try {
+            const segs = this.handle.segments();
+            return segs.map((s) => ({
+                id: s.id,
+                offset: s.offset,
+                payloadLength: s.payloadLength ?? s.payload_length,
+                segType: s.segType ?? s.seg_type,
+            }));
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async dimension() {
+        this.ensureHandle();
+        try {
+            return this.handle.dimension();
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async metric() {
+        this.ensureHandle();
+        try {
+            return metricFromNative(this.handle.metric());
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async exportBytes() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'exportBytes is not supported by the node backend — use a file path with create()/open() instead');
+    }
+    async openBytes(_bytes) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'openBytes is not supported by the node backend — use a file path with open() instead');
+    }
+    // ─── String ID ↔ Numeric Label mapping helpers ───
+    /**
+     * Get or allocate a numeric label for a string ID.
+     * If the ID was already seen, returns the existing label.
+     */
+    resolveLabel(id) {
+        let label = this.idToLabel.get(id);
+        if (label !== undefined)
+            return label;
+        label = this.nextLabel++;
+        this.idToLabel.set(id, label);
+        this.labelToId.set(label, id);
+        return label;
+    }
+    /** Path to the sidecar mappings file. */
+    mappingsPath() {
+        return this.storePath ? this.storePath + '.idmap.json' : '';
+    }
+    /** Journal ops for labels allocated since `fromLabel` (labels are sequential). */
+    newLabelOps(fromLabel) {
+        const ops = [];
+        for (let label = fromLabel; label < this.nextLabel; label++) {
+            const id = this.labelToId.get(label);
+            if (id !== undefined)
+                ops.push({ op: 'add', id, label });
+        }
+        return ops;
+    }
+    /**
+     * Append ops to the id-map journal. If the append fails, labels allocated
+     * since `rollbackTo` are released so memory never runs ahead of disk.
+     */
+    persistOps(ops, rollbackTo) {
+        if (ops.length === 0 || this.readOnly || !this.storePath)
+            return;
+        this.journal ?? (this.journal = new idmap_journal_1.IdMapJournalWriter(this.mappingsPath() + idmap_journal_1.JOURNAL_SUFFIX));
+        try {
+            this.journal.append(ops);
+        }
+        catch (err) {
+            if (rollbackTo !== undefined) {
+                for (let label = rollbackTo; label < this.nextLabel; label++) {
+                    const id = this.labelToId.get(label);
+                    if (id !== undefined)
+                        this.idToLabel.delete(id);
+                    this.labelToId.delete(label);
+                }
+                this.nextLabel = rollbackTo;
+            }
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.SidecarWriteFailed, `at ${this.journal.path}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    /** Fold the journal into a fresh snapshot once it outgrows the snapshot. */
+    async maybeCompactJournal() {
+        const j = this.journal;
+        if (!j || j.bytes <= Math.max(this.journalCompactMinBytes, this.snapshotBytes))
+            return;
+        await this.saveMappings();
+    }
+    closeJournal() {
+        try {
+            this.journal?.close();
+        }
+        catch {
+            // A close failure loses nothing: every append was already written.
+        }
+        finally {
+            this.journal = null;
+            this.snapshotBytes = 0;
+        }
+    }
+    /**
+     * Persist the string↔label mapping to a sidecar JSON file.
+     *
+     * `delete()` resolves string ids through this map and silently filters out
+     * anything unresolvable, so a lost or torn write turns every ingest since
+     * the last good save into an undeletable-by-id vector. Persistence is
+     * therefore NOT best-effort: the write is made atomic (temp file + rename,
+     * so a crash/ENOSPC mid-write can never leave partial JSON at `mp`) and a
+     * failure is surfaced rather than swallowed.
+     */
+    async saveMappings() {
+        const mp = this.mappingsPath();
+        // Read-only handles never write: a concurrent writer may own the files.
+        if (!mp || this.readOnly)
+            return;
+        const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+        const data = JSON.stringify({
+            idToLabel: Object.fromEntries(this.idToLabel),
+            labelToId: Object.fromEntries(Array.from(this.labelToId.entries()).map(([k, v]) => [String(k), v])),
+            nextLabel: this.nextLabel,
+        });
+        // A shared `${mp}.tmp` races across processes opening the same store.
+        // Synchronous writes cannot interleave within one Node process; PID plus
+        // timestamp also keeps independently-running writers on separate paths.
+        const tmp = `${mp}.${process.pid}.${Date.now()}.tmp`;
+        try {
+            fs.writeFileSync(tmp, data, 'utf-8');
+            fs.renameSync(tmp, mp);
+            this.snapshotBytes = Buffer.byteLength(data, 'utf-8');
+            // The snapshot now holds everything the journal recorded. A crash
+            // before this removal just replays already-applied ops (idempotent).
+            this.journal ?? (this.journal = new idmap_journal_1.IdMapJournalWriter(mp + idmap_journal_1.JOURNAL_SUFFIX));
+            this.journal.reset();
+        }
+        catch (err) {
+            try {
+                fs.rmSync(tmp, { force: true });
+            }
+            catch {
+                // best-effort cleanup of the temp file
+            }
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.SidecarWriteFailed, `at ${mp}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    async cleanupFailedChild(childHandle, childPath) {
+        // If native creation failed before returning a handle (for example because
+        // childPath already exists), the path is not ours to remove.
+        if (!childHandle)
+            return;
+        try {
+            childHandle?.close();
+        }
+        catch {
+            // Preserve the original branch/sidecar error.
+        }
+        try {
+            const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+            fs.rmSync(childPath, { force: true });
+            fs.rmSync(`${childPath}.idmap.json`, { force: true });
+            fs.rmSync(`${childPath}.idmap.json${idmap_journal_1.JOURNAL_SUFFIX}`, { force: true });
+        }
+        catch {
+            // Best-effort rollback; the original operation error remains primary.
+        }
+    }
+    /**
+     * Load the string↔label mapping from the sidecar JSON file if it exists.
+     *
+     * A corrupt sidecar must NOT degrade to empty maps: `nextLabel` would reset
+     * to 1 and subsequent ingests would assign labels colliding with existing
+     * vectors (silent data corruption), and the next `saveMappings()` would
+     * overwrite the recoverable file. Instead the corrupt sidecar is quarantined
+     * (renamed aside so it is not clobbered) and a `SidecarCorrupt` error is
+     * raised so the caller learns string-id operations are unsafe.
+     */
+    async loadMappings() {
+        await this.loadSnapshot();
+        await this.replayJournalFile();
+        this.loadFieldRegistry();
+    }
+    /**
+     * Load the metadata field-name registry from the store's file metadata
+     * (issue #704). Stores written before the registry existed, or by an
+     * rvf-node without file-metadata support, start with an empty registry.
+     */
+    loadFieldRegistry() {
+        const get = pickMethod(this.handle, ['getFileMetadata']);
+        this.fields = metadata_fields_1.FieldRegistry.parse(get ? get(metadata_fields_1.FIELD_REGISTRY_KEY) : null);
+    }
+    /**
+     * Encode entry metadata into native per-vector records, persisting any
+     * newly registered field names before the vectors are committed.
+     * Returns null when no entry carries metadata.
+     */
+    encodeMetadataRecords(entries, labels) {
+        if (!entries.some((e) => e.metadata && Object.keys(e.metadata).length > 0))
+            return null;
+        const ingest = pickMethod(this.handle, ['ingestBatchWithMetadataAsync', 'ingestBatchWithMetadata']);
+        const setFileMetadata = pickMethod(this.handle, ['setFileMetadata']);
+        if (!ingest || !setFileMetadata) {
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.MetadataNotSupported, 'this @ruvector/rvf-node build has no per-vector metadata support; upgrade to >= 0.4.2');
+        }
+        // Encode against a copy so a type conflict part-way through the batch
+        // leaves the live registry untouched.
+        const next = metadata_fields_1.FieldRegistry.parse(this.fields.toJSON());
+        let changed = false;
+        const records = [];
+        entries.forEach((e, i) => {
+            if (!e.metadata)
+                return;
+            const enc = next.encodeRecord(e.metadata);
+            changed || (changed = enc.changed);
+            records.push({ id: labels[i], fields: enc.fields });
+        });
+        if (changed)
+            setFileMetadata(metadata_fields_1.FIELD_REGISTRY_KEY, next.toJSON());
+        this.fields = next;
+        return records;
+    }
+    /** Decode a native hit's metadata entries through the field registry. */
+    decodeHitMetadata(entries) {
+        return entries ? this.fields.decodeRecord(entries) : undefined;
+    }
+    /**
+     * Replay `<sidecar>.journal` over the loaded snapshot. A torn last append
+     * (crash mid-write) is dropped, and cut off on read-write opens so the next
+     * append cannot fuse with it; any other damage fails loud like a corrupt
+     * snapshot does.
+     */
+    async replayJournalFile() {
+        const mp = this.mappingsPath();
+        if (!mp)
+            return;
+        const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+        const jp = mp + idmap_journal_1.JOURNAL_SUFFIX;
+        let buf;
+        try {
+            buf = fs.readFileSync(jp);
+        }
+        catch (err) {
+            if (err.code === 'ENOENT') {
+                if (!this.readOnly)
+                    this.journal = new idmap_journal_1.IdMapJournalWriter(jp);
+                return;
+            }
+            throw err;
+        }
+        const state = { idToLabel: this.idToLabel, labelToId: this.labelToId, nextLabel: this.nextLabel };
+        let validBytes;
+        try {
+            ({ validBytes } = (0, idmap_journal_1.replayJournal)(buf, state));
+        }
+        catch (err) {
+            if (!(err instanceof idmap_journal_1.JournalCorruptError))
+                throw err;
+            const { randomUUID } = await Promise.resolve().then(() => __importStar(require('crypto')));
+            const quarantine = `${jp}.corrupt-${Date.now()}-${randomUUID()}`;
+            if (!this.readOnly) {
+                try {
+                    fs.renameSync(jp, quarantine);
+                }
+                catch {
+                    // still fail loud below
+                }
+            }
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.SidecarCorrupt, `at ${jp}${this.readOnly ? '' : ` (quarantined to ${quarantine})`}: ${err.message}`);
+        }
+        this.nextLabel = state.nextLabel;
+        if (this.readOnly)
+            return;
+        if (validBytes === 0)
+            fs.rmSync(jp, { force: true });
+        else if (validBytes < buf.length)
+            fs.truncateSync(jp, validBytes);
+        this.journal = new idmap_journal_1.IdMapJournalWriter(jp, validBytes);
+    }
+    async loadSnapshot() {
+        const mp = this.mappingsPath();
+        if (!mp)
+            return;
+        const fs = await Promise.resolve().then(() => __importStar(require('fs')));
+        if (!fs.existsSync(mp))
+            return; // fresh store: no sidecar yet is legitimate
+        let parsed;
+        try {
+            const text = fs.readFileSync(mp, 'utf-8');
+            this.snapshotBytes = Buffer.byteLength(text, 'utf-8');
+            const candidate = JSON.parse(text);
+            if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+                throw new TypeError('sidecar root must be an object');
+            }
+            const raw = candidate;
+            if (!raw.idToLabel ||
+                typeof raw.idToLabel !== 'object' ||
+                Array.isArray(raw.idToLabel) ||
+                !raw.labelToId ||
+                typeof raw.labelToId !== 'object' ||
+                Array.isArray(raw.labelToId) ||
+                !Number.isSafeInteger(raw.nextLabel) ||
+                raw.nextLabel < 1) {
+                throw new TypeError('sidecar must contain idToLabel, labelToId, and a positive nextLabel');
+            }
+            const idToLabel = raw.idToLabel;
+            const labelToId = raw.labelToId;
+            let maxLabel = 0;
+            for (const [id, label] of Object.entries(idToLabel)) {
+                if (!Number.isSafeInteger(label) || label < 1) {
+                    throw new TypeError(`invalid label for id ${JSON.stringify(id)}`);
+                }
+                if (labelToId[String(label)] !== id) {
+                    throw new TypeError(`idToLabel/labelToId mismatch for id ${JSON.stringify(id)}`);
+                }
+                maxLabel = Math.max(maxLabel, label);
+            }
+            for (const [label, id] of Object.entries(labelToId)) {
+                const numericLabel = Number(label);
+                if (!Number.isSafeInteger(numericLabel) ||
+                    numericLabel < 1 ||
+                    String(numericLabel) !== label ||
+                    typeof id !== 'string' ||
+                    idToLabel[id] !== numericLabel) {
+                    throw new TypeError(`invalid reverse mapping for label ${JSON.stringify(label)}`);
+                }
+            }
+            if (raw.nextLabel <= maxLabel) {
+                throw new TypeError('nextLabel must be greater than every allocated label');
+            }
+            parsed = {
+                idToLabel: idToLabel,
+                labelToId: labelToId,
+                nextLabel: raw.nextLabel,
+            };
+        }
+        catch (err) {
+            const { randomUUID } = await Promise.resolve().then(() => __importStar(require('crypto')));
+            const quarantine = `${mp}.corrupt-${Date.now()}-${randomUUID()}`;
+            try {
+                fs.renameSync(mp, quarantine);
+            }
+            catch {
+                // if we cannot move it aside, leave it in place — still fail loud
+            }
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.SidecarCorrupt, `at ${mp} (quarantined to ${quarantine}): string-id delete()/ingest would ` +
+                `silently corrupt data — restore a valid sidecar or recreate the store; ` +
+                `${err instanceof Error ? err.message : String(err)}`);
+        }
+        this.idToLabel = new Map(Object.entries(parsed.idToLabel));
+        this.labelToId = new Map(Object.entries(parsed.labelToId).map(([k, v]) => [Number(k), v]));
+        this.nextLabel = parsed.nextLabel;
+    }
+}
+exports.NodeBackend = NodeBackend;
+// ---------------------------------------------------------------------------
+// WasmBackend — wraps @ruvector/rvf-wasm
+// ---------------------------------------------------------------------------
+/**
+ * Backend that delegates to the `@ruvector/rvf-wasm` WASM build.
+ *
+ * The WASM microkernel exposes C-ABI store functions (`rvf_store_create`,
+ * `rvf_store_query`, etc.) operating on integer handles. This backend wraps
+ * them behind the same `RvfBackend` interface.
+ *
+ * Suitable for browser environments. The WASM module is loaded lazily.
+ */
+class WasmBackend {
+    constructor() {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.wasm = null;
+        /** Integer store handle returned by `rvf_store_create` / `rvf_store_open`. */
+        this.handle = 0;
+        this.dim = 0;
+        /** Metric given to create(); unknown for stores loaded with openBytes(). */
+        this.storeMetric = null;
+    }
+    async loadWasm() {
+        if (this.wasm)
+            return;
+        try {
+            const mod = await Promise.resolve().then(() => __importStar(require('@ruvector/rvf-wasm')));
+            // wasm-pack default export is the init function
+            if (typeof mod.default === 'function') {
+                this.wasm = await mod.default();
+            }
+            else {
+                this.wasm = mod;
+            }
+        }
+        catch {
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'Could not load @ruvector/rvf-wasm — is it installed?');
+        }
+    }
+    ensureHandle() {
+        if (!this.handle) {
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.StoreClosed);
+        }
+    }
+    metricCode(metric) {
+        switch (metric) {
+            case 'Cosine': return 2;
+            case 'InnerProduct': return 1;
+            default: return 0; // L2
+        }
+    }
+    async create(_path, options) {
+        await this.loadWasm();
+        try {
+            const nativeOpts = mapOptionsToNative(options);
+            const dim = nativeOpts.dimension;
+            const metric = this.metricCode(nativeOpts.metric);
+            const h = this.wasm.rvf_store_create(dim, metric);
+            if (h <= 0)
+                throw new Error('rvf_store_create returned ' + h);
+            this.handle = h;
+            this.dim = dim;
+            this.storeMetric = options.metric ?? 'l2';
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async open(_path) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'WASM backend does not support file-based open (in-memory only)');
+    }
+    async openReadonly(_path) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'WASM backend does not support file-based openReadonly (in-memory only)');
+    }
+    async ingestBatch(entries) {
+        this.ensureHandle();
+        try {
+            rejectUnsupportedMetadata(entries);
+            const n = entries.length;
+            if (n === 0)
+                return { accepted: 0, rejected: 0, epoch: 0 };
+            const dim = this.dim || (entries[0].vector instanceof Float32Array
+                ? entries[0].vector.length : entries[0].vector.length);
+            const flat = new Float32Array(n * dim);
+            const ids = new BigUint64Array(n);
+            for (let i = 0; i < n; i++) {
+                const v = entries[i].vector;
+                const f32 = v instanceof Float32Array ? v : new Float32Array(v);
+                flat.set(f32, i * dim);
+                ids[i] = BigInt(entries[i].id);
+            }
+            // Allocate in WASM memory and call
+            const vecsPtr = this.wasm.rvf_alloc(flat.byteLength);
+            const idsPtr = this.wasm.rvf_alloc(ids.byteLength);
+            new Float32Array(this.wasm.memory.buffer, vecsPtr, flat.length).set(flat);
+            new BigUint64Array(this.wasm.memory.buffer, idsPtr, ids.length).set(ids);
+            const accepted = this.wasm.rvf_store_ingest(this.handle, vecsPtr, idsPtr, n);
+            this.wasm.rvf_free(vecsPtr, flat.byteLength);
+            this.wasm.rvf_free(idsPtr, ids.byteLength);
+            return { accepted: accepted > 0 ? accepted : 0, rejected: accepted < 0 ? n : 0, epoch: 0 };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async query(vector, k, _options) {
+        this.ensureHandle();
+        try {
+            const queryPtr = this.wasm.rvf_alloc(vector.byteLength);
+            new Float32Array(this.wasm.memory.buffer, queryPtr, vector.length).set(vector);
+            // Each result = 8 bytes id + 4 bytes dist = 12 bytes
+            const outSize = k * 12;
+            const outPtr = this.wasm.rvf_alloc(outSize);
+            const count = this.wasm.rvf_store_query(this.handle, queryPtr, k, 0, outPtr);
+            const results = [];
+            const view = new DataView(this.wasm.memory.buffer);
+            for (let i = 0; i < count; i++) {
+                const off = outPtr + i * 12;
+                const id = view.getBigUint64(off, true);
+                const dist = view.getFloat32(off + 8, true);
+                results.push({ id: String(id), distance: dist });
+            }
+            this.wasm.rvf_free(queryPtr, vector.byteLength);
+            this.wasm.rvf_free(outPtr, outSize);
+            return results;
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async delete(ids) {
+        this.ensureHandle();
+        try {
+            const arr = new BigUint64Array(ids.map((id) => BigInt(id)));
+            const ptr = this.wasm.rvf_alloc(arr.byteLength);
+            new BigUint64Array(this.wasm.memory.buffer, ptr, arr.length).set(arr);
+            const deleted = this.wasm.rvf_store_delete(this.handle, ptr, ids.length);
+            this.wasm.rvf_free(ptr, arr.byteLength);
+            return { deleted: deleted > 0 ? deleted : 0, epoch: 0 };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async deleteByFilter(_filter) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'deleteByFilter not supported in WASM backend');
+    }
+    async compact() {
+        return { segmentsCompacted: 0, bytesReclaimed: 0, epoch: 0 };
+    }
+    async status() {
+        this.ensureHandle();
+        try {
+            const outPtr = this.wasm.rvf_alloc(20);
+            this.wasm.rvf_store_status(this.handle, outPtr);
+            const view = new DataView(this.wasm.memory.buffer);
+            const totalVectors = view.getUint32(outPtr, true);
+            const dim = view.getUint32(outPtr + 4, true);
+            this.wasm.rvf_free(outPtr, 20);
+            return {
+                totalVectors,
+                totalSegments: 1,
+                fileSizeBytes: 0,
+                epoch: 0,
+                profileId: 0,
+                compactionState: 'idle',
+                deadSpaceRatio: 0,
+                readOnly: false,
+            };
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    async close() {
+        if (!this.handle)
+            return;
+        try {
+            this.wasm.rvf_store_close(this.handle);
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+        finally {
+            this.handle = 0;
+        }
+    }
+    async fileId() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'fileId not supported in WASM backend');
+    }
+    async parentId() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'parentId not supported in WASM backend');
+    }
+    async lineageDepth() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'lineageDepth not supported in WASM backend');
+    }
+    async derive(_childPath, _options, _derivationType) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'derive not supported in WASM backend');
+    }
+    async derivationType() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'derivationType not supported in WASM backend');
+    }
+    async branch(_childPath) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'branch not supported in WASM backend');
+    }
+    async freeze() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'freeze not supported in WASM backend');
+    }
+    async embedKernel() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'embedKernel not supported in WASM backend');
+    }
+    async extractKernel() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'extractKernel not supported in WASM backend');
+    }
+    async embedEbpf() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'embedEbpf not supported in WASM backend');
+    }
+    async extractEbpf() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'extractEbpf not supported in WASM backend');
+    }
+    async segments() {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'segments not supported in WASM backend');
+    }
+    async dimension() {
+        this.ensureHandle();
+        const d = this.wasm.rvf_store_dimension(this.handle);
+        if (d < 0)
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.StoreClosed);
+        return d;
+    }
+    async metric() {
+        this.ensureHandle();
+        if (this.storeMetric === null) {
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.BackendNotFound, 'metric is not recorded for a WASM store loaded from bytes');
+        }
+        return this.storeMetric;
+    }
+    /**
+     * Serialize the in-memory store to `.rvf` bytes via the `rvf_store_export`
+     * C-ABI export. `rvf_store_export` follows a probe-then-write pattern:
+     * called with a too-small (or zero-length) buffer it returns the negated
+     * required size, so we probe first, allocate exactly that much, then
+     * write for real.
+     */
+    async exportBytes() {
+        this.ensureHandle();
+        try {
+            const probe = this.wasm.rvf_store_export(this.handle, 0, 0);
+            const size = probe < 0 ? -probe : probe;
+            if (size <= 0)
+                return new Uint8Array(0);
+            const ptr = this.wasm.rvf_alloc(size);
+            try {
+                const written = this.wasm.rvf_store_export(this.handle, ptr, size);
+                if (written < 0) {
+                    throw new Error(`rvf_store_export failed after size probe (size=${size})`);
+                }
+                return new Uint8Array(this.wasm.memory.buffer, ptr, written).slice();
+            }
+            finally {
+                this.wasm.rvf_free(ptr, size);
+            }
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+    /** Load a store from `.rvf` bytes via the `rvf_store_open` C-ABI import. */
+    async openBytes(bytes) {
+        await this.loadWasm();
+        try {
+            const ptr = this.wasm.rvf_alloc(bytes.byteLength);
+            try {
+                new Uint8Array(this.wasm.memory.buffer, ptr, bytes.byteLength).set(bytes);
+                const h = this.wasm.rvf_store_open(ptr, bytes.byteLength);
+                if (h <= 0)
+                    throw new Error('rvf_store_open returned ' + h);
+                this.handle = h;
+                this.dim = this.wasm.rvf_store_dimension(h);
+                this.storeMetric = null;
+            }
+            finally {
+                this.wasm.rvf_free(ptr, bytes.byteLength);
+            }
+        }
+        catch (err) {
+            throw errors_1.RvfError.fromNative(err);
+        }
+    }
+}
+exports.WasmBackend = WasmBackend;
+// ---------------------------------------------------------------------------
+// Backend resolution
+// ---------------------------------------------------------------------------
+/**
+ * Resolve a `BackendType` to a concrete `RvfBackend` instance.
+ *
+ * - `'node'`  Always returns a `NodeBackend`.
+ * - `'wasm'`  Always returns a `WasmBackend`.
+ * - `'auto'`  Tries `node` first, falls back to `wasm`.
+ */
+function resolveBackend(type) {
+    switch (type) {
+        case 'node':
+            return new NodeBackend();
+        case 'wasm':
+            return new WasmBackend();
+        case 'auto': {
+            // In Node.js environments, prefer native; in browsers, prefer WASM.
+            const isNode = typeof process !== 'undefined' &&
+                typeof process.versions !== 'undefined' &&
+                typeof process.versions.node === 'string';
+            return isNode ? new NodeBackend() : new WasmBackend();
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Mapping helpers (TS options -> native/wasm shapes)
+// ---------------------------------------------------------------------------
+/** Map the native metric name (`l2`, `inner_product`, `cosine`) to the SDK's. */
+function metricFromNative(raw) {
+    switch (String(raw).toLowerCase()) {
+        case 'cosine':
+            return 'cosine';
+        case 'inner_product':
+        case 'innerproduct':
+        case 'dotproduct':
+            return 'dotproduct';
+        case 'l2':
+            return 'l2';
+        default:
+            throw new errors_1.RvfError(errors_1.RvfErrorCode.InvalidArgument, `unknown native metric ${String(raw)}`);
+    }
+}
+function mapMetricToNative(metric) {
+    switch (metric) {
+        case 'cosine':
+            return 'Cosine';
+        case 'dotproduct':
+            return 'InnerProduct';
+        case 'l2':
+        default:
+            return 'L2';
+    }
+}
+function mapCompressionToNative(compression) {
+    switch (compression) {
+        case 'scalar':
+            return 'Scalar';
+        case 'product':
+            return 'Product';
+        case 'none':
+        default:
+            return 'None';
+    }
+}
+/**
+ * Resolve the vector dimensionality from create options, accepting the
+ * documented `dimensions` (plural) as well as the `dimension` (singular)
+ * alias that mirrors the native field name. Throws a clear error naming
+ * the public option instead of letting the native layer report the
+ * internal `dimension` field (issue #641).
+ */
+function resolveDimensions(options) {
+    const dims = options.dimensions ?? options.dimension;
+    if (typeof dims !== 'number' || !Number.isInteger(dims) || dims <= 0) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.InvalidOptions, `Missing or invalid \`dimensions\` option: expected a positive integer, got ${JSON.stringify(dims)}. ` +
+            'Pass { dimensions: N } (plural) to RvfDatabase.create().');
+    }
+    return dims;
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapOptionsToNative(options) {
+    return {
+        dimension: resolveDimensions(options),
+        metric: mapMetricToNative(options.metric),
+        profile: options.profile ?? 0,
+        compression: mapCompressionToNative(options.compression),
+        signing: options.signing ?? false,
+        m: options.m ?? 16,
+        // #[napi(object)] exposes Rust snake_case fields as camelCase keys; a
+        // snake_case key here is silently ignored by the binding.
+        efConstruction: options.efConstruction ?? 200,
+    };
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapQueryOptionsToNative(options, fields) {
+    return {
+        // camelCase, matching the binding's RvfQueryOptions (see mapOptionsToNative).
+        efSearch: options.efSearch ?? 100,
+        // NAPI accepts the filter as a JSON string, not an object.
+        filter: options.filter ? JSON.stringify(fields.filterToNative(options.filter)) : undefined,
+        timeoutMs: options.timeoutMs ?? 0,
+        forceExact: options.forceExact ?? false,
+    };
+}
+/**
+ * The WASM backend has no durable per-vector metadata, so it rejects
+ * `RvfIngestEntry.metadata` loudly rather than silently dropping it (the
+ * original issue #704 bug). The native backend stores it.
+ */
+function rejectUnsupportedMetadata(entries) {
+    const hasMetadata = entries.some((e) => e.metadata && Object.keys(e.metadata).length > 0);
+    if (hasMetadata) {
+        throw new errors_1.RvfError(errors_1.RvfErrorCode.MetadataNotSupported);
+    }
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapNativeStatus(s) {
+    return {
+        totalVectors: s.total_vectors ?? s.totalVectors ?? 0,
+        totalSegments: s.total_segments ?? s.totalSegments ?? 0,
+        fileSizeBytes: s.file_size ?? s.fileSizeBytes ?? s.fileSize ?? 0,
+        epoch: s.current_epoch ?? s.epoch ?? s.currentEpoch ?? 0,
+        profileId: s.profile_id ?? s.profileId ?? 0,
+        compactionState: mapCompactionState(s.compaction_state ?? s.compactionState),
+        deadSpaceRatio: s.dead_space_ratio ?? s.deadSpaceRatio ?? 0,
+        readOnly: s.read_only ?? s.readOnly ?? false,
+    };
+}
+function mapCompactionState(state) {
+    if (typeof state === 'string') {
+        const lower = state.toLowerCase();
+        if (lower === 'running')
+            return 'running';
+        if (lower === 'emergency')
+            return 'emergency';
+    }
+    return 'idle';
+}
+//# sourceMappingURL=backend.js.map

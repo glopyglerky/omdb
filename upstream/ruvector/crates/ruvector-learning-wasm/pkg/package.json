@@ -1,0 +1,43 @@
+{
+  "name": "@ruvector/learning-wasm",
+  "type": "module",
+  "collaborators": [
+    "rUv <ruvnet@users.noreply.github.com>"
+  ],
+  "author": "RuVector Team <ruvnet@users.noreply.github.com>",
+  "description": "Ultra-fast MicroLoRA adaptation for WASM - rank-2 LoRA with <100us latency for per-operator learning",
+  "version": "0.1.30",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "directory": "crates/ruvector-learning-wasm/pkg",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "files": [
+    "ruvector_learning_wasm_bg.wasm",
+    "ruvector_learning_wasm.js",
+    "ruvector_learning_wasm.d.ts",
+    "ruvector_learning_wasm_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "main": "ruvector_learning_wasm.js",
+  "homepage": "https://ruv.io",
+  "types": "ruvector_learning_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "keywords": [
+    "wasm",
+    "lora",
+    "ai",
+    "machine-learning",
+    "deep-learning",
+    "webassembly",
+    "ruvector",
+    "ruvnet",
+    "neural-network"
+  ]
+}

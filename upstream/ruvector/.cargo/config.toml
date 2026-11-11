@@ -1,0 +1,27 @@
+[net]
+git-fetch-with-cli = true
+
+[registries.crates-io]
+protocol = "git"
+
+# `ruvector-filter` carries `#![recursion_limit = "4096"]` (PR #389) to
+# survive trait-resolution overflow when serde_json's `Serializer` blanket
+# impl recurses through the crate's expression types. The deeper resolution
+# in turn drives rustc's own process stack past the default 8 MB on x86_64
+# Linux, so cargo test/cargo check must run with a larger thread stack.
+# 16 MB is rustc's documented suggested value when this happens.
+[env]
+RUST_MIN_STACK = "16777216"
+
+# aarch64 cross-build linker for arm64 deployments.
+# Default linker (mold) is host-bound and rejects arm64 objects.
+#
+# Do NOT put Cortex-A76 / +rcpc tuning here (issue #1292). This workspace
+# config also applies to the published linux-arm64-gnu npm natives, and
+# Cortex-A72 (Pi 4) / NVIDIA Carmel (Jetson AGX Xavier) lack FEAT_LRCPC,
+# so they die with SIGILL on the resulting LDAPR/LDAPRB instructions.
+# Keep Pi 5 tuning in the Pi-specific crates that opt into it, e.g.
+# crates/ruvector-hailo-cluster/.cargo/config.toml. The npm natives must
+# stay baseline aarch64 and rely on runtime SIMD dispatch.
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"

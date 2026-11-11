@@ -1,0 +1,81 @@
+{
+  "name": "@ruvector/edge-full",
+  "version": "0.1.2",
+  "type": "module",
+  "description": "Consensus: Complete WASM toolkit for edge AI: vector search, graph DB, neural networks, DAG workflows, SQL/SPARQL/Cypher, and ONNX inference - all running in browser",
+  "main": "index.js",
+  "module": "index.js",
+  "types": "index.d.ts",
+  "keywords": [
+    "consensus",
+    "ai",
+    "wasm",
+    "neural-network",
+    "vector-search",
+    "onnx",
+    "ruvector",
+    "ruvnet",
+    "rust",
+    "edge",
+    "hnsw",
+    "graph-database",
+    "embeddings",
+    "dag",
+    "workflow-automation",
+    "post-quantum"
+  ],
+  "author": "RuVector Team",
+  "license": "MIT",
+  "repository": {
+    "directory": "examples/edge-full/pkg",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "edge/",
+    "graph/",
+    "rvlite/",
+    "sona/",
+    "dag/",
+    "onnx/",
+    "generator.html",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "import": "./index.js",
+      "types": "./index.d.ts"
+    },
+    "./edge": {
+      "import": "./edge/ruvector_edge.js",
+      "types": "./edge/ruvector_edge.d.ts"
+    },
+    "./graph": {
+      "import": "./graph/ruvector_graph_wasm.js",
+      "types": "./graph/ruvector_graph_wasm.d.ts"
+    },
+    "./rvlite": {
+      "import": "./rvlite/rvlite.js",
+      "types": "./rvlite/rvlite.d.ts"
+    },
+    "./sona": {
+      "import": "./sona/ruvector_sona.js",
+      "types": "./sona/ruvector_sona.d.ts"
+    },
+    "./dag": {
+      "import": "./dag/ruvector_dag_wasm.js",
+      "types": "./dag/ruvector_dag_wasm.d.ts"
+    },
+    "./onnx": {
+      "import": "./onnx/ruvector_onnx_embeddings_wasm.js",
+      "types": "./onnx/ruvector_onnx_embeddings_wasm.d.ts"
+    }
+  },
+  "sideEffects": false
+}

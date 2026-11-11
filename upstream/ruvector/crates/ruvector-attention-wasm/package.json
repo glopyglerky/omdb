@@ -1,0 +1,54 @@
+{
+  "name": "@ruvector/attention-wasm",
+  "version": "2.2.3",
+  "description": "High-performance WebAssembly attention mechanisms: Multi-Head, Flash, Hyperbolic, MoE, CGT Sheaf Attention with GPU acceleration for transformers and LLMs",
+  "main": "pkg/ruvector_attention_wasm.js",
+  "module": "pkg/ruvector_attention_wasm.js",
+  "types": "pkg/ruvector_attention_wasm.d.ts",
+  "files": [
+    "pkg/",
+    "js/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir pkg",
+    "build:node": "wasm-pack build --target nodejs --out-dir pkg-node",
+    "build:bundler": "wasm-pack build --target bundler --out-dir pkg-bundler",
+    "build:all": "npm run build && npm run build:node && npm run build:bundler",
+    "test": "wasm-pack test --headless --firefox",
+    "test:chrome": "wasm-pack test --headless --chrome",
+    "clean": "rm -rf pkg pkg-node pkg-bundler target",
+    "prepublishOnly": "npm run build"
+  },
+  "repository": {
+    "directory": "crates/ruvector-attention-wasm",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "keywords": [
+    "attention",
+    "wasm",
+    "llm",
+    "transformer",
+    "webassembly",
+    "gpu",
+    "ruvector",
+    "ruvnet"
+  ],
+  "author": "rUv <team@ruvector.dev>",
+  "license": "MIT OR Apache-2.0",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "homepage": "https://ruv.io",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

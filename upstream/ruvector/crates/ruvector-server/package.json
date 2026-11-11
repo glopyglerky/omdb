@@ -1,0 +1,49 @@
+{
+  "name": "@ruvector/server",
+  "version": "0.1.1",
+  "description": "Vector database: HTTP/gRPC server for RuVector - REST API with streaming support",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "ruvector-server": "./bin/ruvector-server"
+  },
+  "files": [
+    "*.js",
+    "*.d.ts",
+    "bin/"
+  ],
+  "scripts": {
+    "build": "cargo build --release",
+    "start": "cargo run --release",
+    "test": "cargo test"
+  },
+  "repository": {
+    "directory": "crates/ruvector-server",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "keywords": [
+    "vector-database",
+    "vector-search",
+    "hnsw",
+    "ruvector",
+    "ruvnet",
+    "server",
+    "embeddings",
+    "rag",
+    "semantic-search",
+    "knowledge-graph",
+    "gnn",
+    "graph-embeddings",
+    "link-prediction",
+    "attention",
+    "local-llm",
+    "onnx"
+  ],
+  "author": "rUv",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "homepage": "https://ruv.io"
+}

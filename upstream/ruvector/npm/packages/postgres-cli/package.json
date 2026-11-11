@@ -1,0 +1,80 @@
+{
+  "name": "@ruvector/postgres-cli",
+  "version": "0.2.12",
+  "description": "Advanced AI vector database CLI for PostgreSQL - pgvector drop-in replacement with 53+ SQL functions, 39 attention mechanisms, GNN layers, hyperbolic embeddings, and self-learning capabilities",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "ruvector-pg": "dist/cli.js",
+    "rvpg": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist *.tsbuildinfo",
+    "pretest": "npm run build",
+    "test": "node --test tests/*.test.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "vector-search",
+    "cli",
+    "ai",
+    "attention",
+    "gnn",
+    "rag",
+    "ruvector",
+    "ruvnet",
+    "vector-database",
+    "postgres",
+    "embeddings",
+    "semantic-search",
+    "pgvector",
+    "hnsw",
+    "machine-learning",
+    "deep-learning"
+  ],
+  "author": "ruv.io Team <info@ruv.io> (https://ruv.io)",
+  "license": "MIT",
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git",
+    "directory": "npm/packages/postgres-cli"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/ruvnet"
+  },
+  "files": [
+    "dist",
+    "benchmarks",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "commander": "^11.1.0",
+    "chalk": "^5.3.0",
+    "pg": "^8.11.3",
+    "inquirer": "^9.2.12",
+    "ora": "^8.0.1",
+    "cli-table3": "^0.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "@types/pg": "^8.10.9",
+    "@types/inquirer": "^9.0.7",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

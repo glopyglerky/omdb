@@ -1,0 +1,30 @@
+{
+  "name": "@ruvector/attention-linux-arm64-gnu",
+  "version": "2.3.1",
+  "homepage": "https://ruv.io",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "main": "attention.linux-arm64-gnu.node",
+  "files": [
+    "attention.linux-arm64-gnu.node"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "engines": {
+    "node": ">= 10"
+  },
+  "libc": [
+    "glibc"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/RuVector.git",
+    "directory": "crates/ruvector-attention-node/npm/linux-arm64-gnu"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/RuVector/issues"
+  }
+}

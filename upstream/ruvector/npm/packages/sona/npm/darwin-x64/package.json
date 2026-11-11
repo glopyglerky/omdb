@@ -1,0 +1,24 @@
+{
+  "name": "@ruvector/sona-darwin-x64",
+  "version": "0.1.11",
+  "homepage": "https://ruv.io",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "main": "sona.darwin-x64.node",
+  "files": [
+    "sona.darwin-x64.node"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/RuVector.git",
+    "directory": "npm/packages/sona/npm/darwin-x64"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/RuVector/issues"
+  }
+}
