@@ -1,0 +1,1116 @@
+{
+  "format_version": 1,
+  "reviewed_on": "2026-11-10",
+  "review_timezone": "America/Denver",
+  "scope": "Research references for database extensions and comparisons; not an install list or executed benchmark.",
+  "omdb_reviewed_base": "c561b00a38b9900aa087b911481bcd1fa238e48b",
+  "catalog": "database-upstream-catalog.md",
+  "comparison_plan": "database-comparison-plan.md",
+  "selection_semantics": {
+    "baseline": "Imported source used as a reference, not a qualified root runtime integration.",
+    "compare_first": "First capability-specific comparison candidate; not a measured winner.",
+    "specialist": "Useful bounded component or independent comparator when its role is required.",
+    "watchlist": "Retain reference; resolve maintenance, scope or review-depth limitations before selection.",
+    "license_gated": "Reference only. No code import or comparison run selected; current terms require a separate decision."
+  },
+  "comparison_case_ids": [
+    "vector-filtered",
+    "graph-semantics",
+    "sql-semantics",
+    "tag-filter",
+    "text-hybrid",
+    "transaction-boundary",
+    "mutation-reopen",
+    "profile-closure",
+    "incremental-view",
+    "replication-boundary",
+    "storage-workload"
+  ],
+  "comparison_results_status": "not_run",
+  "candidate_count": 47,
+  "candidates": [
+    {
+      "id": "ruvector",
+      "repository": "ruvnet/RuVector",
+      "revision": "39a104e50388d41837f86e4001096a01927e1728",
+      "source_url": "https://github.com/ruvnet/RuVector/tree/39a104e50388d41837f86e4001096a01927e1728",
+      "declared_license": "MIT",
+      "category": "redb_extension",
+      "selection": "baseline",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "vector-filtered",
+        "graph-semantics",
+        "tag-filter",
+        "text-hybrid",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "imported_snapshot",
+      "runtime_adopted": false,
+      "boundary": "Imported snapshot only; root runtime is not integrated. Workspace requests redb 2.1; vector and graph storage own separate database/commit paths.",
+      "evidence_urls": [
+        "https://github.com/ruvnet/RuVector/blob/39a104e50388d41837f86e4001096a01927e1728/Cargo.toml",
+        "https://github.com/ruvnet/RuVector/blob/39a104e50388d41837f86e4001096a01927e1728/crates/ruvector-core/src/storage.rs",
+        "https://github.com/ruvnet/RuVector/blob/39a104e50388d41837f86e4001096a01927e1728/crates/ruvector-graph/src/storage.rs",
+        "https://github.com/ruvnet/RuVector/blob/39a104e50388d41837f86e4001096a01927e1728/.github/workflows/ci.yml"
+      ]
+    },
+    {
+      "id": "contextdb",
+      "repository": "context-graph-ai/contextdb",
+      "revision": "e6cf60cf972148bbbfe5a002151f40d191e551b9",
+      "source_url": "https://github.com/context-graph-ai/contextdb/tree/e6cf60cf972148bbbfe5a002151f40d191e551b9",
+      "declared_license": "Apache-2.0",
+      "category": "redb_extension",
+      "selection": "compare_first",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "sql-semantics",
+        "graph-semantics",
+        "vector-filtered",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Primary comparison pin is released 1.0.0 using redb 3. Development has its own redb 4.1 fork and v2 code; do not mix those capabilities.",
+      "evidence_urls": [
+        "https://github.com/context-graph-ai/contextdb/blob/e6cf60cf972148bbbfe5a002151f40d191e551b9/crates/contextdb-engine/src/persistence.rs",
+        "https://github.com/context-graph-ai/contextdb/blob/e6cf60cf972148bbbfe5a002151f40d191e551b9/crates/contextdb-engine/Cargo.toml"
+      ],
+      "additional_revisions": [
+        {
+          "label": "development_v2_and_forked_redb",
+          "revision": "6b44713da932f7bd6882bc8b5486c0ba6d5e3414",
+          "source_url": "https://github.com/context-graph-ai/contextdb/tree/6b44713da932f7bd6882bc8b5486c0ba6d5e3414"
+        }
+      ]
+    },
+    {
+      "id": "uqa-engine",
+      "repository": "cognica-io/uqa-engine",
+      "revision": "1ae12f023c3c4b2733fc60f6051992d3c342c8d2",
+      "source_url": "https://github.com/cognica-io/uqa-engine/tree/1ae12f023c3c4b2733fc60f6051992d3c342c8d2",
+      "declared_license": "Apache-2.0",
+      "category": "redb_extension",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "sql-semantics",
+        "graph-semantics",
+        "vector-filtered",
+        "text-hybrid",
+        "transaction-boundary",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Apache-2.0 from 0.6.2. redb 4.1 backend does not remove mandatory SQLite/SQLCipher and native PostgreSQL parser dependencies.",
+      "evidence_urls": [
+        "https://github.com/cognica-io/uqa-engine/blob/1ae12f023c3c4b2733fc60f6051992d3c342c8d2/LICENSING.md",
+        "https://github.com/cognica-io/uqa-engine/blob/1ae12f023c3c4b2733fc60f6051992d3c342c8d2/crates/uqa-engine/Cargo.toml",
+        "https://github.com/cognica-io/uqa-engine/blob/1ae12f023c3c4b2733fc60f6051992d3c342c8d2/crates/uqa-storage-redb/Cargo.toml",
+        "https://github.com/cognica-io/uqa-engine/blob/1ae12f023c3c4b2733fc60f6051992d3c342c8d2/crates/uqa-pg-query/Cargo.toml"
+      ]
+    },
+    {
+      "id": "gluesql",
+      "repository": "gluesql/gluesql",
+      "revision": "676a62d4f336c80e3d95b00002889cf84f43586d",
+      "source_url": "https://github.com/gluesql/gluesql/tree/676a62d4f336c80e3d95b00002889cf84f43586d",
+      "declared_license": "Apache-2.0",
+      "category": "redb_extension",
+      "selection": "compare_first",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "sql-semantics",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Existing redb 2.6 SQL adapter; own database/transaction interfaces require an omdb integration decision.",
+      "evidence_urls": [
+        "https://github.com/gluesql/gluesql/blob/676a62d4f336c80e3d95b00002889cf84f43586d/storages/redb-storage/Cargo.toml",
+        "https://github.com/gluesql/gluesql/blob/676a62d4f336c80e3d95b00002889cf84f43586d/storages/redb-storage/src/lib.rs"
+      ]
+    },
+    {
+      "id": "nopaldb",
+      "repository": "sharop/nopaldb",
+      "revision": "3636910c4ea5cf4ae839047ac9f9b1456df15c98",
+      "source_url": "https://github.com/sharop/nopaldb/tree/3636910c4ea5cf4ae839047ac9f9b1456df15c98",
+      "declared_license": "MPL-2.0",
+      "category": "redb_extension",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "vector-filtered",
+        "text-hybrid",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "redb 4.1 graph library with its own WAL and separate HNSW persistence; file-level license obligations remain.",
+      "evidence_urls": [
+        "https://github.com/sharop/nopaldb/blob/3636910c4ea5cf4ae839047ac9f9b1456df15c98/nopaldb/src/storage/kv/redb.rs",
+        "https://github.com/sharop/nopaldb/blob/3636910c4ea5cf4ae839047ac9f9b1456df15c98/nopaldb/src/graph/hybrid.rs",
+        "https://github.com/sharop/nopaldb/blob/3636910c4ea5cf4ae839047ac9f9b1456df15c98/nopaldb/src/embeddings/persistence.rs"
+      ]
+    },
+    {
+      "id": "corvid",
+      "repository": "corvid-db/corvid",
+      "revision": "b57d43eb5d5e359344bd5de1fe4cda370424188f",
+      "source_url": "https://github.com/corvid-db/corvid/tree/b57d43eb5d5e359344bd5de1fe4cda370424188f",
+      "declared_license": "MIT",
+      "category": "redb_extension",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "vector-filtered",
+        "graph-semantics",
+        "tag-filter",
+        "text-hybrid",
+        "transaction-boundary",
+        "mutation-reopen"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "redb 4.1, HNSW, BM25, limited graph and lookup joins; not general SQL. Last inspected head September 2026.",
+      "evidence_urls": [
+        "https://github.com/corvid-db/corvid/blob/b57d43eb5d5e359344bd5de1fe4cda370424188f/crates/corvid/Cargo.toml",
+        "https://github.com/corvid-db/corvid/blob/b57d43eb5d5e359344bd5de1fe4cda370424188f/crates/corvid/src/store.rs",
+        "https://github.com/corvid-db/corvid/blob/b57d43eb5d5e359344bd5de1fe4cda370424188f/crates/corvid/src/graph.rs",
+        "https://github.com/corvid-db/corvid/blob/b57d43eb5d5e359344bd5de1fe4cda370424188f/crates/corvid/src/join.rs"
+      ]
+    },
+    {
+      "id": "shodh-redb",
+      "repository": "varun29ankuS/shodh-redb",
+      "revision": "24f0c558d2e53b427c47b99832a252251aa91000",
+      "source_url": "https://github.com/varun29ankuS/shodh-redb/tree/24f0c558d2e53b427c47b99832a252251aa91000",
+      "declared_license": "Apache-2.0",
+      "category": "redb_extension",
+      "selection": "compare_first",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "vector-filtered",
+        "tag-filter",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Storage fork with transaction-bound IVF-PQ, tags, causal relationships and no_std configuration. Not SQL or a general graph language.",
+      "evidence_urls": [
+        "https://github.com/varun29ankuS/shodh-redb/blob/24f0c558d2e53b427c47b99832a252251aa91000/Cargo.toml",
+        "https://github.com/varun29ankuS/shodh-redb/blob/24f0c558d2e53b427c47b99832a252251aa91000/src/lib.rs",
+        "https://github.com/varun29ankuS/shodh-redb/blob/24f0c558d2e53b427c47b99832a252251aa91000/src/ivfpq/index.rs",
+        "https://github.com/varun29ankuS/shodh-redb/blob/24f0c558d2e53b427c47b99832a252251aa91000/src/composite/provider.rs"
+      ]
+    },
+    {
+      "id": "native-db",
+      "repository": "vincent-herlemont/native_db",
+      "revision": "b9554fdabbdd44997aa480c883e067ee3f823046",
+      "source_url": "https://github.com/vincent-herlemont/native_db/tree/b9554fdabbdd44997aa480c883e067ee3f823046",
+      "declared_license": "MIT",
+      "category": "redb_extension",
+      "selection": "watchlist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "tag-filter",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Typed records/indexes/migrations over redb 3.0.2. Inspected main commit October 2025; no general SQL, graph or vector engine.",
+      "evidence_urls": []
+    },
+    {
+      "id": "aresadb",
+      "repository": "yoreai/aresadb",
+      "revision": "f2a0a26b1bcb14d5560a8b9e00250834fcf4e8be",
+      "source_url": "https://github.com/yoreai/aresadb/tree/f2a0a26b1bcb14d5560a8b9e00250834fcf4e8be",
+      "declared_license": "MIT",
+      "category": "redb_extension",
+      "selection": "watchlist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "sql-semantics",
+        "graph-semantics",
+        "vector-filtered",
+        "transaction-boundary",
+        "mutation-reopen"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "redb 2.x; simplified vector indexing and brute-force filtered path in inspected source. Alpha distributed modules do not prove an integrated release.",
+      "evidence_urls": []
+    },
+    {
+      "id": "parsnip",
+      "repository": "omar16100/parsnip",
+      "revision": "96597e8c35f270e20220a5253c918da805ac3e4d",
+      "source_url": "https://github.com/omar16100/parsnip/tree/96597e8c35f270e20220a5253c918da805ac3e4d",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "redb_extension",
+      "selection": "watchlist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "tag-filter",
+        "vector-filtered",
+        "mutation-reopen"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Application-specific entities, relations and project tags over redb 2.2; linear cosine scans, not ANN.",
+      "evidence_urls": []
+    },
+    {
+      "id": "srvdb",
+      "repository": "Srinivas26k/srvdb",
+      "revision": "1eec46feb2b7e6a6e286fa3361a20cd771dd4e04",
+      "source_url": "https://github.com/Srinivas26k/srvdb/tree/1eec46feb2b7e6a6e286fa3361a20cd771dd4e04",
+      "declared_license": "Apache-2.0",
+      "category": "redb_extension",
+      "selection": "watchlist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "vector-filtered",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Embedded vector persistence with redb and separate vector storage. Rust 1.99 requirement and SimSIMD boundary; durability implementation not reviewed.",
+      "evidence_urls": [
+        "https://github.com/Srinivas26k/srvdb/blob/1eec46feb2b7e6a6e286fa3361a20cd771dd4e04/README.md",
+        "https://github.com/Srinivas26k/srvdb/blob/1eec46feb2b7e6a6e286fa3361a20cd771dd4e04/Cargo.toml"
+      ]
+    },
+    {
+      "id": "zvec-rs",
+      "repository": "thedonmon/zvec-rs",
+      "revision": "5e49a55b0fb0a5195ce9582ab80dca0f78ff61d1",
+      "source_url": "https://github.com/thedonmon/zvec-rs/tree/5e49a55b0fb0a5195ce9582ab80dca0f78ff61d1",
+      "declared_license": "MIT",
+      "category": "redb_extension",
+      "selection": "watchlist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "vector-filtered",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Manifest declares MIT and redb 2; license files, implementation durability and maintenance depth need review.",
+      "evidence_urls": [
+        "https://github.com/thedonmon/zvec-rs/blob/5e49a55b0fb0a5195ce9582ab80dca0f78ff61d1/Cargo.toml"
+      ]
+    },
+    {
+      "id": "diskann",
+      "repository": "microsoft/DiskANN",
+      "revision": "13bfb8e3911b9897fe68efd601cd656cec357c3f",
+      "source_url": "https://github.com/microsoft/DiskANN/tree/13bfb8e3911b9897fe68efd601cd656cec357c3f",
+      "declared_license": "MIT",
+      "category": "index_library",
+      "selection": "compare_first",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "vector-filtered",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Current DiskANN3 Rust DataProvider API; KV/B-tree examples. No omdb adapter exists as a result of this catalog. Legacy C++ is separate.",
+      "evidence_urls": [
+        "https://github.com/microsoft/DiskANN/blob/13bfb8e3911b9897fe68efd601cd656cec357c3f/README.md",
+        "https://github.com/microsoft/DiskANN/blob/13bfb8e3911b9897fe68efd601cd656cec357c3f/Cargo.toml"
+      ]
+    },
+    {
+      "id": "hnsw-rs",
+      "repository": "jean-pierreBoth/hnswlib-rs",
+      "revision": "3669dc6ecee50f9cb4faa46b4439042fce30aa80",
+      "source_url": "https://github.com/jean-pierreBoth/hnswlib-rs/tree/3669dc6ecee50f9cb4faa46b4439042fce30aa80",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "index_library",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "vector-filtered",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "HNSW algorithm/persistence reference, crate 0.3.6. Keep upstream and downstream modified copies distinct.",
+      "evidence_urls": [
+        "https://github.com/jean-pierreBoth/hnswlib-rs/blob/3669dc6ecee50f9cb4faa46b4439042fce30aa80/Cargo.toml"
+      ]
+    },
+    {
+      "id": "rust-cv-hnsw",
+      "repository": "rust-cv/hnsw",
+      "revision": "c5edaa0d7f60aedcad6429463ad3e5d74923c8f8",
+      "source_url": "https://github.com/rust-cv/hnsw/tree/c5edaa0d7f60aedcad6429463ad3e5d74923c8f8",
+      "declared_license": "MIT",
+      "category": "index_library",
+      "selection": "watchlist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "vector-filtered",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "ANN algorithm candidate with alloc-oriented dependencies; no persistent omdb adapter or target qualification. Latest inspected head August 2025.",
+      "evidence_urls": [
+        "https://github.com/rust-cv/hnsw/blob/c5edaa0d7f60aedcad6429463ad3e5d74923c8f8/Cargo.toml"
+      ]
+    },
+    {
+      "id": "infinilabs-diskann",
+      "repository": "infinilabs/diskann",
+      "revision": "d94f863f35e075a0d888535282bb7ed1d056b96a",
+      "source_url": "https://github.com/infinilabs/diskann/tree/d94f863f35e075a0d888535282bb7ed1d056b96a",
+      "declared_license": "MIT",
+      "category": "index_library",
+      "selection": "watchlist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "vector-filtered",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Older Rust-port lineage; July 2025 inspected head. Prefer evaluating current Microsoft DiskANN3 first.",
+      "evidence_urls": [
+        "https://github.com/infinilabs/diskann/blob/d94f863f35e075a0d888535282bb7ed1d056b96a/Cargo.toml"
+      ]
+    },
+    {
+      "id": "tantivy",
+      "repository": "quickwit-oss/tantivy",
+      "revision": "2ad36b4fd0c00ded047b12295423250d8d4d713b",
+      "source_url": "https://github.com/quickwit-oss/tantivy/tree/2ad36b4fd0c00ded047b12295423250d8d4d713b",
+      "declared_license": "MIT",
+      "category": "index_library",
+      "selection": "compare_first",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "text-hybrid",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "BM25/tokenization/facets and Directory API; own segment lifecycle needs an omdb generation or outbox bridge. Profile-dependent native compression.",
+      "evidence_urls": [
+        "https://github.com/quickwit-oss/tantivy/blob/2ad36b4fd0c00ded047b12295423250d8d4d713b/Cargo.toml",
+        "https://github.com/quickwit-oss/tantivy/blob/2ad36b4fd0c00ded047b12295423250d8d4d713b/src/directory/directory.rs"
+      ]
+    },
+    {
+      "id": "datafusion",
+      "repository": "apache/datafusion",
+      "revision": "34eb6dc5bf057a35c471a4fbfd2eece2a7937afe",
+      "source_url": "https://github.com/apache/datafusion/tree/34eb6dc5bf057a35c471a4fbfd2eece2a7937afe",
+      "declared_license": "Apache-2.0",
+      "category": "query_library",
+      "selection": "specialist",
+      "review_depth": "primary_docs",
+      "comparison_cases": [
+        "sql-semantics",
+        "transaction-boundary",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Analytical SQL/Arrow execution with table providers. Not an OLTP store; vectorized execution is not ANN search.",
+      "evidence_urls": []
+    },
+    {
+      "id": "petgraph",
+      "repository": "petgraph/petgraph",
+      "revision": "6b4ee17598daf3237ffe570d526b86f992ef4748",
+      "source_url": "https://github.com/petgraph/petgraph/tree/6b4ee17598daf3237ffe570d526b86f992ef4748",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "index_library",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "graph-semantics",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Graph algorithms and an exact traversal reference, not persistence, SQL or a graph query engine.",
+      "evidence_urls": [
+        "https://github.com/petgraph/petgraph/blob/6b4ee17598daf3237ffe570d526b86f992ef4748/Cargo.toml"
+      ]
+    },
+    {
+      "id": "roaring",
+      "repository": "RoaringBitmap/roaring-rs",
+      "revision": "f845305c4b6df310ad4aab9e355749c6badd56e4",
+      "source_url": "https://github.com/RoaringBitmap/roaring-rs/tree/f845305c4b6df310ad4aab9e355749c6badd56e4",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "index_library",
+      "selection": "compare_first",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "tag-filter",
+        "transaction-boundary",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Compressed bitmap candidate sets. Stable ID mapping, serialization and generation ownership belong to the adapter.",
+      "evidence_urls": [
+        "https://github.com/RoaringBitmap/roaring-rs/blob/f845305c4b6df310ad4aab9e355749c6badd56e4/roaring/Cargo.toml"
+      ]
+    },
+    {
+      "id": "differential-dataflow",
+      "repository": "TimelyDataflow/differential-dataflow",
+      "revision": "e7c24703f4b1935cd6c99779ed0c140b0fea8ac6",
+      "source_url": "https://github.com/TimelyDataflow/differential-dataflow/tree/e7c24703f4b1935cd6c99779ed0c140b0fea8ac6",
+      "declared_license": "MIT",
+      "category": "query_library",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "incremental-view",
+        "transaction-boundary",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Incremental joins, aggregates and recursive computations; durable input/replay ownership is not supplied by the computation engine.",
+      "evidence_urls": [
+        "https://github.com/TimelyDataflow/differential-dataflow/blob/e7c24703f4b1935cd6c99779ed0c140b0fea8ac6/differential-dataflow/Cargo.toml"
+      ]
+    },
+    {
+      "id": "timely-dataflow",
+      "repository": "TimelyDataflow/timely-dataflow",
+      "revision": "5d82cb0bd4e43a6a47c59383fb2475e6842c0a57",
+      "source_url": "https://github.com/TimelyDataflow/timely-dataflow/tree/5d82cb0bd4e43a6a47c59383fb2475e6842c0a57",
+      "declared_license": "MIT",
+      "category": "query_library",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "incremental-view",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Dataflow execution/progress substrate; related to Differential Dataflow rather than an independent database alternative.",
+      "evidence_urls": [
+        "https://github.com/TimelyDataflow/timely-dataflow/blob/5d82cb0bd4e43a6a47c59383fb2475e6842c0a57/timely/Cargo.toml"
+      ]
+    },
+    {
+      "id": "openraft",
+      "repository": "databendlabs/openraft",
+      "revision": "abc925f0ea135ae3b76d69b92c7477085ff00605",
+      "source_url": "https://github.com/databendlabs/openraft/tree/abc925f0ea135ae3b76d69b92c7477085ff00605",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "replication_library",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "replication-boundary",
+        "transaction-boundary",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Optional consensus component only for a concrete replication need. Storage/state-machine, membership, fencing and recovery adaptation required.",
+      "evidence_urls": [
+        "https://github.com/databendlabs/openraft/blob/abc925f0ea135ae3b76d69b92c7477085ff00605/Cargo.toml"
+      ]
+    },
+    {
+      "id": "grafeo",
+      "repository": "GrafeoDB/grafeo",
+      "revision": "a54c7cc5c8332b714754acd24d42de67e8ab2854",
+      "source_url": "https://github.com/GrafeoDB/grafeo/tree/a54c7cc5c8332b714754acd24d42de67e8ab2854",
+      "declared_license": "Apache-2.0",
+      "category": "alternative_database",
+      "selection": "compare_first",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "vector-filtered",
+        "text-hybrid",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Graph/RDF and SQL-PGQ, not established general SQL parity. Released 0.6.2 default embedded build omits WAL; enable WAL feature plus sync durability explicitly.",
+      "evidence_urls": [
+        "https://github.com/GrafeoDB/grafeo/blob/a54c7cc5c8332b714754acd24d42de67e8ab2854/crates/grafeo/Cargo.toml",
+        "https://github.com/GrafeoDB/grafeo/blob/a54c7cc5c8332b714754acd24d42de67e8ab2854/crates/grafeo-engine/src/config.rs"
+      ]
+    },
+    {
+      "id": "helixdb",
+      "repository": "HelixDB/helix-db",
+      "revision": "b524727a283f0197ae64249bad51b80bf607a371",
+      "source_url": "https://github.com/HelixDB/helix-db/tree/b524727a283f0197ae64249bad51b80bf607a371",
+      "declared_license": "Apache-2.0",
+      "category": "alternative_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "vector-filtered",
+        "text-hybrid",
+        "sql-semantics",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Current engine uses HelixDB/slatedb fork, not LMDB. SQL-to-graph subset and hosted/native compression closure; sampled CI mixed.",
+      "evidence_urls": [
+        "https://github.com/HelixDB/helix-db/blob/b524727a283f0197ae64249bad51b80bf607a371/crates/db/Cargo.toml",
+        "https://github.com/HelixDB/helix-db/blob/b524727a283f0197ae64249bad51b80bf607a371/docs/database/helix-db/query-guides/sql.mdx"
+      ],
+      "related_storage": {
+        "repository": "HelixDB/slatedb",
+        "revision": "747f75d851c0105a204ef1b113597e62b752f82b"
+      }
+    },
+    {
+      "id": "stoolap",
+      "repository": "stoolap/stoolap",
+      "revision": "225a8a39f697192459fb335504f37f423d31f7ac",
+      "source_url": "https://github.com/stoolap/stoolap/tree/225a8a39f697192459fb335504f37f423d31f7ac",
+      "declared_license": "Apache-2.0",
+      "category": "alternative_database",
+      "selection": "compare_first",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "sql-semantics",
+        "vector-filtered",
+        "tag-filter",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "SQL/MVCC/time travel/HNSW, own storage. Default jemalloc/OS boundary and periodic sync must be normalized for native/durable comparison.",
+      "evidence_urls": [
+        "https://github.com/stoolap/stoolap/blob/225a8a39f697192459fb335504f37f423d31f7ac/README.md",
+        "https://github.com/stoolap/stoolap/blob/225a8a39f697192459fb335504f37f423d31f7ac/Cargo.toml"
+      ]
+    },
+    {
+      "id": "turso",
+      "repository": "tursodatabase/turso",
+      "revision": "214ca686119d0ee6cc2bc4b207c4dffeed0fb7e2",
+      "source_url": "https://github.com/tursodatabase/turso/tree/214ca686119d0ee6cc2bc4b207c4dffeed0fb7e2",
+      "declared_license": "MIT",
+      "category": "alternative_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "sql-semantics",
+        "vector-filtered",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Rust SQLite-compatible engine with exact vector operations; ANN remains on inspected roadmap. Feature-dependent SimSIMD/native boundary.",
+      "evidence_urls": [
+        "https://github.com/tursodatabase/turso/blob/214ca686119d0ee6cc2bc4b207c4dffeed0fb7e2/README.md",
+        "https://github.com/tursodatabase/turso/blob/214ca686119d0ee6cc2bc4b207c4dffeed0fb7e2/COMPAT.md",
+        "https://github.com/tursodatabase/turso/blob/214ca686119d0ee6cc2bc4b207c4dffeed0fb7e2/core/Cargo.toml"
+      ]
+    },
+    {
+      "id": "qdrant",
+      "repository": "qdrant/qdrant",
+      "revision": "222b2e44ab1c3f17e8246396ead6558e45041df7",
+      "source_url": "https://github.com/qdrant/qdrant/tree/222b2e44ab1c3f17e8246396ead6558e45041df7",
+      "declared_license": "Apache-2.0",
+      "category": "retrieval_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "vector-filtered",
+        "tag-filter",
+        "text-hybrid",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Filtered/sparse/hybrid vector comparator, not SQL/graph. Reviewed lockfile has no RocksDB; native compression and allocator boundaries remain.",
+      "evidence_urls": [
+        "https://github.com/qdrant/qdrant/blob/222b2e44ab1c3f17e8246396ead6558e45041df7/Cargo.toml",
+        "https://github.com/qdrant/qdrant/blob/222b2e44ab1c3f17e8246396ead6558e45041df7/Cargo.lock",
+        "https://github.com/qdrant/qdrant/blob/222b2e44ab1c3f17e8246396ead6558e45041df7/lib/segment/Cargo.toml"
+      ]
+    },
+    {
+      "id": "lancedb",
+      "repository": "lancedb/lancedb",
+      "revision": "8029428c7152e6b018dcab31f5240e3144caab68",
+      "source_url": "https://github.com/lancedb/lancedb/tree/8029428c7152e6b018dcab31f5240e3144caab68",
+      "declared_license": "Apache-2.0",
+      "category": "retrieval_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "vector-filtered",
+        "text-hybrid",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Embedded columnar retrieval. Local SQL execution/property graph APIs return NotSupported; remote Enterprise API is not local free functionality.",
+      "evidence_urls": [
+        "https://github.com/lancedb/lancedb/blob/8029428c7152e6b018dcab31f5240e3144caab68/rust/lancedb/Cargo.toml",
+        "https://github.com/lancedb/lancedb/blob/8029428c7152e6b018dcab31f5240e3144caab68/rust/lancedb/src/connection.rs"
+      ]
+    },
+    {
+      "id": "samyama",
+      "repository": "samyama-ai/samyama-graph",
+      "revision": "f4a0d8c771f92ad2ba9bd24b1c33f7153af1538c",
+      "source_url": "https://github.com/samyama-ai/samyama-graph/tree/f4a0d8c771f92ad2ba9bd24b1c33f7153af1538c",
+      "declared_license": "Apache-2.0",
+      "category": "alternative_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "vector-filtered",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Active graph/HNSW source with mandatory RocksDB C++ dependency. No general SQL claim.",
+      "evidence_urls": [
+        "https://github.com/samyama-ai/samyama-graph/blob/f4a0d8c771f92ad2ba9bd24b1c33f7153af1538c/Cargo.toml"
+      ]
+    },
+    {
+      "id": "agdb",
+      "repository": "agnesoft/agdb",
+      "revision": "a1ae3739539cb498f4c310ca07184d9caa8fb1a5",
+      "source_url": "https://github.com/agnesoft/agdb/tree/a1ae3739539cb498f4c310ca07184d9caa8fb1a5",
+      "declared_license": "Apache-2.0",
+      "category": "alternative_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Compact native graph store and typed query API. General SQL and ANN were not established.",
+      "evidence_urls": []
+    },
+    {
+      "id": "oxigraph",
+      "repository": "oxigraph/oxigraph",
+      "revision": "6fd4584114ddc4e8168af68df2b6ed530ab9bb12",
+      "source_url": "https://github.com/oxigraph/oxigraph/tree/6fd4584114ddc4e8168af68df2b6ed530ab9bb12",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "alternative_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "RDF/SPARQL specialist; persistent default uses RocksDB C++. Not a property-graph/SQL/vector engine.",
+      "evidence_urls": [
+        "https://github.com/oxigraph/oxigraph/blob/6fd4584114ddc4e8168af68df2b6ed530ab9bb12/lib/oxigraph/Cargo.toml"
+      ]
+    },
+    {
+      "id": "typedb",
+      "repository": "typedb/typedb",
+      "revision": "a99f0e280829a18289d3d076d23309d46e9888d9",
+      "source_url": "https://github.com/typedb/typedb/tree/a99f0e280829a18289d3d076d23309d46e9888d9",
+      "declared_license": "MPL-2.0",
+      "category": "alternative_database",
+      "selection": "specialist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Current Rust Community server, typed relations/attributes and TypeQL; RocksDB/build-stack boundary, no established ANN capability.",
+      "evidence_urls": [
+        "https://github.com/typedb/typedb/blob/a99f0e280829a18289d3d076d23309d46e9888d9/storage/Cargo.toml"
+      ]
+    },
+    {
+      "id": "cozo",
+      "repository": "cozodb/cozo",
+      "revision": "481af058abac9444ea8c9c52c78f096ed4b5bfc4",
+      "source_url": "https://github.com/cozodb/cozo/tree/481af058abac9444ea8c9c52c78f096ed4b5bfc4",
+      "declared_license": "MPL-2.0",
+      "category": "alternative_database",
+      "selection": "watchlist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "vector-filtered",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Datalog relational/graph/vector engine. Latest inspected main December 2024; default SQLite and optional RocksDB introduce native dependencies.",
+      "evidence_urls": [
+        "https://github.com/cozodb/cozo/blob/481af058abac9444ea8c9c52c78f096ed4b5bfc4/cozo-core/Cargo.toml"
+      ]
+    },
+    {
+      "id": "cozo-community",
+      "repository": "cozo-community/cozo",
+      "revision": "faf89ef77e6462460f873e9de618001d968a1a40",
+      "source_url": "https://github.com/cozo-community/cozo/tree/faf89ef77e6462460f873e9de618001d968a1a40",
+      "declared_license": "MPL-2.0",
+      "category": "alternative_database",
+      "selection": "watchlist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "graph-semantics",
+        "vector-filtered",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Fork provenance only; inspected head December 2024 and no releases returned. Not evidence of resumed independent maintenance.",
+      "evidence_urls": [
+        "https://github.com/cozo-community/cozo/blob/faf89ef77e6462460f873e9de618001d968a1a40/cozo-core/Cargo.toml"
+      ]
+    },
+    {
+      "id": "neumann",
+      "repository": "Shadylukin/Neumann",
+      "revision": "2a6cb7d0ed1bbd92cce5a5239d073f25e866cee0",
+      "source_url": "https://github.com/Shadylukin/Neumann/tree/2a6cb7d0ed1bbd92cce5a5239d073f25e866cee0",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "alternative_database",
+      "selection": "watchlist",
+      "review_depth": "source_review",
+      "comparison_cases": [
+        "sql-semantics",
+        "graph-semantics",
+        "vector-filtered",
+        "transaction-boundary",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Broad engine/query-router design. Latest inspected main June 2026 and mandatory zstd/native boundary; no production-readiness claim.",
+      "evidence_urls": []
+    },
+    {
+      "id": "indradb",
+      "repository": "indradb/indradb",
+      "revision": "11c1c04a8c89fa80c19c00b84281cfdedfa74753",
+      "source_url": "https://github.com/indradb/indradb/tree/11c1c04a8c89fa80c19c00b84281cfdedfa74753",
+      "declared_license": "MPL-2.0",
+      "category": "alternative_database",
+      "selection": "watchlist",
+      "review_depth": "primary_docs",
+      "comparison_cases": [
+        "graph-semantics",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Graph library/server; August 2025 inspected head. Dependency closure and broader multimodel requirements unreviewed.",
+      "evidence_urls": []
+    },
+    {
+      "id": "graphlite",
+      "repository": "GraphLite-AI/GraphLite",
+      "revision": "a370a1c909642688130eccfd57c74b6508dcaea5",
+      "source_url": "https://github.com/GraphLite-AI/GraphLite/tree/a370a1c909642688130eccfd57c74b6508dcaea5",
+      "declared_license": "Apache-2.0",
+      "category": "alternative_database",
+      "selection": "watchlist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "graph-semantics",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Embedded GQL graph over sled; January 2026 inspected head. SQL/ANN and persistence maturity not established.",
+      "evidence_urls": [
+        "https://github.com/GraphLite-AI/GraphLite/blob/a370a1c909642688130eccfd57c74b6508dcaea5/Cargo.toml"
+      ]
+    },
+    {
+      "id": "fjall",
+      "repository": "fjall-rs/fjall",
+      "revision": "87006048139bfe1b072bbc29a5a92bf1f97628e3",
+      "source_url": "https://github.com/fjall-rs/fjall/tree/87006048139bfe1b072bbc29a5a92bf1f97628e3",
+      "declared_license": "MIT OR Apache-2.0",
+      "category": "storage_engine",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "storage-workload",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Rust embedded LSM/KV/transactions; storage comparator, not SQL/graph/vector query functionality.",
+      "evidence_urls": [
+        "https://github.com/fjall-rs/fjall/blob/87006048139bfe1b072bbc29a5a92bf1f97628e3/README.md",
+        "https://github.com/fjall-rs/fjall/blob/87006048139bfe1b072bbc29a5a92bf1f97628e3/Cargo.toml"
+      ]
+    },
+    {
+      "id": "slatedb",
+      "repository": "slatedb/slatedb",
+      "revision": "9aedb40017e4985dbde3702b9f75a82866a69a81",
+      "source_url": "https://github.com/slatedb/slatedb/tree/9aedb40017e4985dbde3702b9f75a82866a69a81",
+      "declared_license": "Apache-2.0",
+      "category": "storage_engine",
+      "selection": "specialist",
+      "review_depth": "primary_docs",
+      "comparison_cases": [
+        "storage-workload",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Object-store-oriented embedded KV/LSM. Keep upstream pin separate from Helix's fork; not a multimodel query engine.",
+      "evidence_urls": [
+        "https://github.com/slatedb/slatedb/blob/9aedb40017e4985dbde3702b9f75a82866a69a81/README.md"
+      ]
+    },
+    {
+      "id": "surrealkv",
+      "repository": "surrealdb/surrealkv",
+      "revision": "889ae54eee7b078a436bd5e3d76c6b83ec06ee45",
+      "source_url": "https://github.com/surrealdb/surrealkv/tree/889ae54eee7b078a436bd5e3d76c6b83ec06ee45",
+      "declared_license": "Apache-2.0",
+      "category": "storage_engine",
+      "selection": "specialist",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [
+        "storage-workload",
+        "transaction-boundary",
+        "mutation-reopen",
+        "profile-closure"
+      ],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Versioned transactional KV; independently Apache-2.0, unlike SurrealDB. Native zstd/compatibility dependencies require review.",
+      "evidence_urls": [
+        "https://github.com/surrealdb/surrealkv/blob/889ae54eee7b078a436bd5e3d76c6b83ec06ee45/Cargo.toml"
+      ]
+    },
+    {
+      "id": "silk-graph",
+      "repository": "Kieleth/silk-graph",
+      "revision": "5c4b7dc4cae74f38c2242cdeb926bda7bd4c02f3",
+      "source_url": "https://github.com/Kieleth/silk-graph/tree/5c4b7dc4cae74f38c2242cdeb926bda7bd4c02f3",
+      "declared_license": "FSL-1.0-Apache-2.0",
+      "category": "restricted_reference",
+      "selection": "license_gated",
+      "review_depth": "source_review",
+      "comparison_cases": [],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "redb-backed CRDT/operation-log graph; competing-use restrictions before license conversion. Reference, not import selection.",
+      "evidence_urls": [
+        "https://github.com/Kieleth/silk-graph/blob/5c4b7dc4cae74f38c2242cdeb926bda7bd4c02f3/LICENSE.md"
+      ]
+    },
+    {
+      "id": "velesdb",
+      "repository": "cyberlife-coder/VelesDB",
+      "revision": "afc0a4366bb92d0af8872262a2d4752aa2ebb6ee",
+      "source_url": "https://github.com/cyberlife-coder/VelesDB/tree/afc0a4366bb92d0af8872262a2d4752aa2ebb6ee",
+      "declared_license": "LicenseRef-VelesDB-Core-1.0",
+      "category": "restricted_reference",
+      "selection": "license_gated",
+      "review_depth": "license_and_docs",
+      "comparison_cases": [],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Custom ELv2-derived terms include competing-product restrictions. Not unrestricted MIT/Apache source.",
+      "evidence_urls": [
+        "https://github.com/cyberlife-coder/VelesDB/blob/afc0a4366bb92d0af8872262a2d4752aa2ebb6ee/LICENSE"
+      ]
+    },
+    {
+      "id": "surrealdb",
+      "repository": "surrealdb/surrealdb",
+      "revision": "9577ac5f0caa60a39d5a334e9352aed0e232f9e6",
+      "source_url": "https://github.com/surrealdb/surrealdb/tree/9577ac5f0caa60a39d5a334e9352aed0e232f9e6",
+      "declared_license": "BUSL-1.1",
+      "category": "restricted_reference",
+      "selection": "license_gated",
+      "review_depth": "license_and_docs",
+      "comparison_cases": [],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Excluded from adoption under current selection. Broad multimodel features do not override current license constraints.",
+      "evidence_urls": [
+        "https://github.com/surrealdb/surrealdb/blob/9577ac5f0caa60a39d5a334e9352aed0e232f9e6/LICENSE"
+      ]
+    },
+    {
+      "id": "reddb",
+      "repository": "reddb-io/reddb",
+      "revision": "3a06a6dccb158e29a301c261b45191d5096c75f6",
+      "source_url": "https://github.com/reddb-io/reddb/tree/3a06a6dccb158e29a301c261b45191d5096c75f6",
+      "declared_license": "BUSL-1.1",
+      "category": "restricted_reference",
+      "selection": "license_gated",
+      "review_depth": "manifest_and_docs",
+      "comparison_cases": [],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Different project from redb/omdb; broad multimodel claims retained as reference only.",
+      "evidence_urls": [
+        "https://github.com/reddb-io/reddb/blob/3a06a6dccb158e29a301c261b45191d5096c75f6/Cargo.toml"
+      ]
+    },
+    {
+      "id": "hydradb",
+      "repository": "hydra-db/hydradb",
+      "revision": "af6344037bffb2a354bf32c2b312ba4921a1583f",
+      "source_url": "https://github.com/hydra-db/hydradb/tree/af6344037bffb2a354bf32c2b312ba4921a1583f",
+      "declared_license": "Elastic-2.0",
+      "category": "restricted_reference",
+      "selection": "license_gated",
+      "review_depth": "license_and_docs",
+      "comparison_cases": [],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "Current head changed to ELv2. SlateDB graph reference requires C parser and SuiteSparse GraphBLAS; not Rust-only.",
+      "evidence_urls": [
+        "https://github.com/hydra-db/hydradb/blob/af6344037bffb2a354bf32c2b312ba4921a1583f/LICENSE",
+        "https://github.com/hydra-db/hydradb/blob/af6344037bffb2a354bf32c2b312ba4921a1583f/README.md"
+      ]
+    },
+    {
+      "id": "spacetimedb",
+      "repository": "clockworklabs/SpacetimeDB",
+      "revision": "0b6f11ab88e74df8650af72e9074ef9ced9cfbfa",
+      "source_url": "https://github.com/clockworklabs/SpacetimeDB/tree/0b6f11ab88e74df8650af72e9074ef9ced9cfbfa",
+      "declared_license": "BUSL-1.1",
+      "category": "restricted_reference",
+      "selection": "license_gated",
+      "review_depth": "license_and_docs",
+      "comparison_cases": [],
+      "comparison_status": "not_run",
+      "source_state": "reference_only",
+      "runtime_adopted": false,
+      "boundary": "2.16.0 base license limits production instances and database-service use. Stored-code model reference; subdirectory terms require separate review.",
+      "evidence_urls": [
+        "https://github.com/clockworklabs/SpacetimeDB/blob/0b6f11ab88e74df8650af72e9074ef9ced9cfbfa/LICENSE.txt"
+      ]
+    }
+  ]
+}

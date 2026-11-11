@@ -67,3 +67,12 @@ file; its gitlink is preserved, not relabeled as omdb-licensed source.
 Update the source pin, complete subtree, and import record together when taking
 a newer upstream snapshot. Keep local integration code outside this byte-pinned
 snapshot so source updates remain auditable.
+
+## Extension and comparison references
+
+The [database extension catalog](../docs/research/database-upstream-catalog.md)
+compares RuVector with redb-backed extensions, reusable Rust query/index libraries,
+and alternative databases. Its [pinned reference manifest](../docs/research/database-candidates.json)
+and [focused comparison plan](../docs/research/database-comparison-plan.md) identify
+what to evaluate next without importing more engines or changing the root build.
+These are research references, not benchmark results or integrated capabilities.
