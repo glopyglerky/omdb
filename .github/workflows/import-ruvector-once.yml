@@ -1,0 +1,45 @@
+name: Import pinned RuVector source
+
+on:
+  push:
+    branches: [omdb/import-ruvector-39a104e]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: import-ruvector-39a104e
+  cancel-in-progress: false
+
+jobs:
+  import:
+    if: github.repository == 'glopyglerky/omdb' && github.ref == 'refs/heads/omdb/import-ruvector-39a104e'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          submodules: false
+
+      - name: Copy and verify the exact upstream snapshot
+        shell: bash
+        run: |
+          set -euo pipefail
+          import_base=$(git rev-parse HEAD)
+          if git cat-file -e HEAD:upstream/ruvector 2>/dev/null; then
+            python3 scripts/verify-ruvector-import.py
+            exit 0
+          fi
+          git fetch --no-tags --no-recurse-submodules --depth=1 https://github.com/ruvnet/RuVector.git 39a104e50388d41837f86e4001096a01927e1728
+          test "$(git rev-parse 39a104e50388d41837f86e4001096a01927e1728^{tree})" = 4553930c20e6ec1a36c021873c8f86f1ccea2be0
+          git read-tree --prefix=upstream/ruvector/ -u 39a104e50388d41837f86e4001096a01927e1728
+          git config user.name "$(git show -s --format=%an HEAD)"
+          git config user.email "$(git show -s --format=%ae HEAD)"
+          git -c core.hooksPath=/dev/null commit -m "Import the complete pinned RuVector source snapshot" -m "Preserve all tracked source, notices, assets, and external submodule pins." -m "Assisted-by: ChatGPT"
+          python3 scripts/verify-ruvector-import.py
+          git diff --exit-code "$import_base" HEAD -- src crates tests examples fuzz build.rs
+          git submodule update --init --recursive --depth 1 -- upstream/ruvector/examples/vectorvroom upstream/ruvector/external/ruqu upstream/ruvector/external/rvdna
+          git submodule status --recursive
+          git push origin HEAD:refs/heads/omdb/import-ruvector-39a104e

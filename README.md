@@ -2,6 +2,12 @@
 
 A fork of [redb](https://github.com/cberner/redb). The Cargo package remains `redb`.
 
+The complete pinned [RuVector source](upstream/ruvector) is included for vector,
+graph, filtering, and related development. See the [import record](upstream/README.md)
+for its revision, licenses, and submodule checkout instructions. It remains a
+separate workspace: this source import does not change redb's API, storage format,
+or dependencies, and does not yet connect RuVector to this fork's redb package.
+
 ![Upstream CI](https://github.com/cberner/redb/actions/workflows/ci.yml/badge.svg)
 [![Crates.io](https://img.shields.io/crates/v/redb.svg)](https://crates.io/crates/redb)
 [![Documentation](https://docs.rs/redb/badge.svg)](https://docs.rs/redb)
