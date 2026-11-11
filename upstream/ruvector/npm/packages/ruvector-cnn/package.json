@@ -1,0 +1,56 @@
+{
+  "name": "@ruvector/cnn",
+  "version": "0.1.4",
+  "description": "CNN feature extraction for image embeddings - SIMD-optimized, pure Rust/WASM",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "ruvector_cnn_wasm_bg.wasm",
+    "ruvector_cnn_wasm.js",
+    "ruvector_cnn_wasm.d.ts",
+    "ruvector_cnn_wasm_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "wasm-pack build ../../../crates/ruvector-cnn-wasm --release --target web --out-dir ../../npm/packages/ruvector-cnn/pkg",
+    "postbuild": "cp pkg/ruvector_cnn_wasm* . && rm -rf pkg",
+    "test": "node test.js"
+  },
+  "keywords": [
+    "embeddings",
+    "simd",
+    "machine-learning",
+    "wasm",
+    "ruvector",
+    "ruvnet",
+    "cnn",
+    "vector-database",
+    "vector-search",
+    "hnsw",
+    "rag",
+    "semantic-search",
+    "knowledge-graph",
+    "gnn",
+    "graph-embeddings",
+    "link-prediction"
+  ],
+  "author": "ruvnet",
+  "license": "MIT",
+  "repository": {
+    "directory": "npm/packages/ruvector-cnn",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "homepage": "https://ruv.io",
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

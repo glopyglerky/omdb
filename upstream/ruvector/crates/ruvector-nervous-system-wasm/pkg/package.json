@@ -1,0 +1,50 @@
+{
+  "name": "@ruvector/nervous-system-wasm",
+  "type": "module",
+  "collaborators": [
+    "RuVector Team"
+  ],
+  "author": "RuVector Team <ruvnet@users.noreply.github.com>",
+  "description": "WASM bindings for ruvector-nervous-system bio-inspired AI components - HDC, BTSP, neuromorphic computing",
+  "version": "0.1.30",
+  "license": "MIT",
+  "repository": {
+    "directory": "crates/ruvector-nervous-system-wasm/pkg",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "files": [
+    "ruvector_nervous_system_wasm_bg.wasm",
+    "ruvector_nervous_system_wasm.js",
+    "ruvector_nervous_system_wasm.d.ts",
+    "ruvector_nervous_system_wasm_bg.wasm.d.ts",
+    "README.md"
+  ],
+  "main": "ruvector_nervous_system_wasm.js",
+  "homepage": "https://ruv.io",
+  "types": "ruvector_nervous_system_wasm.d.ts",
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "keywords": [
+    "wasm",
+    "webassembly",
+    "neural-network",
+    "ai",
+    "ruvector",
+    "ruvnet",
+    "vector-database",
+    "vector-search",
+    "hnsw",
+    "embeddings",
+    "rag",
+    "semantic-search",
+    "knowledge-graph",
+    "gnn",
+    "graph-embeddings",
+    "link-prediction"
+  ]
+}

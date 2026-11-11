@@ -1,0 +1,62 @@
+{
+  "name": "ruvllm-esp32",
+  "version": "0.3.4",
+  "description": "RuvLLM ESP32 - Tiny LLM inference for ESP32 microcontrollers with INT8 quantization, RAG, HNSW vector search, hyperbolic embeddings (Poincaré/Lorentz), and multi-chip federation.",
+  "keywords": [
+    "esp32",
+    "ai",
+    "llm",
+    "rag",
+    "inference",
+    "vector-search",
+    "ruvllm",
+    "ruvnet",
+    "hnsw",
+    "quantization",
+    "edge-ai",
+    "iot",
+    "machine-learning",
+    "neural-network",
+    "embeddings",
+    "local-llm"
+  ],
+  "author": "RuVector Team",
+  "license": "MIT",
+  "repository": {
+    "directory": "examples/ruvLLM/esp32-flash/npm",
+    "type": "git",
+    "url": "git+https://github.com/ruvnet/ruvector.git"
+  },
+  "homepage": "https://ruv.io",
+  "bugs": {
+    "url": "https://github.com/ruvnet/ruvector/issues"
+  },
+  "bin": {
+    "ruvllm-esp32": "./bin/cli.js"
+  },
+  "files": [
+    "bin/",
+    "binaries/",
+    "scripts/",
+    "templates/",
+    "web-flasher/",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node bin/postinstall.js",
+    "test": "node --test test/install-tempfile.test.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "preferGlobal": true
+}

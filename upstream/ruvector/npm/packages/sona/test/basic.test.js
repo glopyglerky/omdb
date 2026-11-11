@@ -1,0 +1,237 @@
+/**
+ * Basic NAPI tests for SONA
+ */
+
+const test = require('node:test');
+const assert = require('node:assert');
+const { SonaEngine } = require('../index.js');
+
+test('SonaEngine creation', () => {
+  const engine = new SonaEngine(128);
+  assert.ok(engine, 'Engine should be created');
+  assert.strictEqual(engine.isEnabled(), true, 'Engine should be enabled by default');
+});
+
+test('SonaEngine with custom config', () => {
+  const engine = SonaEngine.withConfig({
+    hiddenDim: 256,
+    microLoraRank: 2,
+    baseLoraRank: 8,
+  });
+  assert.ok(engine, 'Engine should be created with custom config');
+});
+
+test('Trajectory recording', () => {
+  const engine = new SonaEngine(64);
+  const queryEmbedding = Array(64).fill(0.1);
+
+  const trajectoryId = engine.beginTrajectory(queryEmbedding);
+  assert.strictEqual(typeof trajectoryId, 'number', 'beginTrajectory should return a trajectory id');
+
+  engine.addTrajectoryStep(trajectoryId, Array(64).fill(0.5), Array(32).fill(0.4), 0.8);
+  engine.setTrajectoryRoute(trajectoryId, 'test_route');
+  engine.addTrajectoryContext(trajectoryId, 'test_context');
+
+  engine.endTrajectory(trajectoryId, 0.85);
+});
+
+test('Micro-LoRA application', () => {
+  const engine = new SonaEngine(64);
+  const input = Array(64).fill(1.0);
+
+  const output = engine.applyMicroLora(input);
+  assert.ok(Array.isArray(output), 'Output should be an array');
+  assert.strictEqual(output.length, 64, 'Output should have same dimension as input');
+});
+
+test('Base-LoRA application', () => {
+  const engine = new SonaEngine(64);
+  const input = Array(64).fill(1.0);
+
+  const output = engine.applyBaseLora(0, input);
+  assert.ok(Array.isArray(output), 'Output should be an array');
+  assert.strictEqual(output.length, 64, 'Output should have same dimension as input');
+});
+
+// Regression tests for #706: the Rust LoRA forward pass has residual
+// semantics (it *adds* the learned delta into the provided output buffer),
+// so a cold, untrained engine must return the input unchanged rather than a
+// zero vector, and a trained engine must return input-plus-delta rather
+// than the bare delta.
+test('Micro-LoRA cold-start identity (#706)', () => {
+  const engine = new SonaEngine(64);
+  const input = Array(64).fill(1.0);
+
+  const output = engine.applyMicroLora(input);
+  assert.deepStrictEqual(
+    output,
+    input,
+    'Untrained engine must return the input unchanged, not a zero vector',
+  );
+});
+
+test('Base-LoRA cold-start identity (#706)', () => {
+  const engine = new SonaEngine(64);
+  const input = Array(64).fill(1.0);
+
+  const output = engine.applyBaseLora(0, input);
+  assert.deepStrictEqual(
+    output,
+    input,
+    'Untrained engine must return the input unchanged, not a zero vector',
+  );
+});
+
+test('Micro-LoRA post-feedback is input-plus-delta, not delta alone (#706)', () => {
+  const engine = new SonaEngine(64);
+  const input = Array(64).fill(1.0);
+
+  for (let i = 0; i < 5; i++) {
+    const embedding = Array(64).fill(1 / Math.sqrt(64));
+    const trajectoryId = engine.beginTrajectory(embedding);
+    engine.addTrajectoryStep(trajectoryId, embedding, [], 0.9);
+    engine.endTrajectory(trajectoryId, 0.9);
+  }
+  engine.flush();
+
+  const output = engine.applyMicroLora(input);
+  assert.notDeepStrictEqual(
+    output,
+    Array(64).fill(0),
+    'Post-feedback output collapsed to the bare delta (zero-seeded bug)',
+  );
+
+  const delta = output.reduce((acc, v, i) => acc + Math.abs(v - input[i]), 0);
+  assert.ok(delta > 0, 'Feedback should have produced a nonzero learned delta');
+});
+
+test('Pattern finding', () => {
+  const engine = new SonaEngine(64);
+
+  // Record some trajectories first
+  for (let i = 0; i < 10; i++) {
+    const trajectoryId = engine.beginTrajectory(Array(64).fill(Math.random()));
+    engine.addTrajectoryStep(trajectoryId, Array(64).fill(0.5), Array(32).fill(0.4), 0.8);
+    engine.endTrajectory(trajectoryId, 0.8);
+  }
+
+  // Force learning to extract patterns
+  engine.forceLearn();
+
+  // Find patterns
+  const patterns = engine.findPatterns(Array(64).fill(0.5), 5);
+  assert.ok(Array.isArray(patterns), 'Patterns should be an array');
+});
+
+test('Enable/disable engine', () => {
+  const engine = new SonaEngine(64);
+
+  assert.strictEqual(engine.isEnabled(), true);
+  engine.setEnabled(false);
+  assert.strictEqual(engine.isEnabled(), false);
+  engine.setEnabled(true);
+  assert.strictEqual(engine.isEnabled(), true);
+});
+
+test('Force learning', () => {
+  const engine = new SonaEngine(64);
+
+  // Record trajectories
+  for (let i = 0; i < 5; i++) {
+    const trajectoryId = engine.beginTrajectory(Array(64).fill(Math.random()));
+    engine.addTrajectoryStep(trajectoryId, Array(64).fill(0.5), Array(32).fill(0.4), 0.8);
+    engine.endTrajectory(trajectoryId, 0.8);
+  }
+
+  const result = engine.forceLearn();
+  assert.ok(typeof result === 'string', 'Result should be a string');
+  assert.ok(result.length > 0, 'Result should not be empty');
+});
+
+test('Get statistics', () => {
+  const engine = new SonaEngine(64);
+
+  const stats = engine.getStats();
+  assert.ok(typeof stats === 'string', 'Stats should be a string');
+  assert.ok(stats.length > 0, 'Stats should not be empty');
+});
+
+test('Flush instant updates', () => {
+  const engine = new SonaEngine(64);
+
+  // Should not throw
+  assert.doesNotThrow(() => {
+    engine.flush();
+  });
+});
+
+test('Tick background learning', () => {
+  const engine = new SonaEngine(64);
+
+  // May or may not return a message depending on timing
+  const result = engine.tick();
+  assert.ok(result === null || typeof result === 'string');
+});
+
+// A Rust panic aborts the whole Node process, so bad input must throw instead.
+test('applyMicroLora rejects wrong-length input', () => {
+  const engine = new SonaEngine(64);
+  assert.throws(() => engine.applyMicroLora([1, 2, 3]), /hiddenDim/);
+});
+
+test('applyBaseLora rejects wrong-length input', () => {
+  const engine = new SonaEngine(8);
+  assert.throws(() => engine.applyBaseLora(0, new Array(20).fill(1)), /hiddenDim/);
+});
+
+test('withConfig rejects microLoraRank outside 1-2', () => {
+  assert.throws(() => SonaEngine.withConfig({ hiddenDim: 64, microLoraRank: 3 }), /microLoraRank/);
+  assert.throws(() => SonaEngine.withConfig({ hiddenDim: 64, microLoraRank: 0 }), /microLoraRank/);
+});
+
+test('trajectory ids belong to the engine that issued them', () => {
+  const a = new SonaEngine(8);
+  const b = new SonaEngine(8);
+  const id = a.beginTrajectory(new Array(8).fill(0.5));
+  b.endTrajectory(id, 0.9);
+  assert.strictEqual(JSON.parse(b.getStats()).trajectories_buffered, 0);
+  a.endTrajectory(id, 0.9);
+  assert.strictEqual(JSON.parse(a.getStats()).trajectories_buffered, 1);
+});
+
+test('NaN feedback does not poison LoRA output', () => {
+  const engine = new SonaEngine(8);
+  const id = engine.beginTrajectory(new Array(8).fill(0.5));
+  engine.addTrajectoryStep(id, new Array(8).fill(NaN), [], NaN);
+  engine.endTrajectory(id, NaN);
+  engine.flush();
+  engine.forceLearn();
+  const input = new Array(8).fill(1);
+  assert.ok(engine.applyMicroLora(input).every(Number.isFinite));
+  assert.ok(engine.applyBaseLora(0, input).every(Number.isFinite));
+});
+
+test('unfinished trajectories are capped and ids stay unique', () => {
+  const engine = new SonaEngine(8);
+  const emb = new Array(8).fill(0.5);
+  const ids = new Set();
+  for (let i = 0; i < 10001; i++) ids.add(engine.beginTrajectory(emb));
+  assert.strictEqual(ids.size, 10001);
+  // The first trajectory was evicted, so ending it submits nothing.
+  engine.endTrajectory(0, 0.9);
+  assert.strictEqual(JSON.parse(engine.getStats()).trajectories_buffered, 0);
+  engine.endTrajectory(10000, 0.9);
+  assert.strictEqual(JSON.parse(engine.getStats()).trajectories_buffered, 1);
+});
+
+test('forceLearnAsync resolves off the event loop', async () => {
+  const engine = new SonaEngine(8);
+  const id = engine.beginTrajectory(new Array(8).fill(0.5));
+  engine.endTrajectory(id, 0.9);
+  const pending = engine.forceLearnAsync();
+  assert.throws(() => engine.setEnabled(false), /forceLearnAsync/);
+  const status = await pending;
+  assert.match(status, /Forced learning/);
+  engine.setEnabled(false);
+  assert.strictEqual(engine.isEnabled(), false);
+});
