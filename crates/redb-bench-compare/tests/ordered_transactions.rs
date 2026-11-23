@@ -601,7 +601,9 @@ fn sample_strict_durable_ordered_commits() {
 
 #[cfg(unix)]
 mod process_recovery {
-    use super::{Fjall, Path, Row, Rows, Snapshot, Sqlite, Store, direct, local};
+    use super::{
+        Fjall, Path, Row, Rows, Snapshot, Sqlite, Store, direct, history_rows, local, seed_history,
+    };
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -625,17 +627,57 @@ mod process_recovery {
     const READY: &str = "strict-store-write-staged";
     const ENGINE: &str = "T3_ORDERED_RECOVERY_FIXTURE_ENGINE";
     const PATH: &str = "T3_ORDERED_RECOVERY_FIXTURE_PATH";
+    const RETENTION: &str = "T3_ORDERED_RECOVERY_FIXTURE_RETENTION";
 
     fn stage_and_block<S: Store>(path: &Path) {
         let store = S::open(path);
         store.write(ACKNOWLEDGED, true);
-        store.write_before_commit(INTERRUPTED, false, || {
-            writeln!(io::stdout().lock(), "{READY}").unwrap();
-            io::stdout().flush().unwrap();
-            // The parent owns the pipe and kills this writer with the transaction open.
-            let _ = io::stdin().lock().read_exact(&mut [0]);
-            panic!("fixture writer released without a process kill");
-        });
+        store.write_before_commit(INTERRUPTED, false, signal_and_wait);
+    }
+
+    fn signal_and_wait() {
+        writeln!(io::stdout().lock(), "{READY}").unwrap();
+        io::stdout().flush().unwrap();
+        // The parent owns the pipe and kills this writer with the transaction open.
+        let _ = io::stdin().lock().read_exact(&mut [0]);
+        panic!("fixture writer released without a process kill");
+    }
+
+    fn retention_write<S: Store>(
+        store: &S,
+        root: &[Row<'_>],
+        revision: u32,
+        commit: bool,
+        staged: impl FnOnce(),
+    ) {
+        let appended = history_rows(8_192 + (revision - 1) * 32, 8_192 + revision * 32);
+        let mut rows = root.to_vec();
+        rows.extend(
+            appended
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+        );
+        let removed = history_rows((revision - 1) * 32, revision * 32);
+        let removed = removed
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<Vec<_>>();
+        store.mutate_before_commit(&rows, &removed, commit, staged);
+    }
+
+    fn stage_retention_and_block<S: Store>(path: &Path) {
+        let store = S::open(path);
+        seed_history(&store);
+        retention_write(&store, ACKNOWLEDGED, 1, true, || {});
+        retention_write(&store, INTERRUPTED, 2, false, signal_and_wait);
+    }
+
+    fn stage_fixture<S: Store>(path: &Path) {
+        match std::env::var(RETENTION).as_deref() {
+            Ok("0") => stage_and_block::<S>(path),
+            Ok("1") => stage_retention_and_block::<S>(path),
+            _ => panic!("unknown ordered transaction fixture workload"),
+        }
     }
 
     #[test]
@@ -646,21 +688,22 @@ mod process_recovery {
         let path = std::env::var_os(PATH).unwrap();
         let path = Path::new(&path);
         match engine.to_str().unwrap() {
-            "omdb" => stage_and_block::<local::Database>(path),
-            "redb" => stage_and_block::<direct::Database>(path),
-            "fjall" => stage_and_block::<Fjall>(path),
-            "sqlite" => stage_and_block::<Sqlite>(path),
+            "omdb" => stage_fixture::<local::Database>(path),
+            "redb" => stage_fixture::<direct::Database>(path),
+            "fjall" => stage_fixture::<Fjall>(path),
+            "sqlite" => stage_fixture::<Sqlite>(path),
             _ => panic!("unknown ordered transaction fixture engine"),
         }
     }
 
-    fn interrupt_writer<S: Store>(engine: &str) {
+    fn interrupt_writer<S: Store>(engine: &str, retention: bool) {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state");
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "process_recovery::writer_fixture", "--nocapture"])
             .env(ENGINE, engine)
             .env(PATH, &path)
+            .env(RETENTION, if retention { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -697,13 +740,28 @@ mod process_recovery {
             actual, expected,
             "{engine} did not preserve the root commit"
         );
+        if retention {
+            assert_eq!(
+                reopened.read().range(b"history:", b"history;"),
+                history_rows(32, 8_224),
+                "{engine} did not preserve exactly the acknowledged retention root",
+            );
+        }
     }
 
     #[test]
     fn strict_stores_recover_acknowledged_commit_after_process_death() {
-        interrupt_writer::<local::Database>("omdb");
-        interrupt_writer::<direct::Database>("redb");
-        interrupt_writer::<Fjall>("fjall");
-        interrupt_writer::<Sqlite>("sqlite");
+        interrupt_writer::<local::Database>("omdb", false);
+        interrupt_writer::<direct::Database>("redb", false);
+        interrupt_writer::<Fjall>("fjall", false);
+        interrupt_writer::<Sqlite>("sqlite", false);
+    }
+
+    #[test]
+    fn strict_stores_recover_acknowledged_retention_after_process_death() {
+        interrupt_writer::<local::Database>("omdb", true);
+        interrupt_writer::<direct::Database>("redb", true);
+        interrupt_writer::<Fjall>("fjall", true);
+        interrupt_writer::<Sqlite>("sqlite", true);
     }
 }
