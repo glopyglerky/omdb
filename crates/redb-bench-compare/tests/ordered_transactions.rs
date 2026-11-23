@@ -15,7 +15,11 @@ trait Store: Sized {
 
     fn open(path: &Path) -> Self;
     fn read(&self) -> Self::Reader;
-    fn write(&self, rows: &[Row<'_>], commit: bool);
+    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce());
+
+    fn write(&self, rows: &[Row<'_>], commit: bool) {
+        self.write_before_commit(rows, commit, || {});
+    }
 }
 
 fn exercise<S: Store>() {
@@ -85,7 +89,12 @@ macro_rules! redb_store {
                     self.0.begin_read().unwrap()
                 }
 
-                fn write(&self, rows: &[Row<'_>], commit: bool) {
+                fn write_before_commit(
+                    &self,
+                    rows: &[Row<'_>],
+                    commit: bool,
+                    staged: impl FnOnce(),
+                ) {
                     let mut txn = self.0.begin_write().unwrap();
                     txn.set_durability($engine::Durability::Immediate).unwrap();
                     {
@@ -94,6 +103,7 @@ macro_rules! redb_store {
                             table.insert(key, value).unwrap();
                         }
                     }
+                    staged();
                     if commit {
                         txn.commit().unwrap();
                     }
@@ -148,7 +158,7 @@ impl Store for Fjall {
         }
     }
 
-    fn write(&self, rows: &[Row<'_>], commit: bool) {
+    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce()) {
         let mut txn = self
             .db
             .write_tx()
@@ -156,6 +166,7 @@ impl Store for Fjall {
         for &(key, value) in rows {
             txn.insert(&self.keys, key, value);
         }
+        staged();
         if commit {
             txn.commit().unwrap();
         }
@@ -205,7 +216,7 @@ impl Store for Sqlite {
         conn
     }
 
-    fn write(&self, rows: &[Row<'_>], commit: bool) {
+    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce()) {
         let mut conn = self.connect();
         let txn = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -217,6 +228,7 @@ impl Store for Sqlite {
             )
             .unwrap();
         }
+        staged();
         if commit {
             txn.commit().unwrap();
         }
@@ -253,4 +265,113 @@ fn fjall_ordered_snapshot_and_root_commit() {
 #[test]
 fn sqlite_wal_full_ordered_snapshot_and_root_commit() {
     exercise::<Sqlite>();
+}
+
+#[cfg(unix)]
+mod process_recovery {
+    use super::{Fjall, Path, Row, Rows, Snapshot, Sqlite, Store, direct, local};
+    use std::io::{self, BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const ACKNOWLEDGED: &[Row<'_>] = &[
+        (b"1:event", b"acknowledged"),
+        (b"2:projection", b"visible"),
+        (b"3:index", b"visible"),
+        (b"4:receipt", b"accepted"),
+        (b"5:outbox", b"pending"),
+    ];
+    const INTERRUPTED: &[Row<'_>] = &[
+        (b"1:event", b"interrupted"),
+        (b"2:projection", b"uncommitted"),
+        (b"3:index", b"uncommitted"),
+        (b"4:receipt", b"uncommitted"),
+        (b"5:outbox", b"uncommitted"),
+        (b"5:outbox-duplicate", b"uncommitted"),
+    ];
+    const READY: &str = "strict-store-write-staged";
+    const ENGINE: &str = "T3_ORDERED_RECOVERY_FIXTURE_ENGINE";
+    const PATH: &str = "T3_ORDERED_RECOVERY_FIXTURE_PATH";
+
+    fn stage_and_block<S: Store>(path: &Path) {
+        let store = S::open(path);
+        store.write(ACKNOWLEDGED, true);
+        store.write_before_commit(INTERRUPTED, false, || {
+            writeln!(io::stdout().lock(), "{READY}").unwrap();
+            io::stdout().flush().unwrap();
+            // The parent owns the pipe and kills this writer with the transaction open.
+            let _ = io::stdin().lock().read_exact(&mut [0]);
+            panic!("fixture writer released without a process kill");
+        });
+    }
+
+    #[test]
+    fn writer_fixture() {
+        let Some(engine) = std::env::var_os(ENGINE) else {
+            return;
+        };
+        let path = std::env::var_os(PATH).unwrap();
+        let path = Path::new(&path);
+        match engine.to_str().unwrap() {
+            "omdb" => stage_and_block::<local::Database>(path),
+            "redb" => stage_and_block::<direct::Database>(path),
+            "fjall" => stage_and_block::<Fjall>(path),
+            "sqlite" => stage_and_block::<Sqlite>(path),
+            _ => panic!("unknown ordered transaction fixture engine"),
+        }
+    }
+
+    fn interrupt_writer<S: Store>(engine: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "process_recovery::writer_fixture", "--nocapture"])
+            .env(ENGINE, engine)
+            .env(PATH, &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let output = child.stdout.take().unwrap();
+        let (observed, barrier) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(output).lines() {
+                if line.unwrap().trim() == READY {
+                    observed.send(()).ok();
+                    break;
+                }
+            }
+        });
+        let staged = barrier.recv_timeout(Duration::from_secs(20));
+        let killed = child.kill();
+        let status = child.wait().unwrap();
+        reader.join().unwrap();
+        assert!(
+            staged.is_ok(),
+            "{engine} did not acknowledge the staged fixture"
+        );
+        killed.unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(9));
+
+        let reopened = S::open(&path);
+        let actual = reopened.read().range(b"1:", b"6:");
+        let expected: Rows = ACKNOWLEDGED
+            .iter()
+            .map(|&(key, value)| (key.to_vec(), value.to_vec()))
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "{engine} did not preserve the root commit"
+        );
+    }
+
+    #[test]
+    fn strict_stores_recover_acknowledged_commit_after_process_death() {
+        interrupt_writer::<local::Database>("omdb");
+        interrupt_writer::<direct::Database>("redb");
+        interrupt_writer::<Fjall>("fjall");
+        interrupt_writer::<Sqlite>("sqlite");
+    }
 }
