@@ -314,6 +314,122 @@ fn sqlite_wal_full_ordered_snapshot_and_root_commit() {
     exercise::<Sqlite>();
 }
 
+#[cfg(feature = "ordered-transactions")]
+#[test]
+fn comparable_transactions() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use redb_bench_compare::ordered::{Database, Engine, Error};
+    use std::io::{Error as IoError, ErrorKind};
+
+    type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+    let record = |key: &[u8], value: &[u8]| (key.to_vec(), value.to_vec());
+
+    for engine in [Engine::Fjall, Engine::DirectRedb] {
+        let workspace = tempfile::tempdir()?;
+        let path = workspace.path().join("state");
+        let store = Database::open(engine, &path)?;
+        store.write(|txn| {
+            txn.put(b"a", b"before")?;
+            txn.put(b"a\0", b"prefix")?;
+            txn.put(b"b", b"old")?;
+            txn.put(b"c", b"exclusive end")
+        })?;
+        let pinned = store.snapshot()?;
+
+        store.write(|txn| -> TestResult<()> {
+            txn.delete(b"a")?;
+            txn.put(b"b", b"new")?;
+            assert_eq!(txn.get(b"a")?, None);
+            assert_eq!(txn.get(b"b")?, Some(b"new".to_vec()));
+
+            let rejected = txn.savepoint(|child| -> TestResult<()> {
+                child.delete(b"b")?;
+                child.savepoint(|grandchild| grandchild.put(b"a\x01", b"rolled back"))?;
+                assert_eq!(
+                    child.scan(b"a", b"c", 2)?,
+                    [record(b"a\0", b"prefix"), record(b"a\x01", b"rolled back")]
+                );
+                Err(IoError::new(ErrorKind::Interrupted, "reject child").into())
+            });
+            assert_eq!(
+                rejected.unwrap_err().downcast::<IoError>().unwrap().kind(),
+                ErrorKind::Interrupted
+            );
+            assert_eq!(txn.get(b"a\x01")?, None);
+            txn.savepoint(|child| child.put(b"a\x02", b"kept sibling"))?;
+            assert_eq!(
+                txn.scan(b"a", b"c", 2)?,
+                [record(b"a\0", b"prefix"), record(b"a\x02", b"kept sibling")]
+            );
+            assert_eq!(txn.scan(b"b", b"c", 2)?, [record(b"b", b"new")]);
+
+            let foreground = store.snapshot()?;
+            assert_eq!(foreground.get(b"b")?, Some(b"old".to_vec()));
+            assert_eq!(foreground.get(b"a\x02")?, None);
+            Ok(())
+        })?;
+        assert_eq!(pinned.get(b"a")?, Some(b"before".to_vec()));
+        assert_eq!(pinned.get(b"b")?, Some(b"old".to_vec()));
+
+        let aborted = store.write(|txn| -> Result<(), Error> {
+            txn.put(b"b", b"never published")?;
+            txn.put(b"", b"invalid key")
+        });
+        assert!(matches!(aborted, Err(Error::InvalidKey)));
+        let fresh = store.snapshot()?;
+        assert_eq!(fresh.get(b"a")?, None);
+        assert_eq!(fresh.get(b"b")?, Some(b"new".to_vec()));
+        assert_eq!(fresh.get(b"a\x02")?, Some(b"kept sibling".to_vec()));
+        assert_eq!(fresh.get(b"c")?, Some(b"exclusive end".to_vec()));
+        for (start, end, limit) in [
+            (b"a".as_slice(), b"c".as_slice(), 0),
+            (b"c".as_slice(), b"a".as_slice(), 2),
+            (b"a".as_slice(), b"a".as_slice(), 2),
+            (b"a".as_slice(), b"c".as_slice(), usize::MAX),
+        ] {
+            assert!(matches!(
+                fresh.scan(start, end, limit),
+                Err(Error::InvalidPage)
+            ));
+        }
+        let body = vec![0x42; 9 * 1024 * 1024];
+        assert!(matches!(
+            store.write(|txn| {
+                txn.put(b"z1", &body)?;
+                txn.put(b"z2", &body)
+            }),
+            Err(Error::BudgetExceeded)
+        ));
+        assert_eq!(store.snapshot()?.get(b"z1")?, None);
+        store.write(|txn| txn.put(b"z1", &body))?;
+        store.write(|txn| txn.put(b"z2", &body))?;
+        let large = store.snapshot()?;
+        assert_eq!(large.scan(b"z1", b"z3", 1)?[0].1, body);
+        assert!(matches!(
+            large.scan(b"z1", b"z3", 2),
+            Err(Error::BudgetExceeded)
+        ));
+
+        drop((pinned, fresh, large, store));
+        let reopened = Database::open(engine, &path)?;
+        assert_eq!(
+            reopened.snapshot()?.scan(b"a", b"c", 3)?,
+            [
+                record(b"a\0", b"prefix"),
+                record(b"a\x02", b"kept sibling"),
+                record(b"b", b"new"),
+            ]
+        );
+        let file = workspace.path().join("not-a-directory");
+        std::fs::write(&file, b"leave intact")?;
+        assert!(matches!(
+            Database::open(engine, &file.join("state")),
+            Err(Error::Precommit(_))
+        ));
+        assert_eq!(std::fs::read(&file)?, b"leave intact");
+    }
+    Ok(())
+}
+
 const HISTORY_VALUE: [u8; 1_024] = [0x35; 1_024];
 
 fn seed_history<S: Store>(store: &S) {

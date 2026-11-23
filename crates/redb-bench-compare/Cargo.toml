@@ -9,8 +9,15 @@ homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-# Benchmarks comparing redb against other storage engines. These engines are dev-dependencies of
-# this crate alone, so building redb-bench's benchmarks never compiles them.
+[features]
+ordered-transactions = ["dep:fjall_contract", "dep:redb_direct"]
+
+[dependencies]
+fjall_contract = { package = "fjall", git = "https://github.com/fjall-rs/fjall", rev = "87006048139bfe1b072bbc29a5a92bf1f97628e3", optional = true }
+redb_direct = { package = "redb", git = "https://github.com/cberner/redb", rev = "2fc790d14fb62f39137b13f7943df433bec082c2", optional = true }
+
+# Keep the existing ordered comparison runnable without features. The other benchmark engines
+# remain dev-dependencies, so downstream users of the contract do not build them.
 [dev-dependencies]
 redb-bench = { path = "../redb-bench" }
 redb = { path = "../..", features = ["experimental-api-5"] }

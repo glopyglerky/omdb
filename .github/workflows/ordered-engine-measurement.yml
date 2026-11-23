@@ -39,6 +39,13 @@ jobs:
             df -T "$RUNNER_TEMP"
             uptime
           } > "$evidence/host.txt"
+          if [[ "$GITHUB_REF_NAME" == measure/ordered-engine-contract-* ]]; then
+            cargo test --release --locked -p redb-bench-compare \
+              --features ordered-transactions --test ordered_transactions \
+              -- --test-threads=1 2>&1 | tee "$evidence/contract.log"
+            grep -F 'comparable_transactions ... ok' "$evidence/contract.log"
+            exit 0
+          fi
           cargo test --release --locked -p redb-bench-compare --test ordered_transactions \
             -- --test-threads=1
           cargo test --release --locked -p redb-bench-compare --test ordered_transactions \
