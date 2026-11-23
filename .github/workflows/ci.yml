@@ -193,6 +193,10 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --all --all-targets -- -Dwarnings
 
+      - name: Compare ordered transaction semantics
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p redb-bench-compare --test ordered_transactions
+
       - name: Run 32-bit locking tests
         if: matrix.os == 'ubuntu-latest'
         run: |
