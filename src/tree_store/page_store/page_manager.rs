@@ -1,4 +1,6 @@
 use crate::CacheStats;
+#[cfg(feature = "checked_open_diagnostics")]
+use crate::checked_open_diagnostics::Recorder;
 use crate::db::{
     BACKEND_LOCK_RANGE, CONSISTENT_BYTE, ConcurrencyMode, FULL_RANGE, LEGACY_READER_BYTE,
     PROTOCOL_GENERATION_BYTE, PROTOCOL_GENERATION_BYTES, SHARED_READER_BYTE, SHARED_WRITER_BYTE,
@@ -1277,6 +1279,11 @@ impl TransactionalMemory {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(feature = "checked_open_diagnostics")]
+    pub(crate) fn checked_open_reads(&self) -> &Recorder {
+        self.storage.checked_open_reads()
     }
 
     pub(crate) fn cache_stats(&self) -> CacheStats {

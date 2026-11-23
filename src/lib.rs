@@ -110,6 +110,8 @@ pub use types::{Key, MutInPlaceValue, TypeName, Value};
 pub type Result<T = (), E = StorageError> = core::result::Result<T, E>;
 
 pub mod backends;
+#[cfg(feature = "checked_open_diagnostics")]
+mod checked_open_diagnostics;
 mod complex_types;
 mod db;
 mod error;

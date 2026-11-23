@@ -1360,6 +1360,41 @@ mod test {
         );
     }
 
+    #[test]
+    fn checked_open_verifies_selected_roots_and_refuses_torn_backup() {
+        let tmpfile = crate::create_tempfile();
+        let path = tmpfile.path();
+        create_database_with_one_table(path);
+        let mut builder = Database::builder();
+        builder.set_check_integrity_on_open(true);
+        let verify_value = |db: &Database| {
+            let txn = db.begin_read().unwrap();
+            let table = txn.open_table(X).unwrap();
+            assert_eq!(table.get("k").unwrap().unwrap().value(), "v");
+        };
+
+        let intact = std::fs::read(path).unwrap();
+        verify_value(&builder.open(path).unwrap());
+        std::fs::write(path, intact).unwrap();
+
+        overwrite_root_page_order(path, super::USER_ROOT_OFFSET, 31);
+        patch_god_byte(path, |god_byte| {
+            *god_byte |= RECOVERY_REQUIRED;
+            *god_byte &= !TWO_PHASE_COMMIT;
+        });
+        let mut alternate_case = std::fs::read(path).unwrap();
+        verify_value(&builder.open(path).unwrap());
+
+        let secondary = TRANSACTION_0_OFFSET + TRANSACTION_1_OFFSET
+            - primary_slot_offset(alternate_case[GOD_BYTE_OFFSET]);
+        alternate_case[secondary + super::SLOT_CHECKSUM_OFFSET] ^= 1;
+        std::fs::write(path, alternate_case).unwrap();
+        assert!(matches!(
+            builder.open(path),
+            Err(DatabaseError::Storage(StorageError::Corrupted(_)))
+        ));
+    }
+
     // The read-only open walks the system tree to load the allocator state
     #[test]
     fn oversized_system_root_page_order_is_reported_as_corruption_read_only() {

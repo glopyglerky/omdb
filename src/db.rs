@@ -1,4 +1,6 @@
 use crate::BackendError;
+#[cfg(feature = "checked_open_diagnostics")]
+use crate::checked_open_diagnostics::Phase;
 use crate::transaction_tracker::{SavepointId, TransactionId, TransactionTracker};
 use crate::transactions::AllocatorStateLatch;
 use crate::tree_store::ReadOnlyBackend;
@@ -1547,6 +1549,8 @@ impl Database {
         mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
     ) -> Result<[Option<BtreeHeader>; 2], DatabaseError> {
+        #[cfg(feature = "checked_open_diagnostics")]
+        mem.checked_open_reads().enter(Phase::VerifyCurrentRoots);
         if !Self::primary_verifies(mem)? {
             if mem.used_two_phase_commit() {
                 return Err(DatabaseError::Storage(StorageError::Corrupted(
@@ -1566,6 +1570,10 @@ impl Database {
             // have poisoned it with pages that just got rolled back by repair_primary_corrupted(), since
             // that rolls back a partially committed transaction.
             mem.clear_read_cache();
+            #[cfg(feature = "checked_open_diagnostics")]
+            if fell_back {
+                mem.checked_open_reads().enter(Phase::VerifyAlternateRoots);
+            }
             if !fell_back || !Self::primary_verifies(mem)? {
                 return Err(DatabaseError::Storage(StorageError::Corrupted(
                     "Failed to repair database. All roots are corrupted".to_string(),
@@ -1581,6 +1589,8 @@ impl Database {
 
         let [data_root, system_root] = Self::rebuild_allocator_state(mem, repair_callback)?;
 
+        #[cfg(feature = "checked_open_diagnostics")]
+        mem.checked_open_reads().enter(Phase::RepairCommit);
         mem.clear_recovery_required()?;
 
         // We need to invalidate the userspace cache, because we're about to implicitly free the freed table
@@ -1604,6 +1614,8 @@ impl Database {
         mem: &Arc<TransactionalMemory>,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
     ) -> Result<[Option<BtreeHeader>; 2], DatabaseError> {
+        #[cfg(feature = "checked_open_diagnostics")]
+        mem.checked_open_reads().enter(Phase::RebuildDataAllocator);
         mem.reset_allocator_state()?;
 
         let data_root = {
@@ -1626,6 +1638,9 @@ impl Database {
             return Err(DatabaseError::RepairAborted);
         }
 
+        #[cfg(feature = "checked_open_diagnostics")]
+        mem.checked_open_reads()
+            .enter(Phase::RebuildSystemAllocator);
         let system_root = {
             let root = mem.get_system_root();
             let untracked = Arc::new(TransactionGuard::untracked());
@@ -1639,6 +1654,8 @@ impl Database {
             Self::with_recounted_length(root, system_tables.count_tables()?)
         };
 
+        #[cfg(feature = "checked_open_diagnostics")]
+        mem.checked_open_reads().enter(Phase::MarkPinnedPages);
         Self::visit_freed_tree(system_root, DATA_FREED_TABLE, mem.clone(), |page| {
             mem.mark_page_allocated(page)
         })?;
@@ -1715,6 +1732,9 @@ impl Database {
         debug!("Opening database {:?}", &file_path);
         // The open runs under this lock, which the multi-writer open took for the header read
         // below and the repair after it, and which the transactions it runs are lent
+        // Declared before the writer lock so reporting happens after the lock is released.
+        #[cfg(feature = "checked_open_diagnostics")]
+        let checked_open_report = core::cell::OnceCell::new();
         let (mem, writer_lock) = TransactionalMemory::new(
             file,
             allow_initialize,
@@ -1725,6 +1745,10 @@ impl Database {
             concurrency_mode,
         )?;
         let mut mem = Arc::new(mem);
+        #[cfg(feature = "checked_open_diagnostics")]
+        if check_integrity_on_open && let Some(report) = mem.checked_open_reads().start() {
+            let _ = checked_open_report.set(report);
+        }
         // If the last transaction used 2-phase commit and updated the allocator state table, then
         // we can just load the allocator state from there. Otherwise, unless nothing has been
         // committed, we need a full repair. An integrity check on open skips the recorded state,
@@ -1784,11 +1808,15 @@ impl Database {
 
         let transaction_tracker = Arc::new(TransactionTracker::new(next_transaction_id));
 
+        #[cfg(feature = "checked_open_diagnostics")]
+        mem.checked_open_reads().enter(Phase::RestoreSavepoints);
         // Restore the tracker state for any persistent savepoints
         Self::sync_persistent_savepoints(&transaction_tracker, &mem, writer_lock.as_ref())?;
         // In multi-writer mode a repair ends with a commit recording the allocator state, as
         // compaction and the integrity check do, so that the next open, in any process, loads it
         if repaired && concurrency_mode.is_multi_writer() {
+            #[cfg(feature = "checked_open_diagnostics")]
+            mem.checked_open_reads().enter(Phase::RecordAllocator);
             ensure_allocator_state_table_and_trim(
                 &transaction_tracker,
                 &mem,

@@ -72,6 +72,8 @@ std = []
 logging = ["dep:log"]
 # Enable cache hit metrics
 cache_metrics = []
+# Report per-phase backend read totals for checked writable opens when explicitly enabled.
+checked_open_diagnostics = ["std"]
 # Unstable additions and changes to the public API, planned for redb 5. May change incompatibly, or
 # be removed, in any release
 experimental-api-5 = []

@@ -1,3 +1,5 @@
+#[cfg(feature = "checked_open_diagnostics")]
+use crate::checked_open_diagnostics::Recorder;
 use crate::db::StorageBackend;
 use crate::sync::{Mutex, MutexGuard, RwLock};
 use crate::transaction_tracker::TransactionId;
@@ -126,6 +128,8 @@ struct CheckedBackend {
     file: Box<dyn StorageBackend>,
     io_failed: AtomicBool,
     closed: AtomicBool,
+    #[cfg(feature = "checked_open_diagnostics")]
+    checked_open_reads: Recorder,
 }
 
 // Covers the open paths that fail before there is a Database to drop. Drop cannot report the
@@ -144,6 +148,8 @@ impl CheckedBackend {
             file,
             io_failed: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            #[cfg(feature = "checked_open_diagnostics")]
+            checked_open_reads: Recorder::default(),
         }
     }
 
@@ -224,6 +230,9 @@ impl CheckedBackend {
     fn read(&self, offset: u64, out: &mut [u8]) -> Result<()> {
         self.check_failure()?;
         let result = self.file.read(offset, out);
+        #[cfg(feature = "checked_open_diagnostics")]
+        self.checked_open_reads
+            .backend_read(out.len(), result.is_ok());
         if result.is_err() {
             self.io_failed.store(true, Ordering::Release);
         }
@@ -370,6 +379,11 @@ impl PagedCachedFile {
             read_cache,
             write_buffer,
         }
+    }
+
+    #[cfg(feature = "checked_open_diagnostics")]
+    pub(crate) fn checked_open_reads(&self) -> &Recorder {
+        &self.file.checked_open_reads
     }
 
     pub(crate) fn try_lock_range(&self, range: impl RangeBounds<u64>) -> Result<bool> {

@@ -1,0 +1,55 @@
+name: Checked open phase diagnostic
+
+on:
+  push:
+    branches: ["measure/t3-checked-open-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  checked-open:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      REDB_CHECKED_OPEN_DIAGNOSTICS: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify checked open, alternate-root recovery and torn-slot refusal
+        shell: bash
+        run: |
+          set -euo pipefail
+          export CARGO_HOME="$RUNNER_TEMP/checked-open-cargo"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/checked-open-target"
+          evidence="$RUNNER_TEMP/checked-open-evidence"
+          mkdir "$evidence"
+          trap 'rm -rf -- "$CARGO_TARGET_DIR" "$CARGO_HOME"' EXIT
+          git show -s --format='%H %T' > "$evidence/source.txt"
+          rustup toolchain install 1.90.0 --profile minimal
+          rustc +1.90.0 --version --verbose > "$evidence/compiler.txt"
+          cargo +1.90.0 generate-lockfile
+          sha256sum Cargo.lock > "$evidence/lock.sha256"
+          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics --lib \
+            checked_open_verifies_selected_roots_and_refuses_torn_backup -- --nocapture --test-threads=1 \
+            2>&1 | tee "$evidence/checked-open.log"
+          test "$(grep -c 'phase=VerifyCurrentRoots ' "$evidence/checked-open.log")" -eq 3
+          test "$(grep -c 'phase=VerifyAlternateRoots ' "$evidence/checked-open.log")" -eq 1
+          test "$(grep -c 'phase=RebuildDataAllocator ' "$evidence/checked-open.log")" -eq 2
+          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics --lib \
+            repair_falls_back_to_secondary_on_invalid_primary_root
+          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics --lib \
+            repair_does_not_fall_back_to_a_torn_secondary
+          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics \
+            --test integration_tests check_integrity_with_persistent_savepoint_then_restore
+      - name: Retain diagnostic metadata
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: checked-open-diagnostic-evidence
+          path: ${{ runner.temp }}/checked-open-evidence/
+          if-no-files-found: error
+          retention-days: 14
