@@ -61,7 +61,8 @@ jobs:
             done
             verify_case "$features" --lib checked_open_page_list_keeps_duplicates_and_discards_on_cap \
               "$evidence/candidate-cap.log"
-            cargo +1.90.0 check --locked -p redb@4.5.0 --no-default-features \
+            rustup target add --toolchain 1.90.0 thumbv7em-none-eabihf
+            cargo +1.90.0 check --locked -p redb@4.5.0 --target thumbv7em-none-eabihf --no-default-features \
               --features experimental-api-5,checked_open_reuse_verified_pages
 
             phase_count() {
