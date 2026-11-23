@@ -44,6 +44,28 @@ jobs:
           done
           exit "$failed"
 
+  ordered-transactions:
+    runs-on: ${{ ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_RUNNER_ROUTES || '{}')['ubuntu-latest'] || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: --deny warnings
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/upstream/ruvector/
+          sparse-checkout-cone-mode: false
+      - name: Compare ordered transaction semantics
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/ordered-transactions"
+          rustc --version
+          cargo generate-lockfile
+          sha256sum Cargo.lock
+          cargo test --locked -p redb-bench-compare --test ordered_transactions
+
   ci:
     strategy:
       matrix:

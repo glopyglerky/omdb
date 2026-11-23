@@ -19,6 +19,8 @@ tempfile = "3.5.0"
 heed = { version = "0.22", default-features = false }
 rocksdb = { version = "0.24.0", default-features = false, features = ["lz4", "bindgen-runtime"] }
 fjall = "=3.1.6"
+fjall_contract = { package = "fjall", git = "https://github.com/fjall-rs/fjall", rev = "87006048139bfe1b072bbc29a5a92bf1f97628e3" }
+redb_direct = { package = "redb", git = "https://github.com/cberner/redb", rev = "2fc790d14fb62f39137b13f7943df433bec082c2" }
 rusqlite = { version = "0.41.0", features = ["bundled"] }
 ctrlc = "3.2.3"
 env_logger = "0.11"
