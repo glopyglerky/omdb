@@ -44,6 +44,24 @@ jobs:
           done
           exit "$failed"
 
+  ordered-transactions:
+    runs-on: ${{ ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.CI_RUNNER_ROUTES || '{}')['ubuntu-latest'] || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: --deny warnings
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ runner.temp }}/ordered-transactions
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Compare ordered transaction semantics
+        run: |
+          rustc --version
+          cargo generate-lockfile
+          sha256sum Cargo.lock
+          cargo test --locked -p redb-bench-compare --test ordered_transactions
+
   ci:
     strategy:
       matrix:
@@ -192,10 +210,6 @@ jobs:
 
       - name: Clippy (default features)
         run: cargo clippy --all --all-targets -- -Dwarnings
-
-      - name: Compare ordered transaction semantics
-        if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p redb-bench-compare --test ordered_transactions
 
       - name: Run 32-bit locking tests
         if: matrix.os == 'ubuntu-latest'
