@@ -33,17 +33,17 @@ jobs:
           rustc +1.90.0 --version --verbose > "$evidence/compiler.txt"
           cargo +1.90.0 generate-lockfile
           sha256sum Cargo.lock > "$evidence/lock.sha256"
-          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics --lib \
+          cargo +1.90.0 test --locked -p redb@4.5.0 --features checked_open_diagnostics --lib \
             checked_open_verifies_selected_roots_and_refuses_torn_backup -- --nocapture --test-threads=1 \
             2>&1 | tee "$evidence/checked-open.log"
           test "$(grep -c 'phase=VerifyCurrentRoots ' "$evidence/checked-open.log")" -eq 3
           test "$(grep -c 'phase=VerifyAlternateRoots ' "$evidence/checked-open.log")" -eq 1
           test "$(grep -c 'phase=RebuildDataAllocator ' "$evidence/checked-open.log")" -eq 2
-          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics --lib \
+          cargo +1.90.0 test --locked -p redb@4.5.0 --features checked_open_diagnostics --lib \
             repair_falls_back_to_secondary_on_invalid_primary_root
-          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics --lib \
+          cargo +1.90.0 test --locked -p redb@4.5.0 --features checked_open_diagnostics --lib \
             repair_does_not_fall_back_to_a_torn_secondary
-          cargo +1.90.0 test --locked -p redb --features checked_open_diagnostics \
+          cargo +1.90.0 test --locked -p redb@4.5.0 --features checked_open_diagnostics \
             --test integration_tests check_integrity_with_persistent_savepoint_then_restore
       - name: Retain diagnostic metadata
         if: always()
