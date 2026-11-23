@@ -1,7 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use fjall_contract::Readable;
-use rusqlite::{Connection, TransactionBehavior, params};
+use rusqlite::{params, Connection, TransactionBehavior};
 
 type Row<'a> = (&'a [u8], &'a [u8]);
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -185,11 +187,14 @@ impl Snapshot for FjallRead {
     }
 }
 
-struct Sqlite(PathBuf);
+struct Sqlite {
+    path: PathBuf,
+    writer: Mutex<Connection>,
+}
 
 impl Sqlite {
-    fn connect(&self) -> Connection {
-        let conn = Connection::open(&self.0).unwrap();
+    fn connect(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
         conn.execute_batch("PRAGMA synchronous=FULL;").unwrap();
         conn
     }
@@ -199,34 +204,37 @@ impl Store for Sqlite {
     type Reader = Connection;
 
     fn open(path: &Path) -> Self {
-        let store = Self(path.to_owned());
-        store
-            .connect()
+        let writer = Self::connect(path);
+        writer
             .execute_batch(
                 "PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS ordered
              (key BLOB PRIMARY KEY, value BLOB NOT NULL) WITHOUT ROWID;",
             )
             .unwrap();
-        store
+        Self {
+            path: path.to_owned(),
+            writer: Mutex::new(writer),
+        }
     }
 
     fn read(&self) -> Self::Reader {
-        let conn = self.connect();
+        let conn = Self::connect(&self.path);
         conn.execute_batch("BEGIN DEFERRED;").unwrap();
         conn
     }
 
     fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce()) {
-        let mut conn = self.connect();
+        let mut conn = self.writer.lock().unwrap();
         let txn = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
-        for &(key, value) in rows {
-            txn.execute(
-                "INSERT OR REPLACE INTO ordered VALUES (?, ?)",
-                params![key, value],
-            )
-            .unwrap();
+        {
+            let mut upsert = txn
+                .prepare_cached("INSERT OR REPLACE INTO ordered VALUES (?, ?)")
+                .unwrap();
+            for &(key, value) in rows {
+                upsert.execute(params![key, value]).unwrap();
+            }
         }
         staged();
         if commit {
@@ -238,7 +246,9 @@ impl Store for Sqlite {
 impl Snapshot for Connection {
     fn range(&self, start: &[u8], end: &[u8]) -> Rows {
         let mut stmt = self
-            .prepare("SELECT key, value FROM ordered WHERE key >= ? AND key < ? ORDER BY key")
+            .prepare_cached(
+                "SELECT key, value FROM ordered WHERE key >= ? AND key < ? ORDER BY key",
+            )
             .unwrap();
         stmt.query_map(params![start, end], |row| Ok((row.get(0)?, row.get(1)?)))
             .unwrap()
@@ -267,6 +277,21 @@ fn sqlite_wal_full_ordered_snapshot_and_root_commit() {
     exercise::<Sqlite>();
 }
 
+const HISTORY_VALUE: [u8; 1_024] = [0x35; 1_024];
+
+fn seed_history<S: Store>(store: &S) {
+    for start in (0..8_192u32).step_by(256) {
+        let keys = (start..start + 256)
+            .map(|id| format!("history:{id:06}"))
+            .collect::<Vec<_>>();
+        let rows = keys
+            .iter()
+            .map(|key| (key.as_bytes(), HISTORY_VALUE.as_slice()))
+            .collect::<Vec<_>>();
+        store.write(&rows, true);
+    }
+}
+
 fn exercise_aged_readers<S: Store + Sync>() {
     use std::sync::mpsc;
     use std::time::Duration;
@@ -274,17 +299,7 @@ fn exercise_aged_readers<S: Store + Sync>() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("state");
     let store = S::open(&path);
-    let cold_value = [0x35; 1_024];
-    for start in (0..8_192u32).step_by(256) {
-        let keys = (start..start + 256)
-            .map(|id| format!("history:{id:06}"))
-            .collect::<Vec<_>>();
-        let rows = keys
-            .iter()
-            .map(|key| (key.as_bytes(), cold_value.as_slice()))
-            .collect::<Vec<_>>();
-        store.write(&rows, true);
-    }
+    seed_history(&store);
     let keys = [
         b"turn:event".as_slice(),
         b"turn:index",
@@ -338,7 +353,7 @@ fn exercise_aged_readers<S: Store + Sync>() {
             let history = before.range(b"history:004096", b"history:004128");
             assert_eq!(history.len(), 32);
             assert_eq!(history[0].0, b"history:004096");
-            assert!(history.iter().all(|(_, value)| value == &cold_value));
+            assert!(history.iter().all(|(_, value)| value == &HISTORY_VALUE));
             finish.send(()).unwrap();
             writer.join().unwrap();
             assert_revision(&before, revision - 1);
@@ -359,9 +374,86 @@ fn aged_stores_keep_foreground_reads_coherent_across_staged_writes() {
     exercise_aged_readers::<Sqlite>();
 }
 
+fn sample_ordered_commits<S: Store>(round: usize, engine: &str) {
+    const COMMITS: u32 = 128;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state");
+    let store = S::open(&path);
+    seed_history(&store);
+    let pinned = store.read();
+    let window = |reader: &S::Reader| reader.range(b"history:004096", b"history:004128");
+    let expected_window = (4_096..4_128)
+        .map(|index| {
+            (
+                format!("history:{index:06}").into_bytes(),
+                HISTORY_VALUE.to_vec(),
+            )
+        })
+        .collect::<Rows>();
+    assert_eq!(window(&pinned), expected_window);
+
+    let mut samples = Vec::new();
+    let mut expected = Vec::new();
+    for sequence in 1..=COMMITS {
+        let key = format!("turn:event:{sequence:06}");
+        let index = format!("turn:index:{sequence:06}");
+        let receipt = format!("turn:receipt:{sequence:06}");
+        let effect = format!("turn:outbox:{sequence:06}");
+        let revision = sequence.to_be_bytes();
+        let mut payload = HISTORY_VALUE;
+        payload[..revision.len()].copy_from_slice(&revision);
+        let rows: &[Row<'_>] = &[
+            (key.as_bytes(), &payload),
+            (index.as_bytes(), &revision),
+            (receipt.as_bytes(), b"accepted"),
+            (effect.as_bytes(), b"pending"),
+            (b"turn:projection", &revision),
+        ];
+        let commit_started = Instant::now();
+        store.write(rows, true);
+        let commit_ns = commit_started.elapsed().as_nanos();
+        let read_started = Instant::now();
+        let visible = window(&pinned);
+        let window_ns = read_started.elapsed().as_nanos();
+        assert_eq!(visible, expected_window);
+        expected.extend(
+            rows[..4]
+                .iter()
+                .map(|&(key, value)| (key.to_vec(), value.to_vec())),
+        );
+        samples.push((sequence, commit_ns, window_ns));
+    }
+    assert!(pinned.range(b"turn:", b"turn;").is_empty());
+    drop(pinned);
+    drop(store);
+    let reopened = S::open(&path);
+    let snapshot = reopened.read();
+    expected.push((b"turn:projection".to_vec(), COMMITS.to_be_bytes().to_vec()));
+    expected.sort();
+    assert_eq!(snapshot.range(b"turn:", b"turn;"), expected);
+    for (sequence, commit_ns, window_ns) in samples {
+        println!("ordered-sample\t{round}\t{engine}\t{sequence}\t{commit_ns}\t{window_ns}");
+    }
+}
+
+#[test]
+#[ignore = "Run the release measurement on a dedicated runner"]
+fn sample_strict_durable_ordered_commits() {
+    for round in 0..8 {
+        for position in 0..4 {
+            match (round + position) % 4 {
+                0 => sample_ordered_commits::<local::Database>(round, "omdb-immediate"),
+                1 => sample_ordered_commits::<direct::Database>(round, "redb-immediate"),
+                2 => sample_ordered_commits::<Fjall>(round, "fjall-sync-all"),
+                _ => sample_ordered_commits::<Sqlite>(round, "sqlite-wal-full"),
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 mod process_recovery {
-    use super::{Fjall, Path, Row, Rows, Snapshot, Sqlite, Store, direct, local};
+    use super::{direct, local, Fjall, Path, Row, Rows, Snapshot, Sqlite, Store};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;

@@ -1,0 +1,59 @@
+name: Durable ordered engine measurement
+
+on:
+  push:
+    branches: ["measure/ordered-engine-*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ordered-engine-measurement:
+    runs-on: ${{ fromJSON(vars.CI_RUNNER_ROUTES || '{}')['ubuntu-latest'] || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    env:
+      RUSTFLAGS: --deny warnings
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            /*
+            !/upstream/ruvector/
+          sparse-checkout-cone-mode: false
+      - name: Verify ordered semantics and sample equivalent durable work
+        shell: bash
+        run: |
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/ordered-engine-build"
+          evidence="$RUNNER_TEMP/ordered-engine-evidence"
+          mkdir "$evidence"
+          cargo generate-lockfile
+          sha256sum Cargo.lock > "$evidence/lock.sha256"
+          git show -s --format='%H %T' > "$evidence/source.txt"
+          rustc --version --verbose > "$evidence/compiler.txt"
+          {
+            uname -a
+            lscpu
+            df -T "$RUNNER_TEMP"
+            uptime
+          } > "$evidence/host.txt"
+          cargo test --release --locked -p redb-bench-compare --test ordered_transactions \
+            -- --test-threads=1
+          cargo test --release --locked -p redb-bench-compare --test ordered_transactions \
+            sample_strict_durable_ordered_commits -- --ignored --nocapture --test-threads=1 \
+            | tee "$evidence/workload.log"
+          printf 'round\tengine\tsequence\tcommit_ns\tsnapshot_window_ns\n' > "$evidence/samples.tsv"
+          awk 'match($0, /ordered-sample\t/) { print substr($0, RSTART + RLENGTH) }' \
+            "$evidence/workload.log" >> "$evidence/samples.tsv"
+          test "$(wc -l < "$evidence/samples.tsv")" -eq 4097
+          uptime >> "$evidence/host.txt"
+      - name: Retain exact inputs and observations
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ordered-engine-evidence
+          path: ${{ runner.temp }}/ordered-engine-evidence/
+          if-no-files-found: warn
+          retention-days: 14
