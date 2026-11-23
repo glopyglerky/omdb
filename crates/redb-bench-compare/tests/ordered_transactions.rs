@@ -267,6 +267,98 @@ fn sqlite_wal_full_ordered_snapshot_and_root_commit() {
     exercise::<Sqlite>();
 }
 
+fn exercise_aged_readers<S: Store + Sync>() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state");
+    let store = S::open(&path);
+    let cold_value = [0x35; 1_024];
+    for start in (0..8_192u32).step_by(256) {
+        let keys = (start..start + 256)
+            .map(|id| format!("history:{id:06}"))
+            .collect::<Vec<_>>();
+        let rows = keys
+            .iter()
+            .map(|key| (key.as_bytes(), cold_value.as_slice()))
+            .collect::<Vec<_>>();
+        store.write(&rows, true);
+    }
+    let keys = [
+        b"turn:event".as_slice(),
+        b"turn:index",
+        b"turn:outbox",
+        b"turn:projection",
+        b"turn:receipt",
+    ];
+    let write_rows = |revision: u32| {
+        keys.iter()
+            .map(|&key| (key, revision.to_be_bytes()))
+            .collect::<Vec<_>>()
+    };
+    let assert_revision = |reader: &S::Reader, revision: u32| {
+        let actual = reader.range(b"turn:", b"turn;");
+        assert_eq!(actual.len(), keys.len());
+        for ((key, value), expected_key) in actual.iter().zip(keys) {
+            assert_eq!(key, expected_key);
+            assert_eq!(value, &revision.to_be_bytes());
+        }
+    };
+    let insert = |revision| {
+        let owned = write_rows(revision);
+        let rows = owned
+            .iter()
+            .map(|(key, value)| (*key, value.as_slice()))
+            .collect::<Vec<_>>();
+        store.write(&rows, true);
+    };
+    insert(0);
+    let original = store.read();
+    assert_revision(&original, 0);
+
+    for revision in 1..=16 {
+        std::thread::scope(|scope| {
+            let (ready, staged) = mpsc::channel();
+            let (finish, released) = mpsc::channel();
+            let writer = scope.spawn(|| {
+                let owned = write_rows(revision);
+                let rows = owned
+                    .iter()
+                    .map(|(key, value)| (*key, value.as_slice()))
+                    .collect::<Vec<_>>();
+                store.write_before_commit(&rows, true, move || {
+                    ready.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                });
+            });
+            staged.recv_timeout(Duration::from_secs(10)).unwrap();
+            let before = store.read();
+            assert_revision(&before, revision - 1);
+            let history = before.range(b"history:004096", b"history:004128");
+            assert_eq!(history.len(), 32);
+            assert_eq!(history[0].0, b"history:004096");
+            assert!(history.iter().all(|(_, value)| value == &cold_value));
+            finish.send(()).unwrap();
+            writer.join().unwrap();
+            assert_revision(&before, revision - 1);
+            assert_revision(&store.read(), revision);
+        });
+    }
+    assert_revision(&original, 0);
+    drop(original);
+    drop(store);
+    assert_revision(&S::open(&path).read(), 16);
+}
+
+#[test]
+fn aged_stores_keep_foreground_reads_coherent_across_staged_writes() {
+    exercise_aged_readers::<local::Database>();
+    exercise_aged_readers::<direct::Database>();
+    exercise_aged_readers::<Fjall>();
+    exercise_aged_readers::<Sqlite>();
+}
+
 #[cfg(unix)]
 mod process_recovery {
     use super::{Fjall, Path, Row, Rows, Snapshot, Sqlite, Store, direct, local};
