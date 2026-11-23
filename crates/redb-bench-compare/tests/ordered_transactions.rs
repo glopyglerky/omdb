@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use fjall_contract::Readable;
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{Connection, TransactionBehavior, params};
 
 type Row<'a> = (&'a [u8], &'a [u8]);
 type Rows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -17,7 +17,17 @@ trait Store: Sized {
 
     fn open(path: &Path) -> Self;
     fn read(&self) -> Self::Reader;
-    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce());
+    fn mutate_before_commit(
+        &self,
+        rows: &[Row<'_>],
+        removed: &[&[u8]],
+        commit: bool,
+        staged: impl FnOnce(),
+    );
+
+    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce()) {
+        self.mutate_before_commit(rows, &[], commit, staged);
+    }
 
     fn write(&self, rows: &[Row<'_>], commit: bool) {
         self.write_before_commit(rows, commit, || {});
@@ -91,9 +101,10 @@ macro_rules! redb_store {
                     self.0.begin_read().unwrap()
                 }
 
-                fn write_before_commit(
+                fn mutate_before_commit(
                     &self,
                     rows: &[Row<'_>],
+                    removed: &[&[u8]],
                     commit: bool,
                     staged: impl FnOnce(),
                 ) {
@@ -103,6 +114,9 @@ macro_rules! redb_store {
                         let mut table = txn.open_table(TABLE).unwrap();
                         for &(key, value) in rows {
                             table.insert(key, value).unwrap();
+                        }
+                        for &key in removed {
+                            table.remove(key).unwrap();
                         }
                     }
                     staged();
@@ -160,13 +174,22 @@ impl Store for Fjall {
         }
     }
 
-    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce()) {
+    fn mutate_before_commit(
+        &self,
+        rows: &[Row<'_>],
+        removed: &[&[u8]],
+        commit: bool,
+        staged: impl FnOnce(),
+    ) {
         let mut txn = self
             .db
             .write_tx()
             .durability(Some(fjall_contract::PersistMode::SyncAll));
         for &(key, value) in rows {
             txn.insert(&self.keys, key, value);
+        }
+        for &key in removed {
+            txn.remove(&self.keys, key);
         }
         staged();
         if commit {
@@ -223,7 +246,13 @@ impl Store for Sqlite {
         conn
     }
 
-    fn write_before_commit(&self, rows: &[Row<'_>], commit: bool, staged: impl FnOnce()) {
+    fn mutate_before_commit(
+        &self,
+        rows: &[Row<'_>],
+        removed: &[&[u8]],
+        commit: bool,
+        staged: impl FnOnce(),
+    ) {
         let mut conn = self.writer.lock().unwrap();
         let txn = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -234,6 +263,14 @@ impl Store for Sqlite {
                 .unwrap();
             for &(key, value) in rows {
                 upsert.execute(params![key, value]).unwrap();
+            }
+            if !removed.is_empty() {
+                let mut delete = txn
+                    .prepare_cached("DELETE FROM ordered WHERE key = ?")
+                    .unwrap();
+                for &key in removed {
+                    delete.execute(params![key]).unwrap();
+                }
             }
         }
         staged();
@@ -374,6 +411,117 @@ fn aged_stores_keep_foreground_reads_coherent_across_staged_writes() {
     exercise_aged_readers::<Sqlite>();
 }
 
+fn history_rows(start: u32, end: u32) -> Rows {
+    (start..end)
+        .map(|id| {
+            (
+                format!("history:{id:06}").into_bytes(),
+                HISTORY_VALUE.to_vec(),
+            )
+        })
+        .collect()
+}
+
+fn exercise_retention_snapshots<S: Store + Sync>() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    const ROUNDS: u32 = 8;
+    const PAGE: u32 = 32;
+    const HISTORY: u32 = 8_192;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("state");
+    let store = S::open(&path);
+    seed_history(&store);
+    let revision_rows = |revision: u32| -> Rows {
+        ["event", "index", "outbox", "projection", "receipt"]
+            .map(|name| {
+                (
+                    format!("turn:{name}").into_bytes(),
+                    revision.to_be_bytes().to_vec(),
+                )
+            })
+            .into()
+    };
+    let initial = revision_rows(0);
+    let rows = initial
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.as_slice()))
+        .collect::<Vec<_>>();
+    store.write(&rows, true);
+
+    let assert_snapshot = |reader: &S::Reader, revision: u32| {
+        assert_eq!(reader.range(b"turn:", b"turn;"), revision_rows(revision));
+        assert_eq!(
+            reader.range(b"history:000000", b"history:000256"),
+            history_rows(revision * PAGE, ROUNDS * PAGE),
+        );
+        assert_eq!(
+            reader.range(b"history:008192", b"history:008448"),
+            history_rows(HISTORY, HISTORY + revision * PAGE),
+        );
+    };
+    let original = store.read();
+    assert_snapshot(&original, 0);
+    for revision in 1..=ROUNDS {
+        let mut next = revision_rows(revision);
+        next.extend(history_rows(
+            HISTORY + (revision - 1) * PAGE,
+            HISTORY + revision * PAGE,
+        ));
+        let rows = next
+            .iter()
+            .map(|(key, value)| (key.as_slice(), value.as_slice()))
+            .collect::<Vec<_>>();
+        let removed = history_rows((revision - 1) * PAGE, revision * PAGE);
+        let removed = removed
+            .iter()
+            .map(|(key, _)| key.as_slice())
+            .collect::<Vec<_>>();
+
+        // Aborting a retention commit must preserve its old page and all root records.
+        store.mutate_before_commit(&rows, &removed, false, || {});
+        assert_snapshot(&store.read(), revision - 1);
+
+        std::thread::scope(|scope| {
+            let (ready, staged) = mpsc::channel();
+            let (finish, released) = mpsc::channel();
+            let writer = scope.spawn(|| {
+                store.mutate_before_commit(&rows, &removed, true, move || {
+                    ready.send(()).unwrap();
+                    released.recv_timeout(Duration::from_secs(10)).unwrap();
+                });
+            });
+            staged.recv_timeout(Duration::from_secs(10)).unwrap();
+            let before = store.read();
+            assert_snapshot(&before, revision - 1);
+            finish.send(()).unwrap();
+            writer.join().unwrap();
+            assert_snapshot(&before, revision - 1);
+            assert_snapshot(&store.read(), revision);
+            assert_snapshot(&original, 0);
+        });
+    }
+    drop(original);
+    drop(store);
+
+    let reopened = S::open(&path);
+    let reader = reopened.read();
+    assert_snapshot(&reader, ROUNDS);
+    assert_eq!(
+        reader.range(b"history:", b"history;"),
+        history_rows(ROUNDS * PAGE, HISTORY + ROUNDS * PAGE),
+    );
+}
+
+#[test]
+fn aged_snapshots_keep_pruned_pages_while_new_readers_advance() {
+    exercise_retention_snapshots::<local::Database>();
+    exercise_retention_snapshots::<direct::Database>();
+    exercise_retention_snapshots::<Fjall>();
+    exercise_retention_snapshots::<Sqlite>();
+}
+
 fn sample_ordered_commits<S: Store>(round: usize, engine: &str) {
     const COMMITS: u32 = 128;
     let directory = tempfile::tempdir().unwrap();
@@ -453,7 +601,7 @@ fn sample_strict_durable_ordered_commits() {
 
 #[cfg(unix)]
 mod process_recovery {
-    use super::{direct, local, Fjall, Path, Row, Rows, Snapshot, Sqlite, Store};
+    use super::{Fjall, Path, Row, Rows, Snapshot, Sqlite, Store, direct, local};
     use std::io::{self, BufRead, BufReader, Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
