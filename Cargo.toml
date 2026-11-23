@@ -74,6 +74,8 @@ logging = ["dep:log"]
 cache_metrics = []
 # Report per-phase backend read totals for checked writable opens when explicitly enabled.
 checked_open_diagnostics = ["std"]
+# Reuse checksummed normal-table pages when rebuilding the allocator on checked writable opens.
+checked_open_reuse_verified_pages = []
 # Unstable additions and changes to the public API, planned for redb 5. May change incompatibly, or
 # be removed, in any release
 experimental-api-5 = []

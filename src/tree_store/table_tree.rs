@@ -12,7 +12,7 @@ use crate::tree_store::{
     TableType, multimap_btree_stats,
 };
 use crate::types::{Key, Value};
-use crate::{DatabaseStats, Result};
+use crate::{DatabaseStats, Result, StorageError};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::string::ToString;
@@ -75,6 +75,42 @@ pub(crate) struct TableTree {
     mem: PageResolver,
 }
 
+#[derive(Default)]
+pub(crate) struct VerifiedDataPages(Option<Vec<PageNumber>>);
+
+impl VerifiedDataPages {
+    // Each buffer requests at most this many entries. Growth can hold two buffers briefly,
+    // for a peak request of 2 * MAX_PAGES * size_of::<PageNumber>() bytes. No list is cloned.
+    const MAX_PAGES: usize = 128 * 1024;
+
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self((cfg!(feature = "checked_open_reuse_verified_pages") && enabled).then_some(Vec::new()))
+    }
+
+    fn record(&mut self, page: PageNumber) {
+        if !cfg!(feature = "checked_open_reuse_verified_pages") {
+            return;
+        }
+        let Some(pages) = self.0.as_mut() else {
+            return;
+        };
+        if pages.len() == Self::MAX_PAGES
+            || (pages.len() == pages.capacity()
+                && pages
+                    .try_reserve_exact(pages.len().max(64).min(Self::MAX_PAGES - pages.len()))
+                    .is_err())
+        {
+            self.0 = None;
+            return;
+        }
+        pages.push(page);
+    }
+
+    pub(crate) fn into_pages(self) -> Option<Vec<PageNumber>> {
+        self.0
+    }
+}
+
 impl TableTree {
     pub(crate) fn new(
         master_root: Option<BtreeHeader>,
@@ -92,8 +128,8 @@ impl TableTree {
         self.tree.transaction_guard()
     }
 
-    pub(crate) fn verify_checksums(&self) -> Result<bool> {
-        if !self.tree.verify_checksum()? {
+    pub(crate) fn verify_checksums(&self, pages: &mut VerifiedDataPages) -> Result<bool> {
+        if !self.tree.verify_checksum_with(|page| pages.record(page))? {
             return Ok(false);
         }
 
@@ -115,7 +151,7 @@ impl TableTree {
                             self.mem.clone(),
                             self.tree.hint(),
                         )
-                        .verify_checksum()?
+                        .verify_checksum_with(|page| pages.record(page))?
                     {
                         return Ok(false);
                     }
@@ -126,6 +162,10 @@ impl TableTree {
                     fixed_value_size,
                     ..
                 } => {
+                    // Verification walks the outer tree before its subtrees. Allocation
+                    // walks each subtree at its parent leaf, so retain that walk and its
+                    // allocation error order for catalogs containing a multimap.
+                    pages.0 = None;
                     if !verify_tree_and_subtree_checksums(
                         table_root,
                         fixed_key_size,
@@ -139,6 +179,22 @@ impl TableTree {
             }
         }
 
+        Ok(true)
+    }
+
+    // The allocator walk resolves a listed name by lookup. Even a checksummed catalog can
+    // contain separators that route a lookup away from the definition seen by the range.
+    pub(crate) fn catalog_matches_lookups(&self) -> Result<bool> {
+        for entry in self.tree.range::<RangeFull, &str>(&(..))? {
+            let entry = entry?;
+            match self.get_table_untyped(entry.key(), TableType::Normal) {
+                Ok(Some(definition)) if definition == entry.value() => {}
+                Err(TableError::Storage(err)) if !matches!(err, StorageError::Corrupted(_)) => {
+                    return Err(err);
+                }
+                _ => return Ok(false),
+            }
+        }
         Ok(true)
     }
 
@@ -837,5 +893,25 @@ mod test {
         };
         let y = InternalTableDefinition::from_bytes(InternalTableDefinition::as_bytes(&x).as_ref());
         assert_eq!(x, y);
+    }
+
+    #[cfg(feature = "checked_open_reuse_verified_pages")]
+    #[test]
+    fn checked_open_page_list_keeps_duplicates_and_discards_on_cap() {
+        use super::{PageNumber, VerifiedDataPages};
+
+        let page = PageNumber::new(0, 0, 0);
+        let mut list = VerifiedDataPages::new(true);
+        list.record(page);
+        list.record(page);
+        assert_eq!(list.into_pages().unwrap(), [page, page]);
+
+        let mut list = VerifiedDataPages::new(true);
+        for _ in 0..VerifiedDataPages::MAX_PAGES {
+            list.record(page);
+        }
+        assert_eq!(list.0.as_ref().unwrap().len(), VerifiedDataPages::MAX_PAGES);
+        list.record(page);
+        assert!(list.into_pages().is_none());
     }
 }

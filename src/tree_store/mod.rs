@@ -29,5 +29,5 @@ pub(crate) use page_store::{
     TransactionalMemory, WriterLock,
 };
 pub use page_store::{InMemoryBackend, Savepoint};
-pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut};
+pub(crate) use table_tree::{PageListMut, TableTree, TableTreeMut, VerifiedDataPages};
 pub(crate) use table_tree_base::{InternalTableDefinition, TableType};

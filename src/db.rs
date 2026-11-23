@@ -7,7 +7,7 @@ use crate::tree_store::ReadOnlyBackend;
 use crate::tree_store::{
     AllocationPolicy, BtreeHeader, HeaderGuard, InternalTableDefinition, PAGE_SIZE, PageHint,
     PageNumber, PageResolver, SerializedSavepoint, ShrinkPolicy, TableTree, TableType,
-    TransactionalMemory, WriterLock,
+    TransactionalMemory, VerifiedDataPages, WriterLock,
 };
 use crate::types::{Key, Value};
 use crate::{
@@ -878,9 +878,16 @@ impl Database {
     }
 
     pub(crate) fn verify_primary_checksums(mem: Arc<TransactionalMemory>) -> Result<bool> {
+        Self::verify_primary_checksums_with_pages(mem, &mut VerifiedDataPages::default())
+    }
+
+    fn verify_primary_checksums_with_pages(
+        mem: Arc<TransactionalMemory>,
+        data_pages: &mut VerifiedDataPages,
+    ) -> Result<bool> {
         let data_root = mem.get_data_root();
         let system_root = mem.get_system_root();
-        Self::verify_checksums(mem, data_root, system_root)
+        Self::verify_checksums(mem, data_root, system_root, data_pages)
     }
 
     // Verifies the checksums reachable from the given data and system roots, and from the user
@@ -890,6 +897,7 @@ impl Database {
         mem: Arc<TransactionalMemory>,
         data_root: Option<BtreeHeader>,
         system_root: Option<BtreeHeader>,
+        data_pages: &mut VerifiedDataPages,
     ) -> Result<bool> {
         let resolver = PageResolver::new(mem.clone());
         let table_tree = TableTree::new(
@@ -898,7 +906,7 @@ impl Database {
             Arc::new(TransactionGuard::untracked()),
             resolver.clone(),
         )?;
-        if !table_tree.verify_checksums()? {
+        if !table_tree.verify_checksums(data_pages)? {
             return Ok(false);
         }
         let system_table_tree = TableTree::new(
@@ -907,7 +915,7 @@ impl Database {
             Arc::new(TransactionGuard::untracked()),
             resolver.clone(),
         )?;
-        if !system_table_tree.verify_checksums()? {
+        if !system_table_tree.verify_checksums(&mut VerifiedDataPages::default())? {
             return Ok(false);
         }
         // A persistent savepoint keeps the pages of the user tree it saved, and restoring it makes
@@ -920,7 +928,7 @@ impl Database {
                 Arc::new(TransactionGuard::untracked()),
                 resolver.clone(),
             )?;
-            if !saved_tree.verify_checksums()? {
+            if !saved_tree.verify_checksums(&mut VerifiedDataPages::default())? {
                 return Ok(false);
             }
         }
@@ -1078,7 +1086,7 @@ impl Database {
         let allocator_hash = if peer_committed {
             // The peer's snapshot is in pages this handle has not verified; verify before decoding
             // it, so that a corrupted file is reported rather than panicking
-            if Self::primary_verifies(&self.mem)? {
+            if Self::primary_verifies(&self.mem, &mut VerifiedDataPages::default())? {
                 match Self::get_allocator_state_table(&self.mem)? {
                     Some(tree) => {
                         self.mem.load_allocator_state(&tree)?;
@@ -1103,10 +1111,11 @@ impl Database {
 
         let old_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
 
-        let new_roots = Self::do_repair(&mut self.mem, &|_| {}).map_err(|err| match err {
-            DatabaseError::Storage(storage_err) => storage_err,
-            _ => unreachable!(),
-        })?;
+        let new_roots =
+            Self::do_repair(&mut self.mem, &|_| {}, false).map_err(|err| match err {
+                DatabaseError::Storage(storage_err) => storage_err,
+                _ => unreachable!(),
+            })?;
 
         if old_roots != new_roots
             || allocator_hash.is_some_and(|hash| hash != self.mem.allocator_hash())
@@ -1193,7 +1202,7 @@ impl Database {
             Ok(true) => {
                 let live_allocator_hash = self.mem.allocator_hash();
                 let live_roots = [self.mem.get_data_root(), self.mem.get_system_root()];
-                match Self::rebuild_allocator_state(&self.mem, &|_| {}) {
+                match Self::rebuild_allocator_state(&self.mem, &|_| {}, None) {
                     // Only a durable root can be rewritten from here, so a live root whose table
                     // count was recomputed must be rolled back and repaired by the reload below
                     Ok(roots) if roots != live_roots => Ok(None),
@@ -1229,6 +1238,7 @@ impl Database {
             self.mem.clone(),
             data_root,
             system_root,
+            &mut VerifiedDataPages::default(),
         )?)
     }
 
@@ -1537,8 +1547,11 @@ impl Database {
     // Whether the primary slot's trees verify. A Corrupted error counts as "they do not", so that
     // a torn slot carrying an invalid page number falls back to the secondary like any other bad
     // primary, rather than aborting the repair. Other errors (e.g. I/O) still propagate.
-    fn primary_verifies(mem: &Arc<TransactionalMemory>) -> Result<bool> {
-        match Self::verify_primary_checksums(mem.clone()) {
+    fn primary_verifies(
+        mem: &Arc<TransactionalMemory>,
+        data_pages: &mut VerifiedDataPages,
+    ) -> Result<bool> {
+        match Self::verify_primary_checksums_with_pages(mem.clone(), data_pages) {
             Ok(verified) => Ok(verified),
             Err(StorageError::Corrupted(_)) => Ok(false),
             Err(err) => Err(err),
@@ -1548,23 +1561,26 @@ impl Database {
     fn do_repair(
         mem: &mut Arc<TransactionalMemory>, // Only &mut to ensure exclusivity
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
+        checked_open: bool,
     ) -> Result<[Option<BtreeHeader>; 2], DatabaseError> {
+        let mut data_pages = VerifiedDataPages::new(checked_open);
         #[cfg(feature = "checked_open_diagnostics")]
         mem.checked_open_reads().enter(Phase::VerifyCurrentRoots);
-        if !Self::primary_verifies(mem)? {
+        if !Self::primary_verifies(mem, &mut data_pages)? {
             if mem.used_two_phase_commit() {
                 return Err(DatabaseError::Storage(StorageError::Corrupted(
                     "Primary is corrupted despite 2-phase commit".to_string(),
                 )));
             }
 
-            // 0.3 because the repair takes 3 full scans and the first is done now
+            // Primary verification finished, and trying the alternate slot is cancellable.
             let mut handle = RepairSession::new(0.3);
             repair_callback(&mut handle);
             if handle.aborted() {
                 return Err(DatabaseError::RepairAborted);
             }
 
+            data_pages = VerifiedDataPages::new(checked_open);
             let fell_back = mem.repair_primary_corrupted();
             // We need to invalidate the userspace cache, because walking the tree in verify_primary_checksums() may
             // have poisoned it with pages that just got rolled back by repair_primary_corrupted(), since
@@ -1574,20 +1590,21 @@ impl Database {
             if fell_back {
                 mem.checked_open_reads().enter(Phase::VerifyAlternateRoots);
             }
-            if !fell_back || !Self::primary_verifies(mem)? {
+            if !fell_back || !Self::primary_verifies(mem, &mut data_pages)? {
                 return Err(DatabaseError::Storage(StorageError::Corrupted(
                     "Failed to repair database. All roots are corrupted".to_string(),
                 )));
             }
         }
-        // 0.6 because the repair takes 3 full scans and the second is done now
+        // Verify the selected slot fully before using any collected pages.
         let mut handle = RepairSession::new(0.6);
         repair_callback(&mut handle);
         if handle.aborted() {
             return Err(DatabaseError::RepairAborted);
         }
 
-        let [data_root, system_root] = Self::rebuild_allocator_state(mem, repair_callback)?;
+        let [data_root, system_root] =
+            Self::rebuild_allocator_state(mem, repair_callback, data_pages.into_pages())?;
 
         #[cfg(feature = "checked_open_diagnostics")]
         mem.checked_open_reads().enter(Phase::RepairCommit);
@@ -1613,6 +1630,7 @@ impl Database {
     fn rebuild_allocator_state(
         mem: &Arc<TransactionalMemory>,
         repair_callback: &(dyn Fn(&mut RepairSession) + 'static),
+        verified_data_pages: Option<Vec<PageNumber>>,
     ) -> Result<[Option<BtreeHeader>; 2], DatabaseError> {
         #[cfg(feature = "checked_open_diagnostics")]
         mem.checked_open_reads().enter(Phase::RebuildDataAllocator);
@@ -1627,11 +1645,19 @@ impl Database {
                 untracked,
                 PageResolver::new(mem.clone()),
             )?;
-            tables.visit_all_pages(|path| mem.mark_page_allocated(path.page_number()))?;
+            if let Some(pages) = verified_data_pages
+                && tables.catalog_matches_lookups()?
+            {
+                for page in pages {
+                    mem.mark_page_allocated(page)?;
+                }
+            } else {
+                tables.visit_all_pages(|path| mem.mark_page_allocated(path.page_number()))?;
+            }
             Self::with_recounted_length(root, tables.count_tables()?)
         };
 
-        // 0.9 because the repair takes 3 full scans and the third is done now. There is just some system tables left
+        // Data allocation is rebuilt. System and pinned pages still need marking.
         let mut handle = RepairSession::new(0.9);
         repair_callback(&mut handle);
         if handle.aborted() {
@@ -1698,7 +1724,7 @@ impl Database {
             }
             // Freed-page tables retain the pages that readers and persistent savepoints still
             // reference. Rebuilding must keep those allocated as well as the current trees.
-            let roots = Self::rebuild_allocator_state(mem, &|_| {})
+            let roots = Self::rebuild_allocator_state(mem, &|_| {}, None)
                 .map_err(DatabaseError::into_storage_error_or_corrupted)?;
             if roots != [mem.get_data_root(), mem.get_system_root()] {
                 return Err(StorageError::Corrupted(
@@ -1786,7 +1812,8 @@ impl Database {
             if handle.aborted() {
                 return Err(DatabaseError::RepairAborted);
             }
-            let [data_root, system_root] = Self::do_repair(&mut mem, repair_callback)?;
+            let [data_root, system_root] =
+                Self::do_repair(&mut mem, repair_callback, check_integrity_on_open)?;
             let next_transaction_id = mem.get_last_committed_transaction_id()?.next();
             mem.commit(
                 data_root,

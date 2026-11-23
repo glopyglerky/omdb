@@ -1160,25 +1160,10 @@ mod test {
 
     // Re-checksums the slot, so the count is indistinguishable from one redb wrote itself
     fn overwrite_root_length(path: &std::path::Path, root_offset: usize, length: u64) {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        let mut header = [0u8; DB_HEADER_SIZE];
-        file.read_exact(&mut header).unwrap();
-
-        let slot = primary_slot_offset(header[GOD_BYTE_OFFSET]);
-        let offset = slot + root_offset + super::BtreeHeader::serialized_size() - size_of::<u64>();
-        header[offset..offset + size_of::<u64>()].copy_from_slice(&length.to_le_bytes());
-        let checksum = super::xxh3_checksum(&header[slot..slot + super::SLOT_CHECKSUM_OFFSET]);
-        let checksum_offset = slot + super::SLOT_CHECKSUM_OFFSET;
-        header[checksum_offset..checksum_offset + size_of::<super::Checksum>()]
-            .copy_from_slice(&checksum.to_le_bytes());
-
-        file.seek(SeekFrom::Start(0)).unwrap();
-        file.write_all(&header).unwrap();
-        file.sync_all().unwrap();
+        patch_primary_slot(path, |slot| {
+            let offset = root_offset + super::BtreeHeader::serialized_size() - size_of::<u64>();
+            slot[offset..offset + size_of::<u64>()].copy_from_slice(&length.to_le_bytes());
+        });
     }
 
     fn create_database_with_one_table(path: &std::path::Path) {
@@ -1234,6 +1219,15 @@ mod test {
 
     // Re-checksums the slot, so the page number is indistinguishable from one redb wrote itself
     fn overwrite_root_page_order(path: &std::path::Path, root_offset: usize, order: u8) {
+        patch_primary_slot(path, |slot| {
+            // The page number is the first field of the serialized BtreeHeader
+            let root = super::get_u64(&slot[root_offset..]);
+            let root = (root & !(0b1_1111 << 59)) | (u64::from(order) << 59);
+            slot[root_offset..root_offset + size_of::<u64>()].copy_from_slice(&root.to_le_bytes());
+        });
+    }
+
+    fn patch_primary_slot(path: &std::path::Path, patch: impl FnOnce(&mut [u8])) {
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1242,16 +1236,11 @@ mod test {
         let mut header = [0u8; DB_HEADER_SIZE];
         file.read_exact(&mut header).unwrap();
 
-        let slot = primary_slot_offset(header[GOD_BYTE_OFFSET]);
-        // The page number is the first field of the serialized BtreeHeader
-        let offset = slot + root_offset;
-        let root = super::get_u64(&header[offset..]);
-        let root = (root & !(0b1_1111 << 59)) | (u64::from(order) << 59);
-        header[offset..offset + size_of::<u64>()].copy_from_slice(&root.to_le_bytes());
-        let checksum = super::xxh3_checksum(&header[slot..slot + super::SLOT_CHECKSUM_OFFSET]);
-        let checksum_offset = slot + super::SLOT_CHECKSUM_OFFSET;
-        header[checksum_offset..checksum_offset + size_of::<super::Checksum>()]
-            .copy_from_slice(&checksum.to_le_bytes());
+        let offset = primary_slot_offset(header[GOD_BYTE_OFFSET]);
+        let slot = &mut header[offset..offset + super::TRANSACTION_SIZE];
+        patch(slot);
+        let checksum = super::xxh3_checksum(&slot[..super::SLOT_CHECKSUM_OFFSET]);
+        slot[super::SLOT_CHECKSUM_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
 
         file.seek(SeekFrom::Start(0)).unwrap();
         file.write_all(&header).unwrap();
@@ -1377,7 +1366,9 @@ mod test {
         verify_value(&builder.open(path).unwrap());
         std::fs::write(path, intact).unwrap();
 
-        overwrite_root_page_order(path, super::USER_ROOT_OFFSET, 31);
+        // Reject the primary only after its data tree has verified. The alternate needs
+        // its own page list even when the slots share that data tree.
+        overwrite_root_page_order(path, super::SYSTEM_ROOT_OFFSET, 31);
         patch_god_byte(path, |god_byte| {
             *god_byte |= RECOVERY_REQUIRED;
             *god_byte &= !TWO_PHASE_COMMIT;
@@ -1393,6 +1384,188 @@ mod test {
             builder.open(path),
             Err(DatabaseError::Storage(StorageError::Corrupted(_)))
         ));
+    }
+
+    #[test]
+    fn checked_open_rebuilds_normal_tables_and_recounts() {
+        use crate::{ReadableTable as _, ReadableTableMetadata as _};
+
+        const ROWS: u32 = 512;
+        const DATA: TableDefinition<u32, &[u8; 1024]> = TableDefinition::new("data");
+        const VALUE: &[u8; 1024] = &[42; 1024];
+
+        let tmpfile = crate::create_tempfile();
+        let path = tmpfile.path();
+        create_database_with_one_table(path);
+        let db = Database::open(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_table(DATA).unwrap();
+            for key in 0..ROWS {
+                table.insert(key, VALUE).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        db.close().unwrap();
+        overwrite_root_length(path, super::USER_ROOT_OFFSET, u64::MAX);
+        overwrite_root_length(path, super::SYSTEM_ROOT_OFFSET, u64::MAX);
+
+        let db = Database::builder()
+            .set_cache_size(0)
+            .set_check_integrity_on_open(true)
+            .open(path)
+            .unwrap();
+        assert_eq!(read_root_length(path, super::USER_ROOT_OFFSET), 2);
+        assert_ne!(read_root_length(path, super::SYSTEM_ROOT_OFFSET), u64::MAX);
+        let txn = db.begin_read().unwrap();
+        assert_eq!(
+            txn.open_table(X)
+                .unwrap()
+                .get("k")
+                .unwrap()
+                .unwrap()
+                .value(),
+            "v"
+        );
+        let table = txn.open_table(DATA).unwrap();
+        assert_eq!(table.len().unwrap(), u64::from(ROWS));
+        let mut entries = table.iter().unwrap();
+        for key in 0..ROWS {
+            let (actual, value) = entries.next().unwrap().unwrap();
+            assert_eq!(actual.value(), key);
+            assert_eq!(value.value(), VALUE);
+        }
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn checked_open_rebuilds_multimap_subtrees() {
+        use crate::MultimapTableDefinition;
+
+        const MAP: MultimapTableDefinition<&str, u64> = MultimapTableDefinition::new("map");
+        const VALUES: u64 = 1024;
+        let tmpfile = crate::create_tempfile();
+        let path = tmpfile.path();
+        create_database_with_one_table(path);
+        let db = Database::open(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut table = txn.open_multimap_table(MAP).unwrap();
+            table.insert("inline", 42).unwrap();
+            // This collection exceeds the half-page inline limit.
+            for value in 0..VALUES {
+                table.insert("subtree", value).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+        db.close().unwrap();
+
+        let db = Database::builder()
+            .set_cache_size(0)
+            .set_check_integrity_on_open(true)
+            .open(path)
+            .unwrap();
+        let txn = db.begin_read().unwrap();
+        assert_eq!(
+            txn.open_table(X)
+                .unwrap()
+                .get("k")
+                .unwrap()
+                .unwrap()
+                .value(),
+            "v"
+        );
+        let table = txn.open_multimap_table(MAP).unwrap();
+        let mut inline = table.get_owned("inline").unwrap();
+        assert_eq!(inline.next().unwrap().unwrap().value(), 42);
+        assert!(inline.next().is_none());
+        let mut subtree = table.get_owned("subtree").unwrap();
+        for value in 0..VALUES {
+            assert_eq!(subtree.next().unwrap().unwrap().value(), value);
+        }
+        assert!(subtree.next().is_none());
+    }
+
+    #[test]
+    fn checked_open_refuses_corrupt_data_and_duplicate_allocations() {
+        let tmpfile = crate::create_tempfile();
+        let path = tmpfile.path();
+        let payload = "checked-open synthetic payload";
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(X).unwrap().insert("k", payload).unwrap();
+        txn.commit().unwrap();
+        db.close().unwrap();
+
+        let mut builder = Database::builder();
+        builder.set_check_integrity_on_open(true);
+        let intact = std::fs::read(path).unwrap();
+        let mut corrupt = intact.clone();
+        let offset = intact
+            .windows(payload.len())
+            .position(|window| window == payload.as_bytes())
+            .unwrap();
+        corrupt[offset] ^= 1;
+        std::fs::write(path, &corrupt).unwrap();
+        assert!(matches!(
+            builder.open(path),
+            Err(DatabaseError::Storage(StorageError::Corrupted(_)))
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+
+        // Both catalogs now verify, but the same page would be allocated twice.
+        std::fs::write(path, &intact).unwrap();
+        patch_primary_slot(path, |slot| {
+            let size = super::BtreeHeader::serialized_size();
+            let user = super::USER_ROOT_OFFSET;
+            slot.copy_within(user..user + size, super::SYSTEM_ROOT_OFFSET);
+            slot[super::SYSTEM_ROOT_NON_NULL_OFFSET] = 1;
+        });
+        let overlap = std::fs::read(path).unwrap();
+        assert!(matches!(
+            builder.open(path),
+            Err(DatabaseError::Storage(StorageError::Corrupted(message)))
+                if message.contains("overlaps a page that is already allocated")
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), overlap);
+    }
+
+    #[test]
+    fn checked_open_callbacks_abort_without_committing() {
+        let tmpfile = crate::create_tempfile();
+        let path = tmpfile.path();
+        create_database_with_one_table(path);
+        overwrite_root_page_order(path, super::SYSTEM_ROOT_OFFSET, 31);
+        patch_god_byte(path, |god_byte| {
+            *god_byte &= !TWO_PHASE_COMMIT;
+        });
+        let intact = std::fs::read(path).unwrap();
+
+        let progress: [f64; 4] = [0.0, 0.3, 0.6, 0.9];
+        for (index, target) in progress.iter().enumerate() {
+            let target = target.to_bits();
+            let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = observed.clone();
+            let result = Database::builder()
+                .set_check_integrity_on_open(true)
+                .set_repair_callback(move |session| {
+                    let value = session.progress().to_bits();
+                    log.lock().unwrap().push(value);
+                    if value == target {
+                        session.abort();
+                    }
+                })
+                .open(path);
+            assert!(matches!(result, Err(DatabaseError::RepairAborted)));
+            assert_eq!(
+                *observed.lock().unwrap(),
+                progress[..=index]
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(std::fs::read(path).unwrap(), intact);
+        }
     }
 
     // The read-only open walks the system tree to load the allocator state

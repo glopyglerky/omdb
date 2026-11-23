@@ -939,19 +939,32 @@ impl RawBtree {
     }
 
     pub(crate) fn verify_checksum(&self) -> Result<bool> {
+        self.verify_checksum_with(|_| {})
+    }
+
+    pub(crate) fn verify_checksum_with<F: FnMut(PageNumber)>(
+        &self,
+        mut verified_page: F,
+    ) -> Result<bool> {
         if let Some(header) = self.root {
             let mut visited = Vec::new();
-            self.verify_checksum_helper(header.root, header.checksum, &mut visited)
+            self.verify_checksum_helper(
+                header.root,
+                header.checksum,
+                &mut visited,
+                &mut verified_page,
+            )
         } else {
             Ok(true)
         }
     }
 
-    fn verify_checksum_helper(
+    fn verify_checksum_helper<F: FnMut(PageNumber)>(
         &self,
         page_number: PageNumber,
         expected_checksum: Checksum,
         visited: &mut Vec<PageNumber>,
+        verified_page: &mut F,
     ) -> Result<bool> {
         if visited.len() >= MAX_BTREE_DEPTH || visited.contains(&page_number) {
             return Ok(false);
@@ -962,13 +975,12 @@ impl RawBtree {
         let node_mem = page.memory();
         let result = Ok(match node_mem[0] {
             LEAF => {
-                if let Ok(computed) =
-                    leaf_checksum(&page, self.fixed_key_size, self.fixed_value_size)
-                {
-                    expected_checksum == computed
-                } else {
-                    false
+                let matches = leaf_checksum(&page, self.fixed_key_size, self.fixed_value_size)
+                    .is_ok_and(|computed| expected_checksum == computed);
+                if matches {
+                    verified_page(page_number);
                 }
+                matches
             }
             BRANCH => {
                 if let Ok(computed) = branch_checksum(&page, self.fixed_key_size) {
@@ -978,12 +990,14 @@ impl RawBtree {
                 } else {
                     return Ok(false);
                 }
+                verified_page(page_number);
                 let accessor = BranchAccessor::new(&page, self.fixed_key_size);
                 for i in 0..accessor.count_children() {
                     if !self.verify_checksum_helper(
                         accessor.child_page(i).unwrap(),
                         accessor.child_checksum(i).unwrap(),
                         visited,
+                        verified_page,
                     )? {
                         return Ok(false);
                     }
@@ -1050,7 +1064,10 @@ impl<K: Key, V: Value> Btree<K, V> {
         self.root
     }
 
-    pub(crate) fn verify_checksum(&self) -> Result<bool> {
+    pub(crate) fn verify_checksum_with<F: FnMut(PageNumber)>(
+        &self,
+        verified_page: F,
+    ) -> Result<bool> {
         RawBtree::new(
             self.get_root(),
             K::fixed_width(),
@@ -1058,7 +1075,7 @@ impl<K: Key, V: Value> Btree<K, V> {
             self.mem.clone(),
             self.hint,
         )
-        .verify_checksum()
+        .verify_checksum_with(verified_page)
     }
 
     pub(crate) fn visit_all_pages<F>(&self, visitor: F) -> Result

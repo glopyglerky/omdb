@@ -2607,6 +2607,11 @@ fn check_integrity_with_persistent_savepoint_then_restore() {
         db.check_integrity().unwrap(),
         "false corruption report while a persistent savepoint exists"
     );
+    db.close().unwrap();
+    let mut db = Database::builder()
+        .set_check_integrity_on_open(true)
+        .open(tmpfile.path())
+        .unwrap();
 
     let mut txn = db.begin_write().unwrap();
     let savepoint = txn.get_persistent_savepoint(savepoint_id).unwrap();
@@ -2617,6 +2622,12 @@ fn check_integrity_with_persistent_savepoint_then_restore() {
     let read = db.begin_read().unwrap();
     let table = read.open_table(table_def).unwrap();
     assert_eq!(table.len().unwrap(), 1000);
+    for key in 0..1000u64 {
+        assert_eq!(
+            table.get(key).unwrap().unwrap().value(),
+            savepoint_integrity_value(key, 60).as_slice()
+        );
+    }
     drop(table);
     drop(read);
 
